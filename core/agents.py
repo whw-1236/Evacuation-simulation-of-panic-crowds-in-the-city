@@ -148,15 +148,9 @@ class ResidentAttributeConfig:
                 },
                 'description': '居民健康状态'
             },
-            # 【新增】性格属性 - 影响情绪敏感度和行为阈值
-            'personality': {
-                'type': 'choice',
-                'config': {
-                    'choices': ['理性型', '稳定型', '普通型', '敏感型', '焦虑型'],
-                    'weights': [0.10, 0.25, 0.40, 0.15, 0.10]
-                },
-                'description': '性格类型：理性型冷静不易恐慌，焦虑型容易情绪波动'
-            },
+            # 注：离散性格类型 personality 不再作为独立随机属性生成，
+            # 改为由 OCEAN 五因素通过 ocean_to_personality() 统一推导，
+            # 见 ResidentAgent.__init__() 中的 self.personality 赋值。
             # 【新增】社交活跃度 - 影响信息传播和聚集行为
             'social_activity': {
                 'type': 'range',
@@ -350,18 +344,22 @@ class ResidentAttributeConfig:
     @staticmethod
     def ocean_to_personality(ocean_values):
         """
-        从OCEAN连续值映射到离散性格类型（向后兼容）
+        从 OCEAN 连续值推导离散性格类型（唯一来源）
+
+        注意: 离散 personality 不再作为独立随机属性生成，
+        而是由本方法从 OCEAN 五因素统一推导，保证两类人格描述的一致性。
 
         【映射规则】
-        以情绪稳定性N为主轴，自律性C为辅轴:
+        以情绪稳定性 N 为主轴，自律性 C 为辅轴:
         - N < -0.5              → 焦虑型（高神经质）
         - -0.5 ≤ N < -0.1      → 敏感型
         - N > 0.5 且 C > 0.3   → 理性型（高稳定+高自律）
         - N > 0.2              → 稳定型
         - 其他                  → 普通型
 
-        注意: 此映射用于兼容下游基于离散性格类型的逻辑。
-        OCEAN连续值本身才是更精确的个体描述。
+        OCEAN 连续值本身才是更精确的个体描述；
+        离散类型仅用于需要按类别分流的下游逻辑（如 _apply_attribute_effects 中的
+        阈值乘数表、信息传播中的谣言易感度等）。
 
         返回:
             str: 性格类型名称
@@ -1603,10 +1601,9 @@ class ResidentAgent:
         # 共情系数 ε：影响社会传染敏感度（高ε → 更容易被邻居恐慌感染）
         self.empathy = attr_config.compute_empathy(self.ocean)
 
-        # 从OCEAN推导离散性格类型（向后兼容下游所有基于personality的逻辑）
-        # 注意：不再使用 self.attributes.get('personality')，改为OCEAN推导
+        # 从 OCEAN 推导离散性格类型（唯一来源，不再独立随机生成）
         self.personality = attr_config.ocean_to_personality(self.ocean)
-        # 同步到 attributes 字典，保证 self.attributes['personality'] 与 self.personality 一致
+        # 注入 attributes 字典，供下游通过 self.attributes['personality'] 读取
         self.attributes['personality'] = self.personality
 
         # =============================================================
