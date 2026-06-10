@@ -27,7 +27,7 @@
 import numpy as np
 import math
 import random
-from behavior_switching import SwitchParams, compute_goal_direction
+from behavior_switching import SwitchParams, compute_goal_direction, update_perceived_occupancy
 
 
 class SocialForceModel:
@@ -415,14 +415,11 @@ class SocialForceModel:
 
             interaction_force += social_force + physical_force + emotion_force
 
-        # 3. 集群吸引力（恐慌时倾向于聚集）- 增强版
-        cluster_force = self._calculate_cluster_force(agent, agents_to_check)
-
+        # 3. 从众已由 I1 的 herd 方向（朝 Leader）在 compute_goal_direction 中处理；
+        #    旧的"朝质心"集群力已删除，避免与 I1/I3 重复计算。
         # 4. 总力
-        # 聚集力权重大幅提高，让聚集效果明显
-        total_force = (driving_force * self.scale_factor * 8.0 +  # 驱动力
-                       interaction_force * self.scale_factor * 0.01 +  # 社会力
-                       cluster_force * self.scale_factor * 15.0)  # 聚集力（大幅提高）
+        total_force = (driving_force * self.scale_factor * 8.0 +  # 驱动力（含 I1 期望方向）
+                       interaction_force * self.scale_factor * 0.01)  # 社会力+物理+情绪
 
         return total_force
 
@@ -1116,6 +1113,8 @@ class IntegratedForceCalculator:
 
         # ============ 为每个agent设置安全区域目标 ============
         for agent in agents:
+            if self.stores:
+                update_perceived_occupancy(agent, self.stores, self.sw)
             if not getattr(agent, 'powered', True) and safe_zones:
                 # 找最近的有电区域
                 min_dist = float('inf')

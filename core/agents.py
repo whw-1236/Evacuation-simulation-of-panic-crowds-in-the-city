@@ -28,8 +28,15 @@ unified_stress_model = None
 migrate_to_unified_model = None
 
 try:
-    from .unified_stress_model import unified_stress_model as _usm, migrate_to_unified_model as _mtum
+    from .behavior_switching import attempt_acquire, init_store_state, SwitchParams
+except ImportError:
+    try:
+        from behavior_switching import attempt_acquire, init_store_state, SwitchParams
+    except ImportError:
+        attempt_acquire = init_store_state = SwitchParams = None
 
+try:
+    from .unified_stress_model import unified_stress_model as _usm, migrate_to_unified_model as _mtum
     unified_stress_model = _usm
     migrate_to_unified_model = _mtum
     print("   [OK] 统一心理压力模型加载成功")
@@ -37,7 +44,6 @@ except ImportError:
     # 兼容直接运行时的导入
     try:
         from unified_stress_model import unified_stress_model as _usm, migrate_to_unified_model as _mtum
-
         unified_stress_model = _usm
         migrate_to_unified_model = _mtum
         print("   [OK] 统一心理压力模型加载成功 (直接导入)")
@@ -86,16 +92,16 @@ class ResidentAttributeConfig:
 
     # SEIR 源权重 (方案C2: I态主动传播, E态被动泄露, S/R态不传播)
     SEIR_SOURCE_WEIGHT = {
-        'I': 1.0,  # 表达性恐慌: 主动向外传播
-        'E': 0.3,  # 暴露期: 被动泄露焦虑情绪
-        'S': 0.0,  # 易感期: 不传播
-        'R': 0.0,  # 恢复期/适应期: 不传播
+        'I': 1.0,   # 表达性恐慌: 主动向外传播
+        'E': 0.3,   # 暴露期: 被动泄露焦虑情绪
+        'S': 0.0,   # 易感期: 不传播
+        'R': 0.0,   # 恢复期/适应期: 不传播
     }
 
     # 经纬度-米换算常数（基于厦门思明区平均纬度24.45°N）
     # 如仿真其他城市需重新设置，或动态根据居民坐标均值计算
-    LAT_TO_M = 111000.0  # 1° 纬度 ≈ 111 km
-    LON_TO_M = 101000.0  # 1° 经度 ≈ 111 × cos(24.45°) ≈ 101 km
+    LAT_TO_M = 111000.0                    # 1° 纬度 ≈ 111 km
+    LON_TO_M = 101000.0                    # 1° 经度 ≈ 111 × cos(24.45°) ≈ 101 km
 
     def __init__(self):
         # 初始化基础属性配置
@@ -484,7 +490,7 @@ class GovernmentAgent:
                  behavior_config=None):
         # ============ 行为参数（外部可调）============
         self.initiative = initiative  # 积极性
-        self.response = response  # 响应效率
+        self.response = response      # 响应效率
 
         # 行为配置
         if behavior_config:
@@ -499,9 +505,9 @@ class GovernmentAgent:
         else:
             # 默认值 【调低阈值让事件更容易触发】
             self.warning_threshold = 0.1
-            self.opinion_threshold = 0.3  # 舆情管理阈值（原0.4）
-            self.enterprise_threshold = 0.1  # 分配资源给企业阈值（原0.3）
-            self.resident_threshold = 0.3  # 分配资源给居民阈值（原0.5）
+            self.opinion_threshold = 0.3       # 舆情管理阈值（原0.4）
+            self.enterprise_threshold = 0.1    # 分配资源给企业阈值（原0.3）
+            self.resident_threshold = 0.3      # 分配资源给居民阈值（原0.5）
             self.allocation_grid = 0.5
             self.allocation_enterprise = 0.3
             self.allocation_resident = 0.2
@@ -521,16 +527,16 @@ class GovernmentAgent:
 
         # ============ 状态变量（内部演化）============
         self.current_resource_level = self.base_resource_capacity
-        self.pressure_index = 0.0  # 政府压力指数
-        self.response_state = 'normal'  # 响应状态: normal/warning/emergency
+        self.pressure_index = 0.0           # 政府压力指数
+        self.response_state = 'normal'      # 响应状态: normal/warning/emergency
 
         # ============ 事件触发状态 ============
-        self.emergency_warning_issued = False  # 事件1: 发布应急预警
-        self.resource_to_grid = False  # 事件2: 分配资源给电网
-        self.resource_to_enterprise = False  # 事件3: 分配资源给企业
-        self.resource_to_resident = False  # 事件4: 分配资源给居民
-        self.public_opinion_active = False  # 事件5: 实施舆情管理
-        self.last_deployment = 0.0  # 上次资源下发量
+        self.emergency_warning_issued = False    # 事件1: 发布应急预警
+        self.resource_to_grid = False            # 事件2: 分配资源给电网
+        self.resource_to_enterprise = False      # 事件3: 分配资源给企业
+        self.resource_to_resident = False        # 事件4: 分配资源给居民
+        self.public_opinion_active = False       # 事件5: 实施舆情管理
+        self.last_deployment = 0.0               # 上次资源下发量
 
         # ============ 人为控制模式 ============
         # 当use_manual_events=True时，事件触发由外部控制
@@ -862,15 +868,15 @@ class PowerGridAgent:
         self.ongoing_repairs = {}  # {zone_id: repair_info}
 
         # 事件状态
-        self.is_repairing = False  # 是否正在抢修
+        self.is_repairing = False           # 是否正在抢修
         self.is_setting_temp_power = False  # 是否设置临时供电
         self.repair_progress_percent = 0.0  # 修复进度百分比
 
         # ============ 人为控制模式 ============
         # 事件7（临时供电站）和事件8（抢修）可由外部控制开始/结束
         self.use_manual_events = False
-        self.manual_temp_station = False  # 事件7人为控制
-        self.manual_repair = False  # 事件8人为控制
+        self.manual_temp_station = False    # 事件7人为控制
+        self.manual_repair = False          # 事件8人为控制
 
         # ============ 区域目标控制 ============
         # target_all_zones=True时，修复/临时供电影响所有区域
@@ -1236,9 +1242,9 @@ class EnterpriseAgent:
         # 【新增】资金储备 - 影响抗压能力
         # 不同规模企业的资金储备分布不同
         reserve_ranges = {
-            '小型': (0.1, 0.4),  # 小型企业资金紧张
+            '小型': (0.1, 0.4),    # 小型企业资金紧张
             '中型': (0.3, 0.7),
-            '大型': (0.5, 0.9),  # 大型企业资金雄厚
+            '大型': (0.5, 0.9),    # 大型企业资金雄厚
         }
         r_min, r_max = reserve_ranges[self.enterprise_type]
         self.financial_reserve = random.uniform(r_min, r_max)
@@ -1272,12 +1278,12 @@ class EnterpriseAgent:
 
         # 行业敏感度 - 影响损失速度和危机触发
         industry_sensitivity = {
-            '制造业': 1.2,  # 停电影响大
+            '制造业': 1.2,      # 停电影响大
             '服务业': 0.9,
             '零售业': 1.0,
-            'IT科技': 1.3,  # 数据中心等对停电非常敏感
-            '餐饮业': 1.1,  # 食材保鲜问题
-            '医疗健康': 1.5,  # 医疗设备，影响最大
+            'IT科技': 1.3,      # 数据中心等对停电非常敏感
+            '餐饮业': 1.1,      # 食材保鲜问题
+            '医疗健康': 1.5,    # 医疗设备，影响最大
         }
         self.industry_sensitivity = industry_sensitivity.get(self.industry, 1.0)
 
@@ -1320,10 +1326,10 @@ class EnterpriseAgent:
         # 2. 需要时间：设备重启、人员召回、检查安全
         # 3. 不同企业恢复时间不同（规模、行业、管理水平）
         #
-        self.recovery_delay = 0.0  # 恢复延迟（小时）
-        self.is_recovering = False  # 是否正在恢复中
-        self.recovery_progress = 0.0  # 恢复进度 [0,1]
-        self.power_restored_time = 0.0  # 恢复供电的时刻
+        self.recovery_delay = 0.0           # 恢复延迟（小时）
+        self.is_recovering = False          # 是否正在恢复中
+        self.recovery_progress = 0.0        # 恢复进度 [0,1]
+        self.power_restored_time = 0.0      # 恢复供电的时刻
 
         # 【恢复时间计算】基于企业特性
         # - 小型企业：恢复快（1-3小时）
@@ -1611,9 +1617,9 @@ class ResidentAgent:
         emotion_params = attr_config.compute_emotion_params(self.ocean)
         self.alpha1_emotion = emotion_params['alpha1']  # 激发速率
         self.alpha2_emotion = emotion_params['alpha2']  # 平复速率
-        self.tc_emotion = emotion_params['tc']  # 峰值持续时长（小时）
-        self.te_emotion = emotion_params['te']  # 激发起始延迟（小时）
-        self.emotion_reaction_time = 0.0  # 情绪反应累计时间（小时）
+        self.tc_emotion = emotion_params['tc']          # 峰值持续时长（小时）
+        self.te_emotion = emotion_params['te']          # 激发起始延迟（小时）
+        self.emotion_reaction_time = 0.0                # 情绪反应累计时间（小时）
 
         # 根据属性调整行为参数
         self._apply_attribute_effects()
@@ -1652,7 +1658,7 @@ class ResidentAgent:
         #
         _psi_E = self.ocean['ocean_E']
         _mu_T1 = 0.5 + 0.5 * self.empathy  # 共情决定易感阈值
-        _mu_T2 = 0.5 + 0.5 * _psi_E  # 外向性决定传播阈值
+        _mu_T2 = 0.5 + 0.5 * _psi_E        # 外向性决定传播阈值
         _var_T1 = 2.0 * (_mu_T1 ** 2) / 10  # 放大 2× 后的方差
         _var_T2 = 2.0 * (_mu_T2 ** 2) / 10
         # random.gauss(μ, σ) 接受标准差，因此用 sqrt
@@ -1815,6 +1821,14 @@ class ResidentAgent:
         self.hoarding_attempts = 0  # 尝试囤积次数
         self.hoarding_failures = 0  # 囤积失败次数（抢不到物资）
         self.last_hoarding_time = -999  # 上次囤积时间（避免频繁囤积）
+
+        # I2/I3 状态（behavior_switching 行为切换模块）
+        self.sw = SwitchParams() if SwitchParams is not None else None
+        self.familiarity = {}
+        self.perceived_occupancy = {}
+        self.current_leader = None
+        self._target_store = None
+        self._at_store_id = None
 
         # 注: 事件触发阈值相关的个体差异已由 _apply_attribute_effects
         # 写入 self.combined_threshold_mult（在构造函数早期调用）。
@@ -2064,7 +2078,7 @@ class ResidentAgent:
 
     def step(self, dt=1.0, social_force=None, gov_resource=0.0,
              region_panic_level=0.0, hazard_positions=None,
-             time_factors=None, sim_time=0.0):  # 新增 sim_time 参数
+             time_factors=None, sim_time=0.0):    #  新增 sim_time 参数
         self._sim_time = sim_time
         """
         每步更新 - 整合社会力和恐慌机制
@@ -2178,10 +2192,7 @@ class ResidentAgent:
         if unified_stress_model is None:
             raise RuntimeError(
                 "unified_stress_model 未导入成功，但当前心理模型依赖它；"
-                "请检查 unified_stress_model.py 的导入路径（agent 顶部 27–45 行）。")
-        components = unified_stress_model.update_resident_stress(
-            self, gov_resource, zone_data, dt
-        )
+                "请检查 unified_stress_model.py 的导入路径（agent 顶部 27-45 行）。")
 
         # 调用统一模型更新 stress_level 及 peak_stress
         components = unified_stress_model.update_resident_stress(
@@ -2500,14 +2511,24 @@ class ResidentAgent:
             success_rate *= (0.8 + self.initiative * 0.4)
             success_rate = min(1.0, success_rate)
 
-            self.hoarding_success = random.random() < success_rate
-
-            if self.hoarding_success:
-                # 囤积成功：标记，下一步会补充物资
-                self.just_hoarded = True
+            # I2: 到选定商店后按容量抢购（已载入商店数据时），否则回退原概率式
+            target = getattr(self, '_target_store', None)
+            if target is not None and attempt_acquire is not None:
+                ar = getattr(getattr(self, 'sw', None), 'arrival_radius', 0.0005)
+                d = ((self.x - target['x']) ** 2 + (self.y - target['y']) ** 2) ** 0.5
+                if d <= ar:
+                    attempt_acquire(self, target)   # 按容量，自增占用 -> 产生挤兑
+                else:
+                    self.hoarding_success = False
+                    self.just_hoarded = False
+                    self._at_store_id = None
             else:
-                self.hoarding_failures += 1
-                self.just_hoarded = False
+                self.hoarding_success = random.random() < success_rate
+                if self.hoarding_success:
+                    self.just_hoarded = True
+                else:
+                    self.hoarding_failures += 1
+                    self.just_hoarded = False
         else:
             self.hoarding_success = True
             self.just_hoarded = False
