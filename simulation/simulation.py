@@ -19,42 +19,18 @@ import random
 import sys
 import os
 
+# 项目根目录 = 论文仿真系统/
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
-# ==================== PyInstaller 兼容路径处理 ====================
-def _get_base_path():
-    """获取程序基础路径（兼容打包和开发环境）"""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller 打包后，使用 exe 所在目录
-        return os.path.dirname(sys.executable)
-    else:
-        # 开发环境，simulation 在子目录，需要回到父目录
-        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-_SIM_BASE_PATH = _get_base_path()
-# ================================================================
-
-# 添加父目录到路径
-if _SIM_BASE_PATH not in sys.path:
-    sys.path.insert(0, _SIM_BASE_PATH)
-
-try:
-    from models.agents import (GovernmentAgent, PowerGridAgent, EnterpriseAgent,
-                               ResidentAgent, CriticalInfraAgent)
-    from models.region_manager import (GeoJSONRegionManager, ResidentDistributor,
-                                       CSVPointLoader, NODE_ATTR_CONFIG)
-    from models.social_force import IntegratedForceCalculator
-    from models.event_recorder import EventRecorder, EventDetector
-    from models.event_influence import EventInfluenceCalculator
-except ImportError:
-    # 如果直接运行，尝试相对导入
-    from ..models.agents import (GovernmentAgent, PowerGridAgent, EnterpriseAgent,
-                                 ResidentAgent, CriticalInfraAgent)
-    from ..models.region_manager import (GeoJSONRegionManager, ResidentDistributor,
-                                         CSVPointLoader, NODE_ATTR_CONFIG)
-    from ..models.social_force import IntegratedForceCalculator
-    from ..models.event_recorder import EventRecorder, EventDetector
-    from ..models.event_influence import EventInfluenceCalculator
+from core.agents import (GovernmentAgent, PowerGridAgent, EnterpriseAgent,
+                         ResidentAgent, CriticalInfraAgent)
+from core.region_manager import (GeoJSONRegionManager, ResidentDistributor,
+                                 CSVPointLoader, NODE_ATTR_CONFIG)
+from core.social_force import IntegratedForceCalculator
+from core.event_recorder import EventRecorder, EventDetector
+from core.event_influence import EventInfluenceCalculator
 
 
 class BlackoutSimulation:
