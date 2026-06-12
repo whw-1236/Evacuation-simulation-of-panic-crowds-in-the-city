@@ -2118,11 +2118,9 @@ class ResidentAgent:
                 if all(getattr(n, 'safe_time', 0) > 3 for n in self.neighbors[:2]):
                     if random.random() < 0.2:
                         self.informed = False
-            # t_outage在恢复供电后缓慢衰减（不是瞬间清零）
-            if self.t_outage > 0:
-                self.t_outage = max(0, self.t_outage - dt * 3)
-                if self.t_outage < 1.0:
-                    self.t_outage = 0
+            # t_outage 保持为客观停电时长（不复位/衰减），
+            # 心理层面的恢复由 emotion 的 P_c 平复包络 (§3.2.4 Eq.5) 负责。
+            # 若再次停电，t_outage 继续累加，PTS 历史效应由 total_outage_hours 承载。
 
         # 2.5 个人物资消耗
         # 【核心理念】停电时物资消耗更快（需要用蜡烛、电池、备用食物等）
