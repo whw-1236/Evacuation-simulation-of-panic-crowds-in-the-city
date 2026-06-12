@@ -27,7 +27,7 @@
 import numpy as np
 import math
 import random
-from behavior_switching import SwitchParams, compute_goal_direction, update_perceived_occupancy
+from .behavior_switching import SwitchParams, compute_goal_direction, update_perceived_occupancy
 
 
 class SocialForceModel:
@@ -1080,6 +1080,8 @@ class IntegratedForceCalculator:
         """初始化综合力计算器"""
         self.social_force_model = SocialForceModel(social_force_config)
         self.panic_model = PanicModel(panic_config)
+        self.stores = []  # 商店列表（行为切换模型需要）
+        self.sw = SwitchParams()  # 行为切换参数
 
     def update(self, agents, dt=1.0, hazard_positions=None, region_geometries=None,
                zone_status=None, region_centroids=None):
