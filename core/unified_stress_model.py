@@ -54,7 +54,8 @@ class UnifiedStressModel:
     THRESHOLD_MILD_ANXIETY = 0.2  # 轻度焦虑
     THRESHOLD_MODERATE_ANXIETY = 0.4  # 中度焦虑（囤积、请求供电）
     THRESHOLD_HIGH_PANIC = 0.6  # 高度恐慌（情绪爆发）
-    THRESHOLD_EXTREME_PANIC = 0.8  # 极度恐慌（失控）
+    THRESHOLD_EXTREME_PANIC = 0.8   # 极度恐慌（PTS 进入阈值）
+    THRESHOLD_PTS_EXIT      = 0.5   # PTS 迟滞退出阈值（进入0.8 / 退出0.5，迟滞带0.3）
 
     def __init__(self):
         """初始化模型参数"""
@@ -517,10 +518,15 @@ class UnifiedStressModel:
         high_threshold = self.THRESHOLD_HIGH_PANIC * mult
         extreme_threshold = self.THRESHOLD_EXTREME_PANIC * mult
 
-        # 更新PTS状态（高度恐慌）
-        resident.pts_status = stress >= high_threshold
+        # 更新PTS状态（极度恐慌 + 迟滞带：进入0.8×mult，退出0.5×mult）
+        pts_enter = min(0.95, extreme_threshold)      # extreme_threshold 即 0.8×mult；封顶0.95
+        pts_exit  = self.THRESHOLD_PTS_EXIT * mult    # 0.5×mult
+        if resident.pts_status:
+            resident.pts_status = stress >= pts_exit  # 已在PTS：σ跌破退出阈值才解除
+        else:
+            resident.pts_status = stress >= pts_enter # 未在PTS：σ达到进入阈值才触发
 
-        # 情绪爆发状态
+        # 情绪爆发：仍用高度恐慌阈值（0.6×mult），与PTS解耦
         resident.is_emotion_burst = stress >= high_threshold
 
         # 请求供电状态
