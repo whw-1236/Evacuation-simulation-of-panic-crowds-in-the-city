@@ -421,6 +421,7 @@ class UnifiedStressModel:
             event_effect -= 0.03 * initiative * dt  # 自救降低压力（主动应对）
 
         # 聚集行为影响（双刃剑）
+        neighbors = getattr(resident, 'neighbors', [])
         if getattr(resident, 'is_gathering', False) and neighbors:
             gathering_neighbors = [n for n in neighbors if getattr(n, 'is_gathering', False)]
             if gathering_neighbors:
