@@ -42,6 +42,15 @@ dσ/dt = α·T·(1-σ) - β·C·σ + γ·(σ̄-σ) + Σ(事件影响)
 import numpy as np
 import random
 
+# P2 行为示范阈值修正（来自 behavior_switching）。失败回退到无修正。
+try:
+    from .behavior_switching import adjust_effective_thresholds as _adjust_eff_thr
+except ImportError:
+    try:
+        from behavior_switching import adjust_effective_thresholds as _adjust_eff_thr
+    except ImportError:
+        _adjust_eff_thr = None
+
 
 class UnifiedStressModel:
     """
@@ -56,6 +65,14 @@ class UnifiedStressModel:
     THRESHOLD_HIGH_PANIC = 0.6  # 高度恐慌（情绪爆发）
     THRESHOLD_EXTREME_PANIC = 0.8   # 极度恐慌（PTS 进入阈值）
     THRESHOLD_PTS_EXIT      = 0.5   # PTS 迟滞退出阈值（进入0.8 / 退出0.5，迟滞带0.3）
+
+    # ====== Fig.5 钟形曲线匹配参数 (2026-06-13) ======
+    # 旧默认值导致政府事件 σ 缓解过强 (sum≈-0.034/步)，把 stimulation 完全抵消，
+    # σ 永远涨不起来。这组默认值把缓解缩放到 ~0.3 倍，让"激发-平台-平复"曲线
+    # 能在 t∈[0, T_outage] 内呈现。如要强政府响应可把该常数调回 1.0。
+    GOV_EVENT_SOFTNESS = 0.3
+    # 恢复供电后 outage_threat 的指数衰减时间常数 (h)；越小衰减越快。
+    OUTAGE_THREAT_DECAY_TAU = 6.0
 
     def __init__(self):
         """初始化模型参数"""
@@ -90,9 +107,16 @@ class UnifiedStressModel:
 
         # 1. 停电时长威胁（对数增长，体现边际递减）
         # 0h→0, 2h→0.28, 6h→0.55, 12h→0.78, 24h→1.00(封顶), 48h→1.00(封顶)
+        # 【2026-06-13】恢复供电后按 exp(-t/τ) 衰减，让 σ 钟形曲线能回落
+        # （对应 Fig.5 的"平复"段；τ 默认 6h）。
         t_outage = getattr(resident, 't_outage', 0)
         if t_outage > 0:
             outage_threat = min(1.0, 0.4 * np.log1p(t_outage / 2.0))
+            if getattr(resident, 'powered', True):
+                # 恢复后衰减：用 time_since_recovery 作为衰减计时
+                t_since = float(getattr(resident, 'time_since_recovery', 0.0))
+                tau = max(0.5, self.OUTAGE_THREAT_DECAY_TAU)
+                outage_threat *= float(np.exp(-t_since / tau))
             threat += self.threat_weights['outage_duration'] * outage_threat
 
         # 2. 物资短缺威胁
@@ -364,23 +388,26 @@ class UnifiedStressModel:
         event_effect = 0.0
 
         # ---------- 政府决策影响（缓解压力）----------
+        # 所有事件强度统一乘 GOV_EVENT_SOFTNESS（默认 0.3），让 σ 能在停电期间
+        # 上升到峰值，对应论文 Fig.5 的"激发-平台-平复"钟形曲线。
         gov_events = getattr(resident, '_gov_events', {})
+        gov_softness = self.GOV_EVENT_SOFTNESS
 
         # 事件1: 发布停电通知 → 降低信息焦虑
         if gov_events.get('outage_notice', False):
-            event_effect -= 0.02 * dt
+            event_effect -= 0.02 * gov_softness * dt
 
         # 事件2: 启动应急响应 → 增加安全感
         if gov_events.get('emergency_response', False):
-            event_effect -= 0.025 * dt
+            event_effect -= 0.025 * gov_softness * dt
 
         # 事件3: 发放应急物资 → 降低物资焦虑
         if gov_events.get('supply_distribution', False):
-            event_effect -= 0.03 * dt
+            event_effect -= 0.03 * gov_softness * dt
 
         # 事件4: 疏散安置 → 降低危险感（如果在安全区）
         if gov_events.get('evacuation', False):
-            event_effect -= 0.04 * dt
+            event_effect -= 0.04 * gov_softness * dt
 
         # 事件5: 心理疏导/安抚 → 直接降低压力
         if gov_events.get('psychological_comfort', False):
@@ -392,7 +419,7 @@ class UnifiedStressModel:
                 '稳定型': 0.6,  # 不太需要
                 '理性型': 0.4,
             }.get(personality, 1.0)
-            event_effect -= 0.035 * comfort_effectiveness * dt
+            event_effect -= 0.035 * comfort_effectiveness * gov_softness * dt
 
         # ---------- 电网决策影响 ----------
         grid_events = getattr(resident, '_grid_events', {})
@@ -500,6 +527,8 @@ class UnifiedStressModel:
         【阈值逻辑】
         - 不同性格的人有不同的阈值
         - 阈值 = 基础阈值 × 性格系数
+        - P2 行为示范：邻域内 hoarding/herding 比例压低 θ₁/θ₂
+          (Cialdini 社会证明 + 行为传染，独立于情绪传染通道)
         """
         # 性格对阈值的影响
         personality_threshold_mult = {
@@ -512,11 +541,30 @@ class UnifiedStressModel:
         personality = getattr(resident, 'personality', '普通型')
         mult = personality_threshold_mult.get(personality, 1.0)
 
-        # 调整后的阈值
+        # 调整后的阈值（性格基线）
         mild_threshold = self.THRESHOLD_MILD_ANXIETY * mult
         moderate_threshold = self.THRESHOLD_MODERATE_ANXIETY * mult
         high_threshold = self.THRESHOLD_HIGH_PANIC * mult
         extreme_threshold = self.THRESHOLD_EXTREME_PANIC * mult
+
+        # ============================================================
+        # P2: 行为示范对 θ₁/θ₂ 的压低（独立于情绪传染 γ·(σ̄-σ)）
+        # ============================================================
+        sw = getattr(resident, 'sw', None)
+        if sw is not None and getattr(sw, 'enable_behavior_demo', False) \
+                and _adjust_eff_thr is not None:
+            mod_eff, high_eff = _adjust_eff_thr(
+                resident, moderate_threshold, high_threshold, sw,
+            )
+            moderate_threshold = mod_eff
+            high_threshold = high_eff
+            # extreme 阈值同步在 high 之上做温和上移，保持迟滞带形态
+            extreme_threshold = max(extreme_threshold, high_eff + 0.18 * mult)
+        else:
+            # 即使禁用 P2，也将基线阈值写到 _theta1_eff/_theta2_eff，
+            # 供 compute_goal_direction 统一读取，避免分支。
+            resident._theta1_eff = moderate_threshold
+            resident._theta2_eff = high_threshold
 
         # 更新PTS状态（极度恐慌 + 迟滞带：进入0.8×mult，退出0.5×mult）
         pts_enter = min(0.95, extreme_threshold)      # extreme_threshold 即 0.8×mult；封顶0.95

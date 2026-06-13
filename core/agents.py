@@ -28,12 +28,19 @@ unified_stress_model = None
 migrate_to_unified_model = None
 
 try:
-    from .behavior_switching import attempt_acquire, init_store_state, SwitchParams
+    from .behavior_switching import (
+        attempt_acquire, init_store_state, SwitchParams,
+        apply_outcome_feedback,
+    )
 except ImportError:
     try:
-        from behavior_switching import attempt_acquire, init_store_state, SwitchParams
+        from behavior_switching import (
+            attempt_acquire, init_store_state, SwitchParams,
+            apply_outcome_feedback,
+        )
     except ImportError:
         attempt_acquire = init_store_state = SwitchParams = None
+        apply_outcome_feedback = None
 
 try:
     from .unified_stress_model import unified_stress_model as _usm, migrate_to_unified_model as _mtum
@@ -2164,13 +2171,44 @@ class ResidentAgent:
         if not hasattr(self, '_grid_events'):
             self._grid_events = {}
 
-        # 根据gov_resource推断政府事件（gov_resource 数值越高说明政府支持越多）
-        self._gov_events['outage_notice'] = gov_resource > 0.3 and not self.powered
-        self._gov_events['emergency_response'] = gov_resource > 0.8 and not self.powered
-        self._gov_events['supply_distribution'] = gov_resource > 1.2 and not self.powered
-        self._gov_events['psychological_comfort'] = gov_resource > 1.5 and not self.powered
-        # 疏散安置：需要更高的资源投入门槛（重大举措）
-        self._gov_events['evacuation'] = gov_resource > 2.0 and not self.powered
+        # ===== 政府事件状态（2026-06-13 修复）=====
+        # 历史方案：用 gov_resource 阈值反推 _gov_events，但 simulation 传过来的
+        # gov_resource 量纲与原阈值 (0.3 ~ 2.0) 不匹配，导致停电一开始 5 个事件
+        # 就全部触发，σ 被恒定 event_effect=-0.034/步压制，永远涨不起来。
+        #
+        # 新方案：优先使用 simulation.py 已经传递的真实事件 bool —
+        #   _gov_warning_received       <- district_gov.emergency_warning_issued
+        #   _gov_resource_received      <- district_gov.resource_to_resident
+        #   _opinion_management_active  <- district_gov.public_opinion_active
+        # 这些 bool 直接反映 GovernmentAgent 当前是否处于该响应状态，避免
+        # gov_resource 数值反推的尺度问题。
+        #
+        # 当上述真实 bool 全缺失（例如最小化单元测试）时回退到 gov_resource
+        # 阈值启发式，保持向后兼容。
+        warning_real      = getattr(self, '_gov_warning_received', None)
+        resource_recv     = getattr(self, '_gov_resource_received', None)
+        opinion_real      = getattr(self, '_opinion_management_active', None)
+        has_real_flags    = (warning_real is not None
+                             or resource_recv is not None
+                             or opinion_real is not None)
+
+        if has_real_flags:
+            warning_real  = bool(warning_real)
+            resource_recv = bool(resource_recv)
+            opinion_real  = bool(opinion_real)
+            self._gov_events['outage_notice']        = warning_real and not self.powered
+            self._gov_events['emergency_response']   = (warning_real or resource_recv) and not self.powered
+            self._gov_events['supply_distribution']  = resource_recv and not self.powered
+            self._gov_events['psychological_comfort']= opinion_real and not self.powered
+            # 疏散安置没有对应真实 bool；用 gov_resource 阈值（保守）+ 强响应组合
+            self._gov_events['evacuation']           = (warning_real and resource_recv and opinion_real) and not self.powered
+        else:
+            # Fallback: 旧 gov_resource 阈值反推，仅用于无 simulation 上下文的测试
+            self._gov_events['outage_notice']        = gov_resource > 0.3 and not self.powered
+            self._gov_events['emergency_response']   = gov_resource > 0.8 and not self.powered
+            self._gov_events['supply_distribution']  = gov_resource > 1.2 and not self.powered
+            self._gov_events['psychological_comfort']= gov_resource > 1.5 and not self.powered
+            self._gov_events['evacuation']           = gov_resource > 2.0 and not self.powered
 
         # ============================================================
         # 【改进3】距离加权的邻居压力 σ̄_weighted
@@ -2275,6 +2313,13 @@ class ResidentAgent:
 
         # ============ 更新事件触发状态 ============
         self._update_event_states(dt, gov_resource, region_panic_level)
+
+        # ============ P1.B 行为结果反馈 σ (Lazarus 再评估) ============
+        # 在 is_hoarding / just_hoarded / hoarding_success / _herd_active 都已
+        # 完成本步更新后，按行为结果向 stress_level 注入脉冲。开关由
+        # self.sw.enable_outcome_feedback 控制（消融实验直接关掉即可）。
+        if apply_outcome_feedback is not None and getattr(self, 'sw', None) is not None:
+            apply_outcome_feedback(self, self.sw)
 
     def _update_event_states(self, dt, gov_resource, region_panic_level):
         """
