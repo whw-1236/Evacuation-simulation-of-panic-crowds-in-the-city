@@ -1,0 +1,15 @@
+{
+  "run_dir": "trace_output\\run_20260613_151432_ui_check",
+  "created_at": "2026-06-13T15:14:32",
+  "experiment_tag": "ui_check",
+  "n_residents": 100,
+  "total_steps": 60,
+  "outage_step": 4,
+  "outage_mode": "full",
+  "dt": 0.25,
+  "city": "厦门市",
+  "districts": [
+    "思明区"
+  ],
+  "n_zones": 92
+}
