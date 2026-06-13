@@ -96,6 +96,19 @@ Leader 评分 = α_s·(1-E_j) + α_f·f_ij + α_v·可见性
 
 **滞后切换规则**：新候选者得分必须超过当前 leader 的 μ 倍（μ=1.3）才切换，防止每步重选导致的羊群崩溃（消融：μ=1.0 退化为无惯性）。
 
+### 3.4 I1 扩展（2026-06-13 新增 P1.A / P1.B / P2 / P3）
+
+四项独立可消融增强（全部受 `SwitchParams` 开关控制）：
+
+| 编号 | 名称 | 机制 | 关键参数 / 字段 |
+|:--:|------|------|------|
+| **P1.A** | 行为切换迟滞带 | 囤积/从众进入 σ≥θ / 退出 σ<θ-δ；通过 `agent._hoard_active`、`_herd_active` 状态记忆实现，避免阈值附近反复抖动 | `delta_hoard=0.08`, `delta_herd=0.10`, `enable_hysteresis` |
+| **P1.B** | 结果反馈 σ（再评估） | 囤积成功/失败、跟随 Leader 顺利疏散/陷入拥堵 → 对 σ 加正/负脉冲（Lazarus secondary appraisal） | `feedback_hoard_success=-0.07`, `feedback_hoard_failure=+0.11`, `feedback_herd_jam=+0.06`, `feedback_failure_amplify_repeat=0.2` |
+| **P2** | 行为示范压低 θ | θ_eff = θ × mult - η · 邻居同行为比例；η 由 OCEAN 宜人性调节。结果写入 `agent._theta1_eff`、`_theta2_eff` | `eta_demo_hoard=0.12`, `eta_demo_herd=0.15`, `enable_behavior_demo` |
+| **P3** | 信息搜寻第四态 | σ∈[θ_mild, θ₁) 且 SEIR∈{S,E} 时激活 w_inquire，朝最近信息节点移动；此时 `_goal_shares` 扩为 4-tuple | `theta_mild=0.2`, `k5=10`, `inquire_radius=0.01`, `enable_inquire`（默认关闭，避免破坏 baseline） |
+
+四项扩展可独立消融，对应 AblationPreset 的 `no_hysteresis()` / `no_outcome_feedback()` / `no_behavior_demo()` / `with_inquire()` / `i1_minimal()`（详见 §9.2）。
+
 ---
 
 ## 4. 社会力模型（行为层执行）
@@ -183,17 +196,24 @@ Leader 评分 = α_s·(1-E_j) + α_f·f_ij + α_v·可见性
 
 ## 8. 可视化与输出
 
-由 `observe/` 模块提供：
+由 `visualization/` 模块提供（一键启动入口：`python run_dashboard.py`）：
 
-- **区域地图渲染**：居民点情绪用 4 级填充色随 σ 变化（绿→琥珀→橙→红），PTS 用紫色独立描边（读 `pts_status` bool，不阈值反算）；区域面按停电 4 态着色
-- **时间序列追踪**：trace_plotter 支持绘制情绪/恐慌/停电恢复的时序曲线
+- **`dashboard.py` SimulationDashboard**：交互式仪表盘（matplotlib + Tk 后端）
+  - 控制面板：▶启动/⏸暂停/↺重置；居民数 / 停电步 / 总步数滑块；1x/2x/4x 速度；full/partial 停电模式；散点/热力图/密度/流向图层切换
+  - 多 Run 对比：勾选"对比模式"将历史 run 以虚线叠加；支持加载 `step_history.json`
+  - 按区县分解指标：全局 / 分区 / SEIR 三选项卡
+  - 帧缓存导出 GIF（PillowWriter）
+- **`small_area_viewer.py` 区域地图渲染**：居民点情绪用 4 级填充色随 σ 变化（绿→琥珀→橙→红），PTS 用紫色独立描边（读 `pts_status` bool，不阈值反算）；区域面按停电 4 态着色
+- **`trace_plotter.py` 时间序列追踪**：绘制情绪/恐慌/停电恢复的时序曲线
 
 ### 输出数据
 
-每步输出 JSON（GeoJSON 格式）：
-- 点数据：居民的位置、SEIR 状态、情绪等级、恐慌值、PTS 状态、移动速度/方向、目标份额(home/hoard/herd)
-- 面数据：各区域的停电状态、平均情绪、PTS 比例、恐慌指数、修复状态
-- 详细属性说明见 `属性说明.md`
+- **`output/`**：仪表盘截图、概览图（`overview.png`）、追踪图（`traces.png`）、每步全量 history JSON（`step_history.json`）
+- **`trace_output/run_<时间戳>_<tag>/`**：每次仿真自动新建子目录存储节流写入的 trace CSV（默认每 25 步 flush 一次；`--tag` 可加实验标签便于筛选）
+- 每步输出 JSON（GeoJSON 格式）：
+  - 点数据：居民的位置、SEIR 状态、情绪等级、恐慌值、PTS 状态、移动速度/方向、目标份额(home/hoard/herd[/inquire])
+  - 面数据：各区域的停电状态、平均情绪、PTS 比例、恐慌指数、修复状态
+  - 详细属性说明见 `属性说明.md`
 
 ---
 
@@ -219,8 +239,14 @@ AblationPreset 类提供一键切换的消融配置：
 | `hard_switch()` | E2.2 无软切换 | k₁~k₄ = 50 |
 | `no_info_network()` | E2.3 无信息网 | λ_c = 0, γ = 0 |
 | `no_inertia()` | E2.4 无Leader惯性 | μ = 1.0 |
+| `no_personality()` | E2.5 无 OCEAN 异质性 | （配合 agents.py 修改 OCEAN 采样） |
 | `soft_switch()` | 软切换对照 | k₁~k₄ = 1 |
 | `distance_only_store()` | 仅看距离选商店 | λ_f = λ_c = 0 |
+| `no_hysteresis()` | E2.6 无 P1.A 迟滞带 | `enable_hysteresis=False` |
+| `no_outcome_feedback()` | E2.7 无 P1.B 结果反馈 | `enable_outcome_feedback=False` |
+| `no_behavior_demo()` | E2.8 无 P2 行为示范 | `enable_behavior_demo=False` |
+| `with_inquire()` | E2.9 启用 P3 信息搜寻第四态 | `enable_inquire=True` |
+| `i1_minimal()` | 关闭全部 I1 扩展 | P1.A + P1.B + P2 + P3 全关 |
 
 ### 9.3 参数网格扫描
 
@@ -243,14 +269,14 @@ AblationPreset 类提供一键切换的消融配置：
 ```
 Evacuation-simulation-of-panic-crowds-in-the-city/
 ├── core/
-│   ├── agents.py              # 5类Agent (2567行)
-│   ├── behavior_switching.py  # ⭐ I1/I2/I3 三创新 (228行)
-│   ├── social_force.py        # 社会力 + Greenshields (949行)
-│   ├── unified_stress_model.py # Lazarus统一压力模型 (482行) — pts_status 真值来源
-│   ├── region_manager.py      # GeoJSON区域管理 (1079行)
-│   ├── event_types.py         # 事件类型定义 (179行)
-│   ├── event_recorder.py      # 事件记录器 (563行)
-│   └── event_influence.py     # 事件影响计算 (1724行)
+│   ├── agents.py              # 5类Agent (3093行)
+│   ├── behavior_switching.py  # ⭐ I1/I2/I3 + P1.A/P1.B/P2/P3 扩展 (499行)
+│   ├── social_force.py        # 社会力 + Greenshields (1188行)
+│   ├── unified_stress_model.py # Lazarus统一压力模型 (637行) — pts_status 真值来源
+│   ├── region_manager.py      # GeoJSON区域管理 (1276行)
+│   ├── event_types.py         # 事件类型定义 (209行)
+│   ├── event_recorder.py      # 事件记录器 (628行)
+│   └── event_influence.py     # 事件影响计算 (1995行)
 ├── decision/
 │   ├── base.py                # 决策接口定义
 │   ├── rule_based.py          # 规则专家系统
@@ -259,12 +285,16 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 │   ├── config.py              # 路径/模型参数配置
 │   ├── behavior_config.py     # Agent行为参数
 │   ├── city_manager.py        # 多城市管理
-│   └── simulation_config.py   # ⭐ 超参数集中管理 + 消融预设
+│   └── simulation_config.py   # ⭐ 超参数集中管理 + 消融预设（含 I1 扩展）
 ├── simulation/
-│   └── simulation.py          # 仿真主引擎 (1860行)
-├── observe/
-│   ├── small_area_viewer.py   # 区域地图可视化
-│   └── trace_plotter.py       # 时序曲线绘制
+│   └── simulation.py          # 仿真主引擎 (2246行)
+├── visualization/
+│   ├── dashboard.py           # ⭐ 交互式仪表盘 SimulationDashboard (1258行)
+│   ├── small_area_viewer.py   # 区域地图可视化 (235行)
+│   └── trace_plotter.py       # 时序曲线绘制 (384行)
+├── run_dashboard.py           # 一键启动仪表盘的 CLI 入口
+├── output/                    # 仪表盘截图 / 概览图 / step_history.json
+├── trace_output/              # 每次 run 的 trace CSV (run_<时间戳>_<tag>/)
 ├── 属性说明.md                 # 输出数据JSON属性详解
-└── README.md              # 本文档
+└── README.md                  # 本文档
 ```
