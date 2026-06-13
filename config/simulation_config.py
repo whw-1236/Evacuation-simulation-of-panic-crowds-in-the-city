@@ -48,6 +48,30 @@ class SimulationConfig:
     alpha_f: float = 0.3           # 熟悉度权重
     alpha_v: float = 0.2           # 视野可见性权重
 
+    # ---- I1 扩展 P1.A: 行为切换迟滞带 (2026-06-13) ----
+    delta_hoard: float = 0.08      # σ < θ₁-δ_hoard 才退出囤积态
+    delta_herd: float = 0.10       # σ < θ₂-δ_herd 才退出从众态
+    enable_hysteresis: bool = True
+
+    # ---- I1 扩展 P1.B: 行为结果反馈 σ ----
+    feedback_hoard_success: float = -0.07   # 囤积成功 -> σ 下降脉冲
+    feedback_hoard_failure: float = 0.11    # 囤积失败 -> σ 上升脉冲
+    feedback_herd_smooth:   float = -0.04   # 跟随Leader成功疏散
+    feedback_herd_jam:      float = 0.06    # 跟随Leader陷入拥堵
+    feedback_failure_amplify_repeat: float = 0.2  # 连续失败放大系数
+    enable_outcome_feedback: bool = True
+
+    # ---- I1 扩展 P2: 行为示范对 θ 的压低 ----
+    eta_demo_hoard: float = 0.12   # 邻居囤积比例对 θ₁ 的压低系数
+    eta_demo_herd:  float = 0.15   # 邻居从众比例对 θ₂ 的压低系数
+    enable_behavior_demo: bool = True
+
+    # ---- I1 扩展 P3: 信息搜寻第四态 ----
+    theta_mild: float = 0.2        # inquire 态下边界 (σ)
+    k5:         float = 10.0       # inquire sigmoid 陡度
+    inquire_radius: float = 0.01   # 信息搜寻半径 (~1 km)
+    enable_inquire: bool = False   # 默认关闭，避免破坏 baseline
+
     # ---- 社会力模型 ----
     A: float = 2000.0              # 社会力强度 (N)
     B: float = 0.08                # 社会力范围 (m)
@@ -105,6 +129,24 @@ class SimulationConfig:
             dist_scale=self.dist_scale, gamma=self.gamma, fam_scale=self.fam_scale,
             arrival_radius=self.arrival_radius,
             mu=self.mu, alpha_s=self.alpha_s, alpha_f=self.alpha_f, alpha_v=self.alpha_v,
+            # P1.A
+            delta_hoard=self.delta_hoard, delta_herd=self.delta_herd,
+            enable_hysteresis=self.enable_hysteresis,
+            # P1.B
+            feedback_hoard_success=self.feedback_hoard_success,
+            feedback_hoard_failure=self.feedback_hoard_failure,
+            feedback_herd_smooth=self.feedback_herd_smooth,
+            feedback_herd_jam=self.feedback_herd_jam,
+            feedback_failure_amplify_repeat=self.feedback_failure_amplify_repeat,
+            enable_outcome_feedback=self.enable_outcome_feedback,
+            # P2
+            eta_demo_hoard=self.eta_demo_hoard,
+            eta_demo_herd=self.eta_demo_herd,
+            enable_behavior_demo=self.enable_behavior_demo,
+            # P3
+            theta_mild=self.theta_mild, k5=self.k5,
+            inquire_radius=self.inquire_radius,
+            enable_inquire=self.enable_inquire,
         )
 
     def clone(self, **overrides):
@@ -155,6 +197,37 @@ class AblationPreset:
     def distance_only_store() -> SimulationConfig:
         """只看距离选商店: λ_f=λ_c=0"""
         return SimulationConfig(lambda_f=0.0, lambda_c=0.0)
+
+    # ---- I1 扩展消融 (2026-06-13) ----
+    @staticmethod
+    def no_hysteresis() -> SimulationConfig:
+        """E2.6 关闭行为切换迟滞带（验证 P1.A 贡献）"""
+        return SimulationConfig(enable_hysteresis=False)
+
+    @staticmethod
+    def no_outcome_feedback() -> SimulationConfig:
+        """E2.7 关闭行为结果反馈 σ（验证 P1.B 贡献）"""
+        return SimulationConfig(enable_outcome_feedback=False)
+
+    @staticmethod
+    def no_behavior_demo() -> SimulationConfig:
+        """E2.8 关闭行为示范阈值压低（验证 P2 贡献）"""
+        return SimulationConfig(enable_behavior_demo=False)
+
+    @staticmethod
+    def with_inquire() -> SimulationConfig:
+        """E2.9 启用信息搜寻第四态（验证 P3 贡献）"""
+        return SimulationConfig(enable_inquire=True)
+
+    @staticmethod
+    def i1_minimal() -> SimulationConfig:
+        """关闭全部 I1 扩展（P1.A + P1.B + P2 + P3 全部关）"""
+        return SimulationConfig(
+            enable_hysteresis=False,
+            enable_outcome_feedback=False,
+            enable_behavior_demo=False,
+            enable_inquire=False,
+        )
 
 
 # =============================================================================
