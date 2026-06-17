@@ -37,6 +37,11 @@ from matplotlib.widgets import Button, Slider, RadioButtons, CheckButtons
 from matplotlib.patches import Polygon as MplPolygon, Patch
 from matplotlib.collections import PatchCollection
 
+try:
+    from scipy.ndimage import gaussian_filter as _gaussian_filter
+except ImportError:
+    _gaussian_filter = None
+
 plt.rcParams['font.family'] = ['Microsoft YaHei', 'SimHei', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -64,6 +69,15 @@ FACILITY_OUTAGE_COLOR = '#757575'
 FACILITY_LABELS_CN = {
     'hospital': '医院', 'school': '学校', 'industry': '工业',
     'emergency': '应急', 'government': '政府', 'community': '社区',
+}
+
+# 状态栏使用 monospace 字体（Windows 下 Consolas），不含 CJK 字形；
+# 把 RadioButton 的中文 layer 名映射成英文 key 仅供状态栏显示。
+LAYER_LABEL_TO_KEY = {
+    '散点': 'scatter',
+    '热力图': 'heatmap',
+    '密度': 'density',
+    '流向箭头': 'quiver',
 }
 
 ZONE_FILL_POWERED = '#81C784'
@@ -168,6 +182,12 @@ class SimulationDashboard:
         self.trace_run_dir = None         # 由 _create_sim 时填充
         self._trace_last_flushed_step = -1
         self._trace_known_districts = []  # 缓存列名顺序，避免每次 flush 重排
+
+        # ===== Run 序号 (output_N / trace_output_N 共用) =====
+        # 每次 _create_sim 时通过扫盘取 max(N)+1 分配；output_run_dir
+        # 在首次按"保存图表"/"导出 GIF"时才 lazily mkdir，避免空目录污染。
+        self.current_run_index = None
+        self.output_run_dir = None
 
         # --- 运行状态 ---
         self.sim = None
@@ -447,7 +467,7 @@ class SimulationDashboard:
         }
         self.seir_history = {'step': [], 'S': [], 'E': [], 'I': [], 'R': []}
         self.events = []
-        self.frame_cache = []
+        self._reset_frame_cache()
 
         # ===== 新建 trace_output 子目录 =====
         self._init_trace_run_dir()
@@ -457,37 +477,78 @@ class SimulationDashboard:
         self._update_trace_info_text()
 
     # ------------------------------------------------------------------
+    # Run index 分配 + 目录管理
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _scan_max_index(parent_dir: str, prefix: str) -> int:
+        """扫描 parent_dir 下形如 prefix_<N>/ 的子目录，返回最大 N（无则 0）。"""
+        if not os.path.isdir(parent_dir):
+            return 0
+        max_n = 0
+        for name in os.listdir(parent_dir):
+            if not name.startswith(prefix + '_'):
+                continue
+            full = os.path.join(parent_dir, name)
+            if not os.path.isdir(full):
+                continue
+            tail = name[len(prefix) + 1:]
+            if tail.isdigit():
+                max_n = max(max_n, int(tail))
+        return max_n
+
+    def _allocate_run_index(self) -> int:
+        """两边目录的 max(N) + 1，保证 trace_output_N / output_N 永远同步。"""
+        n_trace = self._scan_max_index(self.trace_output_root, 'trace_output')
+        n_output = self._scan_max_index(self.output_dir, 'output')
+        return max(n_trace, n_output) + 1
+
+    # ------------------------------------------------------------------
     # Trace output：每次运行新建独立子目录，自动存档
     # ------------------------------------------------------------------
     def _init_trace_run_dir(self):
-        """新建 trace_output/run_YYYYMMDD_HHMMSS[_tag]/  目录。"""
-        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        name = f'run_{ts}'
-        if self.experiment_tag:
-            safe_tag = ''.join(c for c in self.experiment_tag if c.isalnum() or c in '_-')
-            if safe_tag:
-                name += f'_{safe_tag}'
-        # 防止极端情况下同秒两次重置撞名（追加 _1, _2…）
-        candidate = os.path.join(self.trace_output_root, name)
-        i = 1
+        """新建 trace_output/trace_output_<N>/，N 取两边目录最大序号+1。
+
+        output/output_<N>/ 不在这里创建——等首次按"保存图表"/"导出GIF"
+        时再 lazily mkdir，避免空目录污染。
+        """
+        n = self._allocate_run_index()
+        self.current_run_index = n
+        candidate = os.path.join(self.trace_output_root, f'trace_output_{n}')
+        # 极端情况（并发）撞名：自增到不撞为止
         while os.path.exists(candidate):
-            candidate = os.path.join(self.trace_output_root, f'{name}_{i}')
-            i += 1
+            n += 1
+            candidate = os.path.join(self.trace_output_root, f'trace_output_{n}')
         os.makedirs(candidate, exist_ok=True)
+        self.current_run_index = n
         self.trace_run_dir = candidate
-        print(f'[Dashboard] Trace 目录: {self.trace_run_dir}')
+        self.output_run_dir = None  # output_N 留到首次保存才建
+        print(f'[Dashboard] Run #{n} → trace: {self.trace_run_dir}')
+
+    def _ensure_output_run_dir(self) -> str:
+        """首次需要写 output 时建 output/output_<N>/ 并返回路径。"""
+        if self.output_run_dir and os.path.isdir(self.output_run_dir):
+            return self.output_run_dir
+        n = self.current_run_index or self._allocate_run_index()
+        path = os.path.join(self.output_dir, f'output_{n}')
+        os.makedirs(path, exist_ok=True)
+        self.output_run_dir = path
+        print(f'[Dashboard] Run #{n} → output: {path}')
+        return path
 
     def _update_trace_info_text(self):
         if hasattr(self, '_trace_info_text') and self.trace_run_dir:
             short = os.path.relpath(self.trace_run_dir)
+            tag_suffix = f' [{self.experiment_tag}]' if self.experiment_tag else ''
             self._trace_info_text.set_text(
-                f'trace →\n{short}\n(每 {self.trace_flush_every} 步自动写盘)'
+                f'run #{self.current_run_index}{tag_suffix}\n'
+                f'trace → {short}\n(每 {self.trace_flush_every} 步自动写盘)'
             )
 
     def _write_trace_meta(self):
         if not self.trace_run_dir:
             return
         meta = {
+            'run_index': self.current_run_index,
             'run_dir': self.trace_run_dir,
             'created_at': datetime.datetime.now().isoformat(timespec='seconds'),
             'experiment_tag': self.experiment_tag,
@@ -665,9 +726,16 @@ class SimulationDashboard:
                 pass
             self._heatmap_im = None
         if self._density_contour is not None:
+            # matplotlib >=3.8: QuadContourSet.remove() 直接生效
+            # matplotlib <3.8 : 退回到逐 collection 移除
             try:
-                for c in self._density_contour.collections:
-                    c.remove()
+                self._density_contour.remove()
+            except (AttributeError, NotImplementedError):
+                try:
+                    for c in self._density_contour.collections:
+                        c.remove()
+                except Exception:
+                    pass
             except Exception:
                 pass
             self._density_contour = None
@@ -711,26 +779,36 @@ class SimulationDashboard:
             return
         # 大规模自动降低点大小
         size = max(3, int(60 - 50 * min(1.0, n / 5000)))
-        positions_by_state = {'S': [], 'E': [], 'I': [], 'R': []}
-        colors_by_state = {'S': [], 'E': [], 'I': [], 'R': []}
-        pts_x, pts_y = [], []
-        for r in residents:
-            st = getattr(r, 'state', 'S')
-            positions_by_state.setdefault(st, []).append((r.x, r.y))
-            colors_by_state.setdefault(st, []).append(_emotion_color(getattr(r, 'stress_level', 0.0)))
-            if getattr(r, 'pts_status', False):
-                pts_x.append(r.x); pts_y.append(r.y)
+
+        # 一次性向量化抽取所有需要的字段
+        xs = np.fromiter((r.x for r in residents), dtype=np.float64, count=n)
+        ys = np.fromiter((r.y for r in residents), dtype=np.float64, count=n)
+        stress = np.fromiter(
+            (getattr(r, 'stress_level', 0.0) for r in residents), dtype=np.float64, count=n)
+        states = np.array([getattr(r, 'state', 'S') for r in residents])
+        pts_mask = np.fromiter(
+            (1 if getattr(r, 'pts_status', False) else 0 for r in residents), dtype=bool, count=n)
+
+        # 用 stress 阈值一次性算颜色索引（4 级配色）
+        thresholds = np.array([lv[0] for lv in EMOTION_LEVELS], dtype=np.float64)
+        colors_pool = [lv[1] for lv in EMOTION_LEVELS]
+        color_idx = np.searchsorted(thresholds, stress, side='right')
+        color_idx = np.clip(color_idx, 0, len(colors_pool) - 1)
+        color_arr = np.array(colors_pool, dtype=object)[color_idx]
+
+        coords = np.column_stack([xs, ys])
         for st, sc in self._scatter_by_state.items():
-            pts = positions_by_state.get(st, [])
-            if pts:
-                sc.set_offsets(np.array(pts))
-                sc.set_color(colors_by_state[st])
-                sc.set_sizes([size] * len(pts))
+            mask = states == st
+            if mask.any():
+                sc.set_offsets(coords[mask])
+                sc.set_color(color_arr[mask].tolist())
+                sc.set_sizes(np.full(int(mask.sum()), size))
             else:
                 sc.set_offsets(np.empty((0, 2)))
-        if pts_x:
-            self._pts_scatter.set_offsets(np.column_stack([pts_x, pts_y]))
-            self._pts_scatter.set_sizes([size * 4] * len(pts_x))
+
+        if pts_mask.any():
+            self._pts_scatter.set_offsets(coords[pts_mask])
+            self._pts_scatter.set_sizes(np.full(int(pts_mask.sum()), size * 4))
         else:
             self._pts_scatter.set_offsets(np.empty((0, 2)))
 
@@ -773,12 +851,12 @@ class SimulationDashboard:
             xs, ys, bins=(40, 40),
             range=[[xlim[0], xlim[1]], [ylim[0], ylim[1]]],
         )
-        # 简单的 box smooth
-        from scipy.ndimage import gaussian_filter
-        try:
-            H = gaussian_filter(H, sigma=1.5)
-        except Exception:
-            pass
+        # 简单的 box smooth（依赖 scipy；不可用时退化为原始 histogram）
+        if _gaussian_filter is not None:
+            try:
+                H = _gaussian_filter(H, sigma=1.5)
+            except Exception:
+                pass
         X, Y = np.meshgrid(0.5 * (xedges[:-1] + xedges[1:]),
                            0.5 * (yedges[:-1] + yedges[1:]))
         try:
@@ -791,33 +869,49 @@ class SimulationDashboard:
 
     def _render_quiver(self):
         residents = self.sim.residents
-        if not residents:
+        n = len(residents)
+        if n == 0:
             return
-        # 按 12x12 网格对速度做平均
-        xs = np.array([r.x for r in residents])
-        ys = np.array([r.y for r in residents])
-        vx = np.array([getattr(r, 'velocity', np.zeros(2))[0] if hasattr(getattr(r, 'velocity', None), '__len__') else 0
-                       for r in residents])
-        vy = np.array([getattr(r, 'velocity', np.zeros(2))[1] if hasattr(getattr(r, 'velocity', None), '__len__') else 0
-                       for r in residents])
+        # 一次性向量化提取位置 + 速度
+        xs = np.fromiter((r.x for r in residents), dtype=np.float64, count=n)
+        ys = np.fromiter((r.y for r in residents), dtype=np.float64, count=n)
+        vx = np.zeros(n, dtype=np.float64)
+        vy = np.zeros(n, dtype=np.float64)
+        for i, r in enumerate(residents):
+            vel = getattr(r, 'velocity', None)
+            if vel is not None and hasattr(vel, '__len__') and len(vel) >= 2:
+                vx[i] = vel[0]; vy[i] = vel[1]
+
         xlim = self.ax_map.get_xlim(); ylim = self.ax_map.get_ylim()
         nx, ny = 12, 12
         xe = np.linspace(xlim[0], xlim[1], nx + 1)
         ye = np.linspace(ylim[0], ylim[1], ny + 1)
         ix = np.clip(np.digitize(xs, xe) - 1, 0, nx - 1)
         iy = np.clip(np.digitize(ys, ye) - 1, 0, ny - 1)
-        U = np.zeros((nx, ny)); V = np.zeros((nx, ny)); C = np.zeros((nx, ny))
-        for i, j, u, v in zip(ix, iy, vx, vy):
-            U[i, j] += u; V[i, j] += v; C[i, j] += 1
+
+        # 用 np.add.at 矢量化累加，替代原来的 Python for 循环
+        U = np.zeros((nx, ny), dtype=np.float64)
+        V = np.zeros((nx, ny), dtype=np.float64)
+        C = np.zeros((nx, ny), dtype=np.float64)
+        np.add.at(U, (ix, iy), vx)
+        np.add.at(V, (ix, iy), vy)
+        np.add.at(C, (ix, iy), 1.0)
         mask = C > 0
         U[mask] /= C[mask]; V[mask] /= C[mask]
+
         Xc = 0.5 * (xe[:-1] + xe[1:])
         Yc = 0.5 * (ye[:-1] + ye[1:])
         Xm, Ym = np.meshgrid(Xc, Yc, indexing='ij')
         speed = np.hypot(U, V)
+
+        # scale_units='xy' + scale=0.05 在经纬度坐标下箭头会爆长；
+        # 改用 'inches' 让 quiver 自动按速度极值归一，箭头长度可读
+        vmax = float(speed[mask].max()) if mask.any() else 1.0
+        q_scale = max(vmax * 8.0, 1e-6)
         self._quiver = self.ax_map.quiver(
             Xm[mask], Ym[mask], U[mask], V[mask],
-            speed[mask], cmap='cool', scale=0.05, scale_units='xy',
+            speed[mask], cmap='cool',
+            scale=q_scale, scale_units='inches',
             width=0.004, alpha=0.85, zorder=3,
         )
 
@@ -830,22 +924,38 @@ class SimulationDashboard:
             colors.append(ZONE_FILL_POWERED if powered else ZONE_FILL_OUTAGE)
         self._zone_collection.set_facecolors(colors)
 
-    def _update_facility_colors(self):
-        # 简化：根据所在区域的停电状态决定颜色
+    def _ensure_facility_cache(self):
+        """infras 在 sim 生命周期内是静态的，分组 + zone 列表只算一次。
+
+        缓存结构 _facility_cache:
+            { ftype: { 'items': [...], 'zids': [zid,...], 'powered_color': hex } }
+        """
+        if getattr(self, '_facility_cache_sim', None) is self.sim:
+            return
         infras = getattr(self.sim, 'critical_infras', None) or []
-        groups = defaultdict(list)
+        cache = {}
         for f in infras:
             ftype = getattr(f, 'infra_type', None) or getattr(f, 'category', 'community')
-            groups[ftype].append(f)
-        for ftype, items in groups.items():
+            entry = cache.setdefault(ftype, {'items': [], 'zids': [],
+                                            'powered_color': FACILITY_COLORS.get(ftype, '#9E9E9E')})
+            entry['items'].append(f)
+            entry['zids'].append(getattr(f, 'zone', getattr(f, 'zone_id', None)))
+        self._facility_cache = cache
+        self._facility_cache_sim = self.sim
+
+    def _update_facility_colors(self):
+        # 简化：根据所在区域的停电状态决定颜色（infras 静态，分组缓存）
+        self._ensure_facility_cache()
+        for ftype, entry in self._facility_cache.items():
             sc = self._facility_scatters.get(ftype)
             if sc is None:
                 continue
-            colors = []
-            for f in items:
-                zid = getattr(f, 'zone', getattr(f, 'zone_id', None))
-                powered = self.sim.zone_status.get(zid, True) if zid else True
-                colors.append(FACILITY_COLORS.get(ftype, '#9E9E9E') if powered else FACILITY_OUTAGE_COLOR)
+            powered_color = entry['powered_color']
+            colors = [
+                powered_color if (zid is None or self.sim.zone_status.get(zid, True))
+                else FACILITY_OUTAGE_COLOR
+                for zid in entry['zids']
+            ]
             sc.set_facecolors(colors)
 
     # ------------------------------------------------------------------
@@ -856,34 +966,46 @@ class SimulationDashboard:
         n = max(1, len(residents))
         s = self.sim.step_count
         self.history['step'].append(s)
-        self.history['avg_stress'].append(sum(r.stress_level for r in residents) / n)
-        self.history['avg_emotion'].append(sum(getattr(r, 'emotion', 0.0) for r in residents) / n)
-        self.history['avg_panic'].append(sum(getattr(r, 'panic_value', 0.0) for r in residents) / n)
+
+        # 一次遍历提取所有居民标量，后续聚合全部用 numpy
+        stress_arr = np.fromiter(
+            (getattr(r, 'stress_level', 0.0) for r in residents), dtype=np.float64, count=len(residents))
+        emotion_arr = np.fromiter(
+            (getattr(r, 'emotion', 0.0) for r in residents), dtype=np.float64, count=len(residents))
+        panic_arr = np.fromiter(
+            (getattr(r, 'panic_value', 0.0) for r in residents), dtype=np.float64, count=len(residents))
+        hoard_arr = np.fromiter(
+            (1 if getattr(r, 'is_hoarding', False) else 0 for r in residents), dtype=np.int8, count=len(residents))
+        herd_arr = np.fromiter(
+            (1 if getattr(r, '_herd_active', False) else 0 for r in residents), dtype=np.int8, count=len(residents))
+        zone_arr = [getattr(r, 'zone', getattr(r, 'zone_id', None)) for r in residents]
+
+        self.history['avg_stress'].append(float(stress_arr.mean()) if len(residents) else 0.0)
+        self.history['avg_emotion'].append(float(emotion_arr.mean()) if len(residents) else 0.0)
+        self.history['avg_panic'].append(float(panic_arr.mean()) if len(residents) else 0.0)
+
         n_off = sum(1 for p in self.sim.zone_status.values() if not p)
         n_zone = max(1, len(self.sim.zone_status))
         self.history['outage_ratio'].append(n_off / n_zone)
-        self.history['hoard_ratio'].append(
-            sum(1 for r in residents if getattr(r, 'is_hoarding', False)) / n
-        )
-        self.history['herd_ratio'].append(
-            sum(1 for r in residents if getattr(r, '_herd_active', False)) / n
-        )
+        self.history['hoard_ratio'].append(float(hoard_arr.sum()) / n)
+        self.history['herd_ratio'].append(float(herd_arr.sum()) / n)
 
-        # 分区历史
+        # 分区历史：用 zone→district 反向索引一次性分组
         d2z = getattr(self.sim, 'district_to_zones', {}) or {}
-        for d, zones in d2z.items():
-            zset = set(zones)
-            sub = [r for r in residents if getattr(r, 'zone', getattr(r, 'zone_id', None)) in zset]
-            if not sub:
-                continue
-            ns = max(1, len(sub))
-            h = self.district_history.setdefault(d, self._empty_history())
-            h['step'].append(s)
-            h['avg_stress'].append(sum(r.stress_level for r in sub) / ns)
-            h['avg_emotion'].append(sum(getattr(r, 'emotion', 0.0) for r in sub) / ns)
-            h['avg_panic'].append(sum(getattr(r, 'panic_value', 0.0) for r in sub) / ns)
-            n_off_z = sum(1 for z in zones if not self.sim.zone_status.get(z, True))
-            h['outage_ratio'].append(n_off_z / max(1, len(zones)))
+        if d2z:
+            zone_to_district = {z: d for d, zs in d2z.items() for z in zs}
+            district_arr = np.array([zone_to_district.get(z, None) for z in zone_arr], dtype=object)
+            for d, zones in d2z.items():
+                mask = district_arr == d
+                if not mask.any():
+                    continue
+                h = self.district_history.setdefault(d, self._empty_history())
+                h['step'].append(s)
+                h['avg_stress'].append(float(stress_arr[mask].mean()))
+                h['avg_emotion'].append(float(emotion_arr[mask].mean()))
+                h['avg_panic'].append(float(panic_arr[mask].mean()))
+                n_off_z = sum(1 for z in zones if not self.sim.zone_status.get(z, True))
+                h['outage_ratio'].append(n_off_z / max(1, len(zones)))
 
         # SEIR 历史
         seir_count = {'S': 0, 'E': 0, 'I': 0, 'R': 0}
@@ -1001,11 +1123,12 @@ class SimulationDashboard:
         outage = self.history['outage_ratio'][-1] if self.history['outage_ratio'] else 0.0
         hoard = self.history['hoard_ratio'][-1] if self.history['hoard_ratio'] else 0.0
         herd = self.history['herd_ratio'][-1] if self.history['herd_ratio'] else 0.0
+        layer_key = LAYER_LABEL_TO_KEY.get(self.layer_mode, self.layer_mode)
         self._status_text.set_text(
             f"Step={s}/{self.total_steps} | t={t:.1f}h "
             f"| Stress={stress:.3f} | Outage={outage:.0%} "
             f"| Hoard={hoard:.0%} | Herd={herd:.0%} "
-            f"| Layer={self.layer_mode} | Speed={self.speed}x | Mode={self.outage_mode}"
+            f"| Layer={layer_key} | Speed={self.speed}x | Mode={self.outage_mode}"
         )
         self._step_text.set_text(
             f"Step {s} | t={t:.1f}h\nσ̄={stress:.3f}\nOutage={outage:.0%}"
@@ -1083,16 +1206,36 @@ class SimulationDashboard:
         if self.recording_gif:
             self._capture_frame()
 
+    def _reset_frame_cache(self):
+        """清空帧缓存并删除对应的临时目录。"""
+        old_dir = self.frame_dir
+        self.frame_cache = []
+        self.frame_dir = None
+        if old_dir and os.path.isdir(old_dir):
+            try:
+                import shutil
+                shutil.rmtree(old_dir, ignore_errors=True)
+            except Exception:
+                pass
+
     def _capture_frame(self):
-        # 保存为内存 PNG → PIL Image
+        """流式落盘：每帧写到临时目录里，不全量保留在内存中。
+
+        旧实现是把 PIL Image 全塞在 self.frame_cache 里，
+        n 帧 × 16×9inch@70dpi RGB ≈ 几十 MB/帧，几百帧后就会爆几个 GB。
+        现在改为：捕获时 savefig 到 self.frame_dir/frame_xxxxx.png，
+        cache 只保留路径。bbox_inches='tight' 也去掉——
+        否则每帧的实际像素尺寸会因文字长度变化，PIL 合 GIF 会报尺寸不一。
+        """
         try:
-            from io import BytesIO
-            from PIL import Image
-            buf = BytesIO()
-            self.fig.savefig(buf, format='png', dpi=70, bbox_inches='tight')
-            buf.seek(0)
-            img = Image.open(buf).convert('RGB')
-            self.frame_cache.append(img)
+            if self.frame_dir is None:
+                import tempfile
+                self.frame_dir = tempfile.mkdtemp(prefix='ccd_dashboard_frames_')
+            idx = len(self.frame_cache)
+            path = os.path.join(self.frame_dir, f'frame_{idx:06d}.png')
+            # 关键：不要传 bbox_inches='tight'，否则各帧像素尺寸会漂移
+            self.fig.savefig(path, format='png', dpi=70)
+            self.frame_cache.append(path)
         except Exception as e:
             print(f"[Dashboard] capture_frame: {e}")
 
@@ -1115,17 +1258,12 @@ class SimulationDashboard:
                 'district_history': {k: v.copy() for k, v in self.district_history.items()},
                 'seir_history': self.seir_history.copy(),
             })
-        # 清掉旧 district 线
-        for ln in self._district_lines.values():
-            try:
-                ln.remove()
-            except Exception:
-                pass
+        # #10: 三个 metric 轴全部 cla()，清掉上一次 run 的 axvspan/axvline 残留，
+        # 再用 _build_metric_axes 把 Line2D 引用重新建好
         self._district_lines = {}
-        self.ax_metric1.cla()
-        self.ax_metric1.set_title('分区平均压力（按区县）', fontsize=10, fontweight='bold')
-        self.ax_metric1.set_ylim(0, 1)
-        self.ax_metric1.grid(True, alpha=0.3)
+        for ax in (self.ax_metric0, self.ax_metric1, self.ax_metric2):
+            ax.cla()
+        self._build_metric_axes()
         self._create_sim()
         self._draw_zone_patches()
         self._draw_facilities_static()
@@ -1148,19 +1286,26 @@ class SimulationDashboard:
         elif label == '录制GIF':
             self.recording_gif = not self.recording_gif
             if self.recording_gif:
-                self.frame_cache = []
+                # 新一轮录制：丢弃旧帧缓存与对应 tempdir
+                self._reset_frame_cache()
 
     def _on_export_gif(self, event):
         if not self.frame_cache:
             print('[Dashboard] 暂无帧可导出 — 请先勾选"录制GIF"再运行仿真。')
             return
-        path = os.path.join(self.output_dir, f'dashboard_{int(time.time())}.gif')
+        out_dir = self._ensure_output_run_dir()
+        path = os.path.join(out_dir, 'dashboard.gif')
         try:
-            self.frame_cache[0].save(
-                path, save_all=True, append_images=self.frame_cache[1:],
+            from PIL import Image
+            # 流式打开第一帧、后续帧按路径懒加载，合成完立刻释放
+            frames = self.frame_cache
+            first = Image.open(frames[0]).convert('RGB')
+            rest = (Image.open(p).convert('RGB') for p in frames[1:])
+            first.save(
+                path, save_all=True, append_images=list(rest),
                 duration=120, loop=0, optimize=True,
             )
-            print(f'[Dashboard] GIF 已导出: {path} ({len(self.frame_cache)} 帧)')
+            print(f'[Dashboard] GIF 已导出: {path} ({len(frames)} 帧)')
         except Exception as e:
             print(f'[Dashboard] GIF 导出失败: {e}')
 
@@ -1169,6 +1314,7 @@ class SimulationDashboard:
             from .trace_plotter import plot_overview, plot_traces
         except ImportError:
             from trace_plotter import plot_overview, plot_traces
+        out_dir = self._ensure_output_run_dir()
         baseline_end = self.outage_step
         outage_end = None
         for ev in self.events:
@@ -1176,38 +1322,56 @@ class SimulationDashboard:
                 outage_end = ev.get('step')
         events_for_plot = [{'step': ev['step'], 'label': ev.get('label'),
                             'color': ev.get('color')} for ev in self.events]
-        overview_path = os.path.join(self.output_dir, 'overview.png')
+        overview_path = os.path.join(out_dir, 'overview.png')
         plot_overview(
             self.history, self.district_history, self.seir_history,
             out_path=overview_path,
             events=events_for_plot,
             baseline_end=baseline_end, outage_end=outage_end,
         )
-        traces_path = os.path.join(self.output_dir, 'traces.png')
+        traces_path = os.path.join(out_dir, 'traces.png')
         plot_traces([self.history], labels=['current'],
                     out_path=traces_path,
                     events=events_for_plot,
                     baseline_end=baseline_end, outage_end=outage_end)
         # 保存 history.json
-        json_path = os.path.join(self.output_dir, 'step_history.json')
+        json_path = os.path.join(out_dir, 'step_history.json')
         with open(json_path, 'w', encoding='utf-8') as f:
             json.dump({
                 'history': self.history,
                 'district_history': self.district_history,
                 'seir_history': self.seir_history,
                 'events': self.events,
+                'run_index': self.current_run_index,
             }, f, ensure_ascii=False, indent=2)
         # 强制把当前 trace 写入对应 run 子目录
         self._flush_traces(force=True)
-        print(f'[Dashboard] 已保存: {overview_path}, {traces_path}, {json_path}')
+        print(f'[Dashboard] Run #{self.current_run_index} 已保存:')
+        print(f'  - {overview_path}')
+        print(f'  - {traces_path}')
+        print(f'  - {json_path}')
         if self.trace_run_dir:
-            print(f'[Dashboard] Trace CSV → {self.trace_run_dir}')
+            print(f'  - Trace CSV → {self.trace_run_dir}')
 
     def _on_load_history(self, event):
-        path = os.path.join(self.output_dir, 'step_history.json')
-        if not os.path.exists(path):
-            print(f'[Dashboard] 未找到历史文件: {path}')
+        """加载历史 run：优先取最新的 output/output_N/step_history.json，
+        若不存在则回退到老路径 output/step_history.json（向后兼容）。"""
+        path = None
+        latest_n = self._scan_max_index(self.output_dir, 'output')
+        # 从最大 N 倒着找第一个含 step_history.json 的目录
+        for n in range(latest_n, 0, -1):
+            cand = os.path.join(self.output_dir, f'output_{n}', 'step_history.json')
+            if os.path.exists(cand):
+                path = cand
+                break
+        if path is None:
+            legacy = os.path.join(self.output_dir, 'step_history.json')
+            if os.path.exists(legacy):
+                path = legacy
+        if path is None:
+            print(f'[Dashboard] 未找到任何 step_history.json（已扫 output/output_*/）')
             return
+        print(f'[Dashboard] 加载历史: {path}')
         try:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
