@@ -59,6 +59,7 @@ class CityManager:
 
         self.map_data_dir = map_data_dir
         self._city_cache = {}  # 缓存城市数据
+        self._road_graph_cache = {}  # 会话内 networkx 图缓存 {(city, district): G}
 
     def get_available_cities(self):
         """
@@ -403,6 +404,48 @@ class CityManager:
             'center': city_data['center'],
             'districts': list(city_data['districts'].keys())
         }
+
+    # =================================================================
+    # 路网图（road network graph）接入
+    # =================================================================
+    def load_road_graph(self, city_name, district_name=None,
+                        network_type='walk', place_query=None,
+                        force_rebuild=False):
+        """加载城市/区路网图（networkx MultiDiGraph）。
+
+        优先读 road_graph_cache/{city}_{district}.graphml；
+        不存在时通过 osmnx.graph_from_place 联网下载并缓存。
+        本会话内会缓存到 self._road_graph_cache 避免重复 IO。
+
+        Args:
+            city_name: 城市名称，如 '厦门市'
+            district_name: 区县名称，如 '思明区'；None 则取整个城市
+            network_type: osmnx 网络类型，默认 'walk'（适合疏散仿真）
+            place_query: 自定义 Nominatim 查询字符串；默认 f"{city_name}{district_name}"
+            force_rebuild: True 时强制重新下载并覆盖缓存
+
+        Returns:
+            networkx.MultiDiGraph
+        """
+        cache_key = (city_name, district_name)
+        if not force_rebuild and cache_key in self._road_graph_cache:
+            return self._road_graph_cache[cache_key]
+
+        try:
+            from core.road_graph import load_or_build
+        except ImportError as e:
+            raise ImportError(
+                "需要 core.road_graph（依赖 osmnx）。请在 Crowds_sim env 中执行:\n"
+                "    conda install -n Crowds_sim -c conda-forge osmnx"
+            ) from e
+
+        G = load_or_build(
+            city_name, district_name,
+            network_type=network_type, place_query=place_query,
+            force_rebuild=force_rebuild,
+        )
+        self._road_graph_cache[cache_key] = G
+        return G
 
 
 # 单例实例

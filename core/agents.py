@@ -1644,6 +1644,26 @@ class ResidentAgent:
         self.zone = None
         self.neighbors = []
 
+        # =============================================================
+        # 【M2 新增】路网图状态 — agent 在 road graph 上的位置 + 路径
+        # =============================================================
+        # 由 simulation 在初始化时调 road_graph.snap_to_node() 落到节点；
+        # 行为决策 (I1) 写入 target_node；路径规划 (path_planner) 写入 current_path。
+        # 不动 σ/OCEAN/SEIR 任何字段；以下纯增量。
+        self.current_node = None          # 当前所在 OSM node id (int|None)
+        self.target_node = None           # I1 决策的语义目标 (home/store/leader_node)
+        self.home_node = None             # 家对应的 graph node id (sim init 时 snap)
+        self.current_path = []            # [node_0, node_1, ...] Dijkstra 给出的路径
+        self.path_progress = 0            # current_path[path_progress] 应该是当前 node
+        self.current_edge = None          # (u, v, k) 当前正在通过的 edge key
+        self._steps_since_replan = 0      # 动态重路由用：上次 replan 距今多少步
+        self._last_target_node = None     # 检测 target_node 变化以触发 replan
+        self._dom_action = None           # I1 当前主导行为 'home'/'hoard'/'herd'/'flee'/'stay'
+        # 【M3+ Shelter】最近避难所 (sim 在 _init_shelters_if_enabled 时填充)
+        self.nearest_shelter_node = None  # graph node id of nearest shelter
+        self.nearest_shelter_xy = None    # (lon, lat) of nearest shelter
+        self.nearest_shelter_id = None    # 对应 csv 里的 id (调试用)
+
         # SEIR状态
         self.state = seir_type
         self.incubation = 0.0

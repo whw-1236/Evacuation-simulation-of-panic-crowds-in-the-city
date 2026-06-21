@@ -587,9 +587,15 @@ class SimulationDashboard:
                 w = csv.writer(f)
                 w.writerow(['step', 't_hour', 'avg_stress', 'avg_emotion',
                             'avg_panic', 'outage_ratio', 'hoard_ratio',
-                            'herd_ratio'])
+                            'herd_ratio',
+                            # 【M3 T14】路网层指标
+                            'avg_edge_congestion', 'pct_on_path',
+                            'max_edge_occupancy'])
                 dt = float(getattr(self.sim, 'dt', 0.25))
                 steps = self.history['step']
+                avg_cong = self.history.get('avg_edge_congestion', [])
+                pct_path = self.history.get('pct_on_path', [])
+                max_occ = self.history.get('max_edge_occupancy', [])
                 for i, s in enumerate(steps):
                     w.writerow([
                         s, round(s * dt, 4),
@@ -599,6 +605,9 @@ class SimulationDashboard:
                         round(self.history['outage_ratio'][i], 6),
                         round(self.history['hoard_ratio'][i], 6),
                         round(self.history['herd_ratio'][i], 6),
+                        round(avg_cong[i], 6) if i < len(avg_cong) else 0.0,
+                        round(pct_path[i], 6) if i < len(pct_path) else 0.0,
+                        round(max_occ[i], 3) if i < len(max_occ) else 0.0,
                     ])
         except Exception as e:
             print(f'[Dashboard] global_metrics.csv 写入失败: {e}')
@@ -647,6 +656,14 @@ class SimulationDashboard:
                     ])
         except Exception as e:
             print(f'[Dashboard] seir.csv 写入失败: {e}')
+
+        # ---- 【M3 T14】edge_observations（仅当 use_road_graph）----
+        try:
+            if getattr(self.sim, 'use_road_graph', False):
+                edge_path = os.path.join(self.trace_run_dir, 'edge_observations.csv')
+                self.sim.write_edge_observations(edge_path)
+        except Exception as e:
+            print(f'[Dashboard] edge_observations.csv 写入失败: {e}')
 
         # ---- 事件 ----
         events_path = os.path.join(self.trace_run_dir, 'events.csv')
@@ -989,6 +1006,35 @@ class SimulationDashboard:
         self.history['outage_ratio'].append(n_off / n_zone)
         self.history['hoard_ratio'].append(float(hoard_arr.sum()) / n)
         self.history['herd_ratio'].append(float(herd_arr.sum()) / n)
+
+        # 【M3 T14】路网层 graph 指标：congestion / 上路率 / 最大 edge occupancy
+        # use_road_graph=False 时全部 0, 不影响旧分析
+        cong_vals = np.fromiter(
+            (float(getattr(r, '_edge_congestion', 0.0)) for r in residents),
+            dtype=np.float64, count=len(residents),
+        )
+        on_path_arr = np.fromiter(
+            (1 if getattr(r, 'current_edge', None) is not None else 0
+             for r in residents),
+            dtype=np.int8, count=len(residents),
+        )
+        self.history.setdefault('avg_edge_congestion', []).append(
+            float(cong_vals.mean()) if len(residents) else 0.0)
+        self.history.setdefault('pct_on_path', []).append(
+            float(on_path_arr.mean()) if len(residents) else 0.0)
+        G = getattr(self.sim, 'road_graph', None)
+        if G is not None:
+            try:
+                max_occ = max(
+                    (float(d.get('occupancy', 0))
+                     for _, _, _, d in G.edges(keys=True, data=True)),
+                    default=0.0,
+                )
+            except Exception:
+                max_occ = 0.0
+        else:
+            max_occ = 0.0
+        self.history.setdefault('max_edge_occupancy', []).append(max_occ)
 
         # 分区历史：用 zone→district 反向索引一次性分组
         d2z = getattr(self.sim, 'district_to_zones', {}) or {}

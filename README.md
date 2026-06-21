@@ -264,37 +264,156 @@ AblationPreset 类提供一键切换的消融配置：
 
 ---
 
+## 12. 路网层与避难所架构 ⭐（2026-06-21 M2 / M3 / M3+ 新增）
+
+把模型从"连续空间 social force"升级为 **graph-constrained ABM + 真实避难所驱动 flee 行为**，目的是让仿真能与城市真实路网拓扑对齐、给论文的 §4.2 / §5.x 提供硬证据。
+
+### 12.1 三层架构
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Layer 1: GeoJSON polygon  (行政边界 + 真实 POI, 不动)      │
+├──────────────────────────────────────────────────────────┤
+│ Layer 2: OSM road graph  (osmnx 下载 + edge capacity)     │
+│   - 节点 = 路口     边 = 路段 (length / capacity / speed) │
+├──────────────────────────────────────────────────────────┤
+│ Layer 3: Agent 行为 (I1/I2/I3) → target_node              │
+│   - I1 stress 驱动 (home/hoard/herd/flee)                 │
+│   - Dijkstra 路径规划 (congestion-aware + 动态重路由)     │
+│   - Greenshields 速度衰减 (软约束)                        │
+│   - 拥堵 → σ 反馈 (panic cascade loop)                    │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 12.2 启用方式
+
+向后兼容：默认 `use_road_graph=False`，行为不变。打开方式（在 `city_config` 里加一个键）：
+
+```python
+city_config = {
+    'city': '厦门市',
+    'geojson_paths': [...],
+    'districts': ['思明区'],
+    'use_road_graph': True,    # ← M2 关键开关
+}
+sim = BlackoutSimulation(config=cfg, city_config=city_config)
+```
+
+仿真启动后会自动：
+1. 从 `road_graph_cache/{城市}_{区}.graphml` 读图（缺失则联网下载并缓存）
+2. 调 `snap_to_nodes_batch` 把所有 agent 落到最近的 graph node（current_node = home_node）
+3. 加载 `simulation map data/{城市}/{区}/{区}POI/应急.csv`，过滤出真避难所，给每个 agent 分配最近 shelter（KD-Tree）
+4. 把 graph 引用注入 `social_force.road_graph`，让 driving_force 朝路径走
+
+### 12.3 Panic Cascade Loop（论文加分点）
+
+```
+拥堵 (cong↑)
+    ↓ feedback_congestion=+0.05 × cong / step
+σ 被推升
+    ↓ sigmoid 权重压向 herd
+agent 转为 herd, 聚集到同 edge
+    ↓
+edge occupancy↑ → cong↑ (循环)
+```
+
+### 12.4 Flee 行为（M3+ 新增）
+
+当 `σ > 0.6` 且 agent 有最近避难所时，I1 强制 `target_node = nearest_shelter_node`，覆盖 home/hoard/herd 决策。在厦门思明区跑 N=800 时，peak flee_ratio ≈ 10.4%，即约 83 个 agents 同时向真实避难所逃。
+
+| 关键参数 | 位置 | 默认值 |
+|---|---|---|
+| `feedback_congestion` | `SwitchParams` | +0.05 |
+| `enable_congestion_feedback` | `SwitchParams` | True |
+| `flee_threshold` | `SwitchParams` | 0.6（= PTS 进入阈值） |
+| `enable_flee_behavior` | `SwitchParams` | True |
+| `CONGESTION_WEIGHT_ALPHA` | `path_planner` | 2.0 |
+| `REPLAN_EVERY_STEPS` | `path_planner` | 25 |
+| `DEFAULT_JAM_RATIO` (Greenshields) | `movement_layer` | 0.9 |
+| `DEFAULT_OCC_DECAY` | `movement_layer` | 0.5 |
+| `MIN_SPEED_FACTOR` | `movement_layer` | 0.10 |
+
+### 12.5 trace 输出扩展
+
+`global_metrics.csv` 增 3 列：
+- `avg_edge_congestion` — 所有 agent 当前 edge 拥堵率的均值
+- `pct_on_path` — 多少比例的 agent 当前正在 edge 上
+- `max_edge_occupancy` — 全图最大单边 occupancy
+
+新增 `edge_observations.csv` — 仿真结束时 dump 每条边的累计观测，字段：
+`edge_id, u, v, k, highway, length_m, capacity_per_step, cum_occupancy, mean_occupancy, peak_occupancy`
+
+用于 T16 betweenness ↔ 仿真观测的 Pearson 相关性分析。
+
+### 12.6 三城路网指标对比（V3 polish）
+
+`_compare_cities.py` 跑厦门思明 / 沈阳沈河 / 北京东城，输出：
+- `road_graph_cache/{城市}_{区}/metrics.json`（4 组指标）
+- `orientation_rose.png`（玫瑰图：方位熵 0.991 / 0.941 / 0.743）
+- `betweenness_heatmap.png`（瓶颈预测）
+
+四组指标：
+1. **topology**：节点/边数、路网总长、面积（**polygon 而非 bbox**）、密度、平均路段长
+2. **geometry**：方位熵（归一化 [0,1]）、circuity、bearing 36-bin 直方图（可离线重画玫瑰图）
+3. **evacuation**：betweenness max/mean/std/**Gini**/**top-1% share**、top-10 节点、直径
+4. **coupling**：人口、人均路网、人均路口
+
+---
+
 ## 代码模块总览
 
 ```
 Evacuation-simulation-of-panic-crowds-in-the-city/
 ├── core/
-│   ├── agents.py              # 5类Agent (3093行)
-│   ├── behavior_switching.py  # ⭐ I1/I2/I3 + P1.A/P1.B/P2/P3 扩展 (499行)
-│   ├── social_force.py        # 社会力 + Greenshields (1188行)
-│   ├── unified_stress_model.py # Lazarus统一压力模型 (637行) — pts_status 真值来源
+│   ├── agents.py              # 5类Agent (~3100行) +graph state字段
+│   ├── behavior_switching.py  # ⭐ I1/I2/I3 + P1.A/P1.B/P2/P3 + 拥堵反馈 + flee 行为
+│   ├── social_force.py        # 社会力 + path-based driving + Greenshields 速度衰减
+│   ├── unified_stress_model.py # Lazarus统一压力模型 (637行)
 │   ├── region_manager.py      # GeoJSON区域管理 (1276行)
-│   ├── event_types.py         # 事件类型定义 (209行)
-│   ├── event_recorder.py      # 事件记录器 (628行)
-│   └── event_influence.py     # 事件影响计算 (1995行)
+│   ├── event_types.py         # 事件类型定义
+│   ├── event_recorder.py      # 事件记录器
+│   ├── event_influence.py     # 事件影响计算
+│   ├── road_graph.py          # ⭐ 【M2 新增】osmnx 下载 + edge 标注 + snap helper
+│   ├── path_planner.py        # ⭐ 【M2 新增】Dijkstra + congestion-aware + 动态重路由
+│   ├── movement_layer.py      # ⭐ 【M2 新增】Greenshields + node load + occupancy decay
+│   ├── city_metrics.py        # ⭐ 【M2 新增】4 组路网指标 + Gini + 玫瑰图 + 热力图
+│   └── shelter_loader.py      # ⭐ 【M3+ 新增】应急.csv 加载 + name 过滤
 ├── decision/
-│   ├── base.py                # 决策接口定义
-│   ├── rule_based.py          # 规则专家系统
-│   └── utility.py             # 效用函数
+│   ├── base.py rule_based.py utility.py
 ├── config/
-│   ├── config.py              # 路径/模型参数配置
-│   ├── behavior_config.py     # Agent行为参数
-│   ├── city_manager.py        # 多城市管理
-│   └── simulation_config.py   # ⭐ 超参数集中管理 + 消融预设（含 I1 扩展）
+│   ├── config.py simulation_config.py behavior_config.py
+│   └── city_manager.py        # ⭐ +load_road_graph 方法
 ├── simulation/
-│   └── simulation.py          # 仿真主引擎 (2246行)
+│   └── simulation.py          # ⭐ +_init_road_graph + _init_shelters + _path_planning_hook
 ├── visualization/
-│   ├── dashboard.py           # ⭐ 交互式仪表盘 SimulationDashboard (1258行)
-│   ├── small_area_viewer.py   # 区域地图可视化 (235行)
-│   └── trace_plotter.py       # 时序曲线绘制 (384行)
-├── run_dashboard.py           # 一键启动仪表盘的 CLI 入口
-├── output/                    # 仪表盘截图 / 概览图 / step_history.json
-├── trace_output/              # 每次 run 的 trace CSV (run_<时间戳>_<tag>/)
+│   ├── dashboard.py           # ⭐ +avg_edge_congestion/pct_on_path/max_edge_occupancy 字段
+│   ├── small_area_viewer.py
+│   └── trace_plotter.py
+├── road_graph_cache/          # ⭐ 【M2 新增】OSM graphml + metrics.json + plots
+│   ├── 厦门市_思明区.graphml
+│   ├── 沈阳市_沈河区.graphml
+│   ├── 北京市_东城区.graphml
+│   └── {城市}_{区}/{metrics.json, orientation_rose.png, betweenness_heatmap.png}
+├── _compare_cities.py         # ⭐ 【M2 新增】三城 metrics 对比脚本
+├── _t5_validate.py            # ⭐ 【M1 新增】单城市 metrics 验证
+├── _t15_harness.py            # ⭐ 【M3 新增】graph-on vs off 对照实验 harness
+├── _t16_correlation.py        # ⭐ 【M3 新增】betweenness ↔ 仿真观测相关性
+├── _t16b_shelter_aware.py     # ⭐ 【M3+ 新增】shelter-aware betweenness 对照
+├── run_dashboard.py           # 一键启动仪表盘
+├── output/                    # 截图 / 概览图
+├── trace_output/              # ⭐ 每次 run 的 trace CSV +edge_observations.csv
+├── simulation map data/       # Layer 1 polygon + POI CSV
 ├── 属性说明.md                 # 输出数据JSON属性详解
 └── README.md                  # 本文档
 ```
+
+### 复现命令（必须先 conda activate Crowds_sim）
+
+```powershell
+# Windows PowerShell, 推荐 cmd /c 包裹
+cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _compare_cities.py"
+cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _t15_harness.py"
+cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _t16_correlation.py"
+```
+
+> ⚠️ **不要直接在 PowerShell 里 `& env\python.exe script.py`**——DLL 搜索路径不会包含 `Library/bin`，会让 matplotlib 等 C 扩展炸 `0xc06d007f`。详见 Obsidian [[2026-06-21 M2-M3 工程困难与解决方案]] 第 1 节。
