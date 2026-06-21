@@ -4,7 +4,7 @@ Python simulation model for panic crowd evacuation in urban public space.
 
 本项目是基于多智能体的城市停电应急仿真系统，用于模拟大规模停电事件下居民的心理-行为动态、基础设施响应以及政府/电网的应急决策过程。该系统对应 IJDRR 论文 *"城市大停电下的人群行为动态仿真研究"* 的 Methodology 第3章，所有模块均与论文公式对齐。
 
-> **PTS 定义修订（2026-06-12 已确认）**：`pts_status` 由 **σ 迟滞带** 控制：进入 σ ≥ 0.8 × 性格系数（封顶 0.95）、退出 σ < 0.5 × 性格系数（迟滞带 0.3）；非永久锁存。基准取 EXTREME（0.8），PTS 为少数极端态。依据文献（SIR 含 Recovered 态、P-SIS 情绪可逆、伊比利亚大停电情绪随恢复消退）：PTS 不永久锁存但需迟滞。
+> **PTS 定义修订 **：`pts_status` 由 **σ 迟滞带** 控制：进入 σ ≥ 0.8 × 性格系数（封顶 0.95）、退出 σ < 0.5 × 性格系数（迟滞带 0.3）；非永久锁存。基准取 EXTREME（0.8），PTS 为少数极端态。依据文献（SIR 含 Recovered 态、P-SIS 情绪可逆、伊比利亚大停电情绪随恢复消退）：PTS 不永久锁存但需迟滞。
 
 ---
 
@@ -96,7 +96,7 @@ Leader 评分 = α_s·(1-E_j) + α_f·f_ij + α_v·可见性
 
 **滞后切换规则**：新候选者得分必须超过当前 leader 的 μ 倍（μ=1.3）才切换，防止每步重选导致的羊群崩溃（消融：μ=1.0 退化为无惯性）。
 
-### 3.4 I1 扩展（2026-06-13 新增 P1.A / P1.B / P2 / P3）
+### 3.4 I1 扩展（ 新增 P1.A / P1.B / P2 / P3）
 
 四项独立可消融增强（全部受 `SwitchParams` 开关控制）：
 
@@ -221,7 +221,7 @@ Leader 评分 = α_s·(1-E_j) + α_f·f_ij + α_v·可见性
 
 ### 9.1 超参数集中管理
 
-`config/simulation_config.py` 提供 SimulationConfig dataclass，所有论文 Table 2 参数集中在此：
+`config/simulation_config.py` 提供 SimulationConfig dataclass，所有参数集中在此：
 
 - I1/I2/I3 全部参数（θ₁, θ₂, k₁~k₄, λ_d/f/c, μ 等）
 - 社会力模型参数（A, B, τ, K, κ, λ）
@@ -264,7 +264,7 @@ AblationPreset 类提供一键切换的消融配置：
 
 ---
 
-## 12. 路网层与避难所架构 ⭐（2026-06-21 M2 / M3 / M3+ 新增）
+## 12. 路网层与避难所架构 ⭐（ M2 / M3 / M3+ 新增）
 
 把模型从"连续空间 social force"升级为 **graph-constrained ABM + 真实避难所驱动 flee 行为**，目的是让仿真能与城市真实路网拓扑对齐、给论文的 §4.2 / §5.x 提供硬证据。
 
@@ -305,7 +305,7 @@ sim = BlackoutSimulation(config=cfg, city_config=city_config)
 3. 加载 `simulation map data/{城市}/{区}/{区}POI/应急.csv`，过滤出真避难所，给每个 agent 分配最近 shelter（KD-Tree）
 4. 把 graph 引用注入 `social_force.road_graph`，让 driving_force 朝路径走
 
-### 12.3 Panic Cascade Loop（论文加分点）
+### 12.3 Panic Cascade Loop
 
 ```
 拥堵 (cong↑)
@@ -416,4 +416,3 @@ cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _t
 cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _t16_correlation.py"
 ```
 
-> ⚠️ **不要直接在 PowerShell 里 `& env\python.exe script.py`**——DLL 搜索路径不会包含 `Library/bin`，会让 matplotlib 等 C 扩展炸 `0xc06d007f`。详见 Obsidian [[2026-06-21 M2-M3 工程困难与解决方案]] 第 1 节。
