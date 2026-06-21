@@ -95,6 +95,18 @@ class SwitchParams:
     feedback_failure_amplify_repeat: float = 0.2  # 连续失败累乘加成 (每次 +20%)
     enable_outcome_feedback: bool = True
 
+    # M2 新增 — 拥堵直接驱动 σ 上升 (panic cascade loop)
+    # 读 agent._edge_congestion (由 _path_planning_hook 维护)
+    # cong=1.0 时 σ 推升 +0.05/step；cong=0.5 时 +0.025/step
+    feedback_congestion: float = +0.05
+    enable_congestion_feedback: bool = True
+
+    # M3+ Shelter — flee 行为：stress > 阈值时强制冲向最近避难所
+    # 覆盖 home/hoard/herd 的 target_node, 让 agent 跨网络移动 (激活 betweenness 节点)
+    # 0.6 = PTS 进入阈值, 与 unified_stress_model.THRESHOLD_HIGH_PANIC 一致
+    flee_threshold: float = 0.6
+    enable_flee_behavior: bool = True
+
     # ---------------------------------------------------------------
     # P2 — behavioral demonstration (θ pull-down by neighbour ratio)
     # ---------------------------------------------------------------
@@ -357,6 +369,13 @@ def apply_outcome_feedback(agent, p):
             # 跟随中且未拥堵 → 视为顺利疏散
             delta += p.feedback_herd_smooth
 
+    # --- 【M2】拥堵 → σ 反馈 (panic cascade loop) ---
+    # agent._edge_congestion 由 simulation._path_planning_hook 维护
+    if p.enable_congestion_feedback:
+        cong = float(getattr(agent, '_edge_congestion', 0.0))
+        if cong > 0:
+            delta += p.feedback_congestion * cong
+
     if abs(delta) > 0:
         old = getattr(agent, 'stress_level', 0.0)
         agent.stress_level = max(0.0, min(1.0, old + delta))
@@ -463,6 +482,46 @@ def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
         )
     else:
         agent._goal_shares = (w_home / W, w_hoard / W, w_herd / W)
+
+    # =====================================================================
+    # M2 新增: 推导 target_node (语义目标)，给 path_planner 用。
+    # 不破坏 (dx, dy) 返回值——sigmoid blend 给 movement layer fallback；
+    # target_node 给 graph-constrained 路径规划主路。
+    # =====================================================================
+    home_node = getattr(agent, 'home_node', None)
+    hoard_node = s_star.get('node_id') if (s_star is not None) else None
+    herd_node = getattr(leader, 'current_node', None) if (leader is not None) else None
+
+    # ----- M3+ Shelter flee override (优先级最高) -----
+    # σ 超过阈值 + 有最近避难所 → 强制冲向避难所, 让 path 跨网络
+    shelter_node = getattr(agent, 'nearest_shelter_node', None)
+    if (p.enable_flee_behavior
+        and shelter_node is not None
+        and E > p.flee_threshold):
+        agent.target_node = shelter_node
+        agent._dom_action = 'flee'
+        # 同步覆盖方向: 朝避难所走 (path_planner 算完后 social_force 会用 path 方向, 这里
+        # 给 first step / path 不可达 时的 fallback 方向)
+        sxy = getattr(agent, 'nearest_shelter_xy', None)
+        if sxy is not None:
+            return _unit(sxy[0] - agent.x, sxy[1] - agent.y)
+        return _unit(dx, dy)
+
+    candidates = [
+        ('home',  w_home,  home_node),
+        ('hoard', w_hoard, hoard_node),
+        ('herd',  w_herd,  herd_node),
+    ]
+    valid = [(act, w, n) for act, w, n in candidates if n is not None]
+    if valid:
+        dom_act, _dom_w, dom_n = max(valid, key=lambda x: x[1])
+        agent.target_node = dom_n
+        agent._dom_action = dom_act
+    else:
+        # 所有节点都未注入 -> 退化 stay，让 movement layer 用 (dx,dy) fallback
+        agent.target_node = getattr(agent, 'current_node', None)
+        agent._dom_action = 'stay'
+
     return _unit(dx, dy)
 
 

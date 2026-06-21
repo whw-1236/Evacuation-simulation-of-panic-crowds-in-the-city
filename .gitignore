@@ -219,3 +219,12 @@ __marimo__/
 
 output/
 trace_output/
+
+# Project-specific generated data
+road_graph_cache/
+cache/
+simulation map data/沈阳市/
+simulation map data/北京市/
+
+# IDE
+.vscode/

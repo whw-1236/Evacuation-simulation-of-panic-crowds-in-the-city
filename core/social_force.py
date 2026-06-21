@@ -77,6 +77,9 @@ class SocialForceModel:
         self.sw = SwitchParams()  # I1/I2/I3 参数
         self.stores = []  # 商店列表，由 simulation 载入商店数据后赋值
         self.g_max = 1.37  # 唤起最大加速倍数（恐慌速度因子）
+        # 【M2 新增】路网图: simulation 在初始化路网层之后赋值
+        # 为 None 时退化为连续空间 social force (向后兼容)
+        self.road_graph = None
 
         # ==================== 情绪传播参数 ====================
         self.attraction_strength = 0.1  # 情绪吸引力强度
@@ -108,11 +111,20 @@ class SocialForceModel:
         mass = getattr(agent, 'mass', 1.0)
         velocity = getattr(agent, 'velocity', np.array([0.0, 0.0]))
 
-        # ---- I1: 期望方向 ----
+        # ---- I1: 期望方向 (同时副作用写 agent.target_node) ----
         stores = getattr(self, 'stores', None) or []
         neighbors = getattr(agent, 'neighbors', [])
         e_i0 = np.array(compute_goal_direction(agent, stores, neighbors, self.sw),
                         dtype=float)
+
+        # ---- 【M2】如有路径上的 next_node, 优先朝它走 (graph-constrained) ----
+        nxy = getattr(agent, '_next_node_xy', None)
+        if nxy is not None:
+            dx_n = nxy[0] - agent.x
+            dy_n = nxy[1] - agent.y
+            n_node = math.hypot(dx_n, dy_n)
+            if n_node > 1e-12:
+                e_i0 = np.array([dx_n / n_node, dy_n / n_node], dtype=float)
 
         # 兜底：平静+物资足+无Leader 时方向为0 → 朝家（否则原地微动）
         if not np.any(e_i0):
@@ -136,7 +148,22 @@ class SocialForceModel:
                 time_speed = 1.0
 
         v0 = base_speed * g * time_speed
-        # （可选）Greenshields 密度降速：算出局部密度 rho 后乘 (1 - rho/rho_jam)
+
+        # ---- 【M2】Greenshields 拥堵速度衰减 (当前 edge 越堵越慢) ----
+        G_roads = getattr(self, 'road_graph', None)
+        ce = getattr(agent, 'current_edge', None)
+        if G_roads is not None and ce is not None:
+            try:
+                from core.movement_layer import get_edge_congestion, speed_factor
+                if len(ce) == 3:
+                    u, v_, k = ce
+                else:
+                    u, v_ = ce[0], ce[1]
+                    k = None
+                cong = get_edge_congestion(G_roads, u, v_, k)
+                v0 *= speed_factor(cong)
+            except Exception:
+                pass
 
         desired_velocity = v0 * e_i0
         driving_force = mass * (desired_velocity - velocity) / self.tau
