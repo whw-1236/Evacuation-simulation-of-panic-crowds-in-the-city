@@ -79,6 +79,10 @@ class BlackoutSimulation:
         # 保存城市配置
         self.city_config = city_config
 
+        # 【M2 新增】路网图开关 & 引用 (默认 False, 由 city_config 显式打开)
+        self.use_road_graph = bool(city_config and city_config.get('use_road_graph'))
+        self.road_graph = None
+
         # ==================== 基础参数 ====================
         self.T = config.simulation.TOTAL_STEPS
         self.dt = config.simulation.DT
@@ -245,6 +249,223 @@ class BlackoutSimulation:
         # 对比实验切换σ时,修改该常量后重新初始化 simulation 即可
         for r in self.residents:
             r.precompute_neighbor_weights()
+
+        # 【M2 新增】路网图 snap 必须放到 distribute_residents 之后
+        # (此时 r.x, r.y, r.home_position 已就位)
+        self._init_road_graph_if_enabled()
+
+    def _init_road_graph_if_enabled(self):
+        """M2: 加载 road_graph + 批量 snap 所有 resident 到最近 node。
+
+        触发条件: city_config['use_road_graph'] == True
+        失败时 (osmnx 不可用 / 联网失败 / 节点为空) 自动回退到无路网模式。
+        """
+        if not self.use_road_graph:
+            return
+
+        city = (self.city_config or {}).get('city')
+        districts = (self.city_config or {}).get('districts') or []
+        district = districts[0] if districts else None
+        if not city:
+            print('[road_graph] city 未指定, 跳过路网图载入')
+            self.use_road_graph = False
+            return
+
+        try:
+            from config.city_manager import CityManager
+            from core.road_graph import snap_to_nodes_batch
+        except ImportError as e:
+            print(f'[road_graph] 模块缺失 ({e}), 回退到 social-force-only')
+            self.use_road_graph = False
+            return
+
+        try:
+            cm = CityManager()
+            self.road_graph = cm.load_road_graph(city, district)
+            xs = [r.x for r in self.residents]
+            ys = [r.y for r in self.residents]
+            node_ids = snap_to_nodes_batch(self.road_graph, xs, ys)
+            for r, nid in zip(self.residents, node_ids):
+                r.current_node = nid
+                r.home_node = nid           # 居民"家"对应的节点
+                r.target_node = nid         # 初始语义目标 = home
+                r.current_path = [nid]
+                r.path_progress = 0
+                r._last_target_node = nid
+            # 【M2】把 graph 引用注入 social_force 让 driving_force 能读 congestion
+            try:
+                self.force_calculator.social_force_model.road_graph = self.road_graph
+            except AttributeError:
+                pass
+            print(f'[road_graph] snapped {len(self.residents)} residents to '
+                  f'graph ({len(self.road_graph.nodes)} nodes / '
+                  f'{len(self.road_graph.edges)} edges)')
+
+            # 【M3+】加载真实避难所并给每个 agent 分配最近 shelter (flee 行为目标)
+            self._init_shelters_if_enabled(city, district)
+        except Exception as ex:
+            print(f'[road_graph] 载入失败 ({type(ex).__name__}: {ex}); '
+                  f'回退到 social-force-only')
+            self.use_road_graph = False
+            self.road_graph = None
+
+    def _init_shelters_if_enabled(self, city, district):
+        """【M3+】加载真实避难所并 snap 到 graph, 给每个 agent 分配最近 shelter。
+
+        失败时 (CSV 缺失 / 无 shelter) self.shelters=[], agent.nearest_shelter_node=None,
+        I1 的 flee 分支自动退化为 home 行为。
+        """
+        self.shelters = []
+        if not self.use_road_graph or self.road_graph is None:
+            return
+
+        try:
+            from core.shelter_loader import load_shelters
+            from core.road_graph import snap_to_nodes_batch
+        except ImportError as ex:
+            print(f'[shelter] 模块缺失 ({ex})')
+            return
+
+        # 找 map_data_dir
+        map_dir = None
+        for cand in (
+            os.path.join(_PROJECT_ROOT, 'simulation map data'),
+            os.path.join(_PROJECT_ROOT, '地图数据'),
+        ):
+            if os.path.isdir(cand):
+                map_dir = cand
+                break
+        if not map_dir:
+            print('[shelter] 找不到 simulation map data 根目录')
+            return
+
+        shelters = load_shelters(map_dir, city, district)
+        if not shelters:
+            for r in self.residents:
+                r.nearest_shelter_node = None
+            return
+
+        # snap 每个 shelter 到最近 graph node
+        xs = [s['lon'] for s in shelters]
+        ys = [s['lat'] for s in shelters]
+        shelter_nodes = snap_to_nodes_batch(self.road_graph, xs, ys)
+        for s, nid in zip(shelters, shelter_nodes):
+            s['node_id'] = int(nid)
+        self.shelters = shelters
+
+        # 给每个 agent 用 KD-Tree 找最近 shelter (经纬度直线距离, 思明区<20km 误差<1%)
+        try:
+            import numpy as _np
+            from scipy.spatial import cKDTree
+            shelter_xy = _np.array([[s['lon'], s['lat']] for s in shelters])
+            tree = cKDTree(shelter_xy)
+            agent_xy = _np.array([[r.x, r.y] for r in self.residents])
+            _dists, nearest_idx = tree.query(agent_xy, k=1)
+            for r, idx in zip(self.residents, nearest_idx):
+                s = shelters[int(idx)]
+                r.nearest_shelter_node = s['node_id']
+                r.nearest_shelter_xy = (s['lon'], s['lat'])
+                r.nearest_shelter_id = s['id']
+        except ImportError:
+            # 退化: 不用 KD-Tree, 逐个 O(N*M) 找最近
+            for r in self.residents:
+                best_d, best = float('inf'), None
+                for s in shelters:
+                    d = (r.x - s['lon']) ** 2 + (r.y - s['lat']) ** 2
+                    if d < best_d:
+                        best_d = d
+                        best = s
+                if best:
+                    r.nearest_shelter_node = best['node_id']
+                    r.nearest_shelter_xy = (best['lon'], best['lat'])
+                    r.nearest_shelter_id = best['id']
+
+        print(f'[shelter] {len(shelters)} 避难所 snap 到 graph, '
+              f'{len(self.residents)} agents 已分配最近 shelter')
+
+    def _path_planning_hook(self):
+        """M2: 每仿真步开头调用，做三件事:
+          1. 推进 _steps_since_replan 计数
+          2. target_node 变化或超过 REPLAN_EVERY_STEPS 步 -> replan
+          3. 路径追踪 (path_follow_step): 更新 _next_node_xy / current_edge
+        social_force 读 _next_node_xy 决定方向, movement_layer 读 current_edge 算拥堵。
+        """
+        if not self.use_road_graph or self.road_graph is None:
+            return
+        from core.path_planner import should_replan, replan, path_follow_step
+        from core.movement_layer import occupancy_update_step, get_edge_congestion
+
+        # 先按 agent.current_edge 更新 graph 的 occupancy (用于下一步 weight)
+        occupancy_update_step(self.road_graph, self.residents)
+
+        # 【M3 T14】每步累加 cum_occupancy 用于 end-of-run 与 betweenness 做相关性
+        for _, _, _, d in self.road_graph.edges(keys=True, data=True):
+            d['cum_occupancy'] = float(d.get('cum_occupancy', 0)) + float(d.get('occupancy', 0))
+
+        n_replanned = 0
+        for r in self.residents:
+            r._steps_since_replan = getattr(r, '_steps_since_replan', 0) + 1
+            if should_replan(r):
+                replan(r, self.road_graph)
+                n_replanned += 1
+            # 路径追踪: 检查到达, 缓存 _next_node_xy / current_edge
+            path_follow_step(r, self.road_graph)
+            # 【M2 T12】缓存当前 edge 的拥堵率 → apply_outcome_feedback 读它做 σ 推升
+            ce = r.current_edge
+            if ce is not None:
+                try:
+                    if len(ce) == 3:
+                        u, v, k = ce
+                    else:
+                        u, v = ce[0], ce[1]
+                        k = None
+                    r._edge_congestion = get_edge_congestion(self.road_graph, u, v, k)
+                except Exception:
+                    r._edge_congestion = 0.0
+            else:
+                r._edge_congestion = 0.0
+        # 节流日志: 仅在显著重路由时打印
+        if n_replanned >= max(20, len(self.residents) // 20):
+            print(f'[path_plan] step {self.step_count}: replanned {n_replanned}/'
+                  f'{len(self.residents)} agents')
+
+    def write_edge_observations(self, out_path):
+        """【M3 T14】把每条 edge 的累计观测 dump 成 CSV, 用于 T16 betweenness 相关性。
+
+        字段:
+            edge_id    形如 "uOSMid->vOSMid"
+            u, v       端点 OSM id
+            highway    OSM highway 类型
+            length     m
+            capacity   capacity_per_step
+            cum_occupancy   仿真期间累计 occupancy (时间积分)
+            mean_occupancy  cum / step_count
+            peak_occupancy  仿真中最后一步的 occupancy (粗略)
+        """
+        import csv
+        if not self.use_road_graph or self.road_graph is None:
+            return False
+        steps = max(1, int(self.step_count))
+        with open(out_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f)
+            w.writerow(['edge_id', 'u', 'v', 'k', 'highway',
+                        'length_m', 'capacity_per_step',
+                        'cum_occupancy', 'mean_occupancy', 'peak_occupancy'])
+            for u, v, k, d in self.road_graph.edges(keys=True, data=True):
+                cum = float(d.get('cum_occupancy', 0.0))
+                occ = float(d.get('occupancy', 0.0))
+                hw = d.get('highway', '')
+                if isinstance(hw, list):
+                    hw = ','.join(map(str, hw))
+                w.writerow([
+                    f'{u}->{v}', u, v, k, hw,
+                    round(float(d.get('length', 0)), 2),
+                    round(float(d.get('capacity_per_step', 0)), 1),
+                    round(cum, 4),
+                    round(cum / steps, 6),
+                    round(occ, 4),
+                ])
+        return True
 
     def _init_load_priority_system(self):
         """
@@ -1689,6 +1910,10 @@ class BlackoutSimulation:
         """
         # 0. 【新增】更新仿真时间（昼夜差异）
         self._update_time()
+
+        # 0.5 【M2 新增】路径规划 hook —— 在社会力计算前推进路由
+        # use_road_graph=False 时立即返回, 完全不影响原有行为
+        self._path_planning_hook()
 
         # 1. 区域时长累积
         for z, st in self.zone_status.items():
