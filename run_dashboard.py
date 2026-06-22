@@ -33,15 +33,9 @@ def _project_root():
 
 
 def _detect_map_data_dir(root):
-    """优先 simulation map data/, 回退 地图数据/。"""
-    cands = [
-        os.path.join(root, 'simulation map data'),
-        os.path.join(root, '地图数据'),
-    ]
-    for c in cands:
-        if os.path.isdir(c):
-            return c
-    return None
+    """返回 simulation map data/ 目录路径，不存在返回 None。"""
+    p = os.path.join(root, 'simulation map data')
+    return p if os.path.isdir(p) else None
 
 
 def _resolve_city_config(root, city=None, district=None):
@@ -51,7 +45,7 @@ def _resolve_city_config(root, city=None, district=None):
     """
     map_dir = _detect_map_data_dir(root)
     if not map_dir:
-        print('[!] 未找到 simulation map data/ 或 地图数据/ 目录')
+        print('[!] 未找到 simulation map data/ 目录')
         return None
     try:
         from config.city_manager import CityManager

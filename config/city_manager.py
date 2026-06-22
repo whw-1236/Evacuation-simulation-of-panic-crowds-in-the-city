@@ -4,7 +4,7 @@
 城市数据管理模块 - 支持多城市切换
 ================================================================================
 功能：
-    1. 扫描地图数据目录，获取可用城市列表
+    1. 扫描simulation map data目录，获取可用城市列表
     2. 加载指定城市的区县GeoJSON数据
     3. 随机生成关键设施位置（如无数据）
 
@@ -12,7 +12,7 @@
     from config.city_manager import CityManager
 
     manager = CityManager()
-    cities = manager.get_available_cities()  # ['厦门市', '福州市', ...]
+    cities = manager.get_available_cities()  # ['厦门市', '沈阳市', ...]
     districts = manager.get_districts('厦门市')  # ['思明区', '湖里区', ...]
     paths = manager.get_geojson_paths('厦门市')  # [path1, path2, ...]
 ================================================================================
@@ -51,11 +51,11 @@ class CityManager:
         初始化城市管理器
 
         Args:
-            map_data_dir: 地图数据目录，默认为项目下的"地图数据"文件夹
+            map_data_dir: simulation map data目录，默认为项目下的"simulation map data"文件夹
         """
         if map_data_dir is None:
-            # 默认路径：项目目录/地图数据（使用兼容路径）
-            map_data_dir = os.path.join(CITY_MGR_BASE_PATH, "地图数据")
+            # 默认路径：项目目录/simulation map data（使用兼容路径）
+            map_data_dir = os.path.join(CITY_MGR_BASE_PATH, "simulation map data")
 
         self.map_data_dir = map_data_dir
         self._city_cache = {}  # 缓存城市数据
@@ -69,7 +69,7 @@ class CityManager:
             list: 城市名称列表，如 ['厦门市', '福州市', '泉州市', ...]
         """
         if not os.path.exists(self.map_data_dir):
-            print(f"[警告] 地图数据目录不存在: {self.map_data_dir}")
+            print(f"[警告] simulation map data目录不存在: {self.map_data_dir}")
             return []
 
         cities = []
