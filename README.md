@@ -408,11 +408,3 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 ```
 
 ### 复现命令（必须先 conda activate Crowds_sim）
-
-```powershell
-# Windows PowerShell, 推荐 cmd /c 包裹
-cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _compare_cities.py"
-cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _t15_harness.py"
-cmd /c "call D:\EnvironmentAnaconda\Scripts\activate.bat Crowds_sim && python _t16_correlation.py"
-```
-
