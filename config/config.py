@@ -38,10 +38,10 @@ class PathConfig:
             self.BASE_DIR = os.path.dirname(os.path.dirname(self.COMMUNITY_PATHS[0])) if self.COMMUNITY_PATHS else ""
             print(f"[PathConfig] 使用城市配置: {self.DISTRICT_NAME}")
         else:
-            # 回退：从环境变量或默认地图数据路径读取
+            # 回退：从环境变量或默认 simulation map data 路径读取
             default_data = os.environ.get(
                 "BLACKOUT_DATA_DIR",
-                os.path.join(self._project_dir, "地图数据")
+                os.path.join(self._project_dir, "simulation map data")
             )
             self.BASE_DIR = default_data
             self.DISTRICT_NAME = os.environ.get("BLACKOUT_CITY", "默认城市")
@@ -49,19 +49,12 @@ class PathConfig:
             self.COMMUNITY_PATHS = []
             print(f"[PathConfig] 使用默认配置: {self.DISTRICT_NAME} (数据目录: {self.BASE_DIR})")
 
-        # 【兼容旧代码】保留SUB_AREA_PATHS别名
-        self.SUB_AREA_PATHS = self.COMMUNITY_PATHS
-
-        # 【废弃】轮廓文件不再使用，设为空列表
-        self.CONTOUR_PATHS = []
-
         # CSV点位文件路径 - 动态加载对应城市/区县的真实设施数据
         self.CSV_PATHS = self._build_csv_paths()
 
     def _build_csv_paths(self):
         """
-        动态构建CSV路径 —— 优先从 地图数据/各地区的设施机构经纬度/ 加载真实设施数据，
-        回退到旧的 BASE_DIR/各类型节点经纬度/ 路径。
+        动态构建CSV路径 —— 在 simulation map data/{城市}/{区县}/{区县}POI/ 下查找 6 类设施 CSV。
 
         返回 dict: {category: path_or_list_of_paths}
           - 单区县时值为 str（向后兼容）
@@ -73,62 +66,38 @@ class PathConfig:
             'industry': '工业.csv',
             'emergency': '应急.csv',
             'school': '学校.csv',
-            'community': '社区卫生院.csv',
+            'shop': '商店.csv',
         }
 
-        # 【新】优先尝试两种数据结构：
-        #   旧结构: 地图数据/各地区的设施机构经纬度/{城市}/{区县}/医院.csv ...
-        #   新结构: 地图数据/{城市}/{区县}/医院.csv ...
-        candidate_bases = [
-            os.path.join(self._project_dir, "地图数据", "各地区的设施机构经纬度"),
-            os.path.join(self._project_dir, "地图数据"),
-        ]
+        facility_base = os.path.join(self._project_dir, "simulation map data")
         collected = {cat: [] for cat in csv_filename_map}
 
         city_districts = self._extract_city_districts()
-        for facility_base in candidate_bases:
-            if not os.path.exists(facility_base):
-                continue
+        if os.path.exists(facility_base):
             for city, district in city_districts:
-                district_csv_dir = os.path.join(facility_base, city, district)
-                if not os.path.exists(district_csv_dir):
-                    continue
-                for category, filename in csv_filename_map.items():
-                    csv_file = os.path.join(district_csv_dir, filename)
-                    if os.path.exists(csv_file) and csv_file not in collected[category]:
-                        collected[category].append(csv_file)
-            # 一旦从某个 base 找到了文件就停止 (避免重复)
-            if any(collected[cat] for cat in collected):
-                break
+                # CSV 在 {city}/{district}/{district}POI/ 下；少量旧布局直接在 {district}/ 下
+                base_a = os.path.join(facility_base, city, district)
+                base_b = os.path.join(base_a, f"{district}POI")
+                for district_csv_dir in (base_b, base_a):
+                    if not os.path.exists(district_csv_dir):
+                        continue
+                    for category, filename in csv_filename_map.items():
+                        csv_file = os.path.join(district_csv_dir, filename)
+                        if os.path.exists(csv_file) and csv_file not in collected[category]:
+                            collected[category].append(csv_file)
 
-        found_any = any(collected[cat] for cat in collected)
-
-        if found_any:
-            result = {}
-            for cat, paths in collected.items():
-                if not paths:
-                    continue
-                result[cat] = paths[0] if len(paths) == 1 else paths
-            if result:
-                total = sum(len(v) if isinstance(v, list) else 1 for v in result.values())
-                print(f"[PathConfig] 从 各地区的设施机构经纬度 加载CSV: {total} 个文件")
-            return result
-
-        # 回退到旧路径
-        if os.path.exists(self.BASE_DIR):
-            old_dir = os.path.join(self.BASE_DIR, "各类型节点经纬度")
-            if os.path.exists(old_dir):
-                result = {}
-                for category, filename in csv_filename_map.items():
-                    old_path = os.path.join(old_dir, filename)
-                    if os.path.exists(old_path):
-                        result[category] = old_path
-                if result:
-                    print(f"[PathConfig] 从旧路径加载CSV: {len(result)} 个文件")
-                return result
-
-        print("[PathConfig] 未找到CSV设施数据")
-        return {}
+        result = {}
+        for cat, paths in collected.items():
+            if not paths:
+                continue
+            result[cat] = paths[0] if len(paths) == 1 else paths
+        if result:
+            total = sum(len(v) if isinstance(v, list) else 1 for v in result.values())
+            print(f"[PathConfig] CSV 设施数据加载完成: {total} 个文件 "
+                  f"({len(result)} 类 × {len(city_districts)} 区县)")
+        else:
+            print("[PathConfig] 未找到CSV设施数据")
+        return result
 
     def _extract_city_districts(self):
         """从 COMMUNITY_PATHS 中提取 (城市, 区县) 列表"""
@@ -137,28 +106,43 @@ class PathConfig:
 
         for path in self.COMMUNITY_PATHS:
             parts = path.replace('\\', '/').split('/')
-            if '地图数据' in parts:
-                idx = parts.index('地图数据')
+            if 'simulation map data' in parts:
+                idx = parts.index('simulation map data')
                 if len(parts) > idx + 2:
                     city = parts[idx + 1]
                     district = parts[idx + 2]
-                    if city == '各地区的设施机构经纬度':
-                        continue
                     key = (city, district)
                     if key not in seen:
                         seen.add(key)
                         city_districts.append(key)
 
         if not city_districts:
-            facility_base = os.path.join(self._project_dir, "地图数据", "各地区的设施机构经纬度")
-            if os.path.exists(facility_base) and hasattr(self, 'DISTRICT_NAME'):
-                for city_dir in os.listdir(facility_base):
-                    city_path = os.path.join(facility_base, city_dir)
-                    if not os.path.isdir(city_path):
+            # 扫描数据目录，按 DISTRICT_NAME 匹配；否则收所有城市
+            scan_bases = [os.path.join(self._project_dir, "simulation map data")]
+            district_name = getattr(self, 'DISTRICT_NAME', None)
+            # "默认城市" 是 PathConfig 的占位符，等同于"未指定"
+            if district_name in (None, '', '默认城市', '默认行政区'):
+                district_name = None
+            for scan_base in scan_bases:
+                if not os.path.exists(scan_base):
+                    continue
+                for city_dir in sorted(os.listdir(scan_base)):
+                    city_path = os.path.join(scan_base, city_dir)
+                    if not os.path.isdir(city_path) or city_dir.startswith('_'):
                         continue
-                    for district_dir in os.listdir(city_path):
-                        if self.DISTRICT_NAME == district_dir:
-                            city_districts.append((city_dir, district_dir))
+                    for district_dir in sorted(os.listdir(city_path)):
+                        d_path = os.path.join(city_path, district_dir)
+                        if not os.path.isdir(d_path):
+                            continue
+                        if district_name and district_name not in (district_dir, city_dir):
+                            # 指定了 DISTRICT_NAME 时只收匹配的
+                            continue
+                        key = (city_dir, district_dir)
+                        if key not in seen:
+                            seen.add(key)
+                            city_districts.append(key)
+                if city_districts:
+                    break
 
         return city_districts
 
@@ -180,10 +164,10 @@ class PathConfig:
                                 fixed_paths.append(path)
                             else:
                                 # 尝试从路径中提取城市和区县名，在本地查找
-                                # 路径格式: .../地图数据/城市名/区县名/xxx.geojson
+                                # 路径格式: .../simulation map data/城市名/区县名/xxx.geojson
                                 path_parts = path.replace('\\', '/').split('/')
-                                if '地图数据' in path_parts:
-                                    idx = path_parts.index('地图数据')
+                                if 'simulation map data' in path_parts:
+                                    idx = path_parts.index('simulation map data')
                                     # 构建相对路径
                                     relative_parts = path_parts[idx:]
                                     local_path = os.path.join(self._project_dir, *relative_parts)
@@ -209,15 +193,15 @@ class PathConfig:
         return None
 
     def _find_geojson_by_district(self, path_parts, map_data_idx):
-        """根据城市和区县名在本地地图数据文件夹中查找geojson文件"""
+        """根据城市和区县名在本地 simulation map data 文件夹中查找geojson文件"""
         try:
             # 获取城市和区县名
             if len(path_parts) > map_data_idx + 2:
                 city = path_parts[map_data_idx + 1]
                 district = path_parts[map_data_idx + 2]
 
-                # 在本地地图数据文件夹中查找
-                local_map_dir = os.path.join(self._project_dir, "地图数据", city, district)
+                # 在本地数据文件夹中查找
+                local_map_dir = os.path.join(self._project_dir, "simulation map data", city, district)
                 if os.path.exists(local_map_dir):
                     # 查找无山水版本的geojson
                     for f in os.listdir(local_map_dir):
@@ -331,9 +315,8 @@ class SocialForceConfig:
 
 class PanicConfig:
     """
-    恐慌传播模型参数配置 - 完整版
+    恐慌传播模型参数配置 
 
-    基于论文: 恐慌模拟复现.py
 
     核心公式：
     恐慌值 P = D * [(1 - exp(-α*l_c)) / (1 + exp(α*l_o)) + A_ij] * exp(-β*t)
@@ -421,10 +404,10 @@ class LoadPriorityConfig:
         'emergency': LEVEL_1,  # 应急机构 - 一级负荷
         'government': LEVEL_1,  # 政府机关 - 一级负荷
         'school': LEVEL_2,  # 学校 - 二级负荷
-        'community': LEVEL_2,  # 社区卫生院 - 二级负荷
         'industry': LEVEL_2,  # 工业企业 - 二级负荷（大型）
         'enterprise': LEVEL_3,  # 普通企业 - 三级负荷
         'resident': LEVEL_3,  # 居民区 - 三级负荷
+        'shop': LEVEL_3,  # 商店 - 三级负荷（商业设施，可优先切除）
     }
 
     # 各等级负荷的权重（用于计算切负荷比例）
@@ -575,7 +558,7 @@ class Config:
     使用方法：
         config = Config()
         print(config.simulation.TOTAL_STEPS)  # 访问仿真配置
-        print(config.paths.CONTOUR_PATHS)     # 访问路径配置
+        print(config.paths.COMMUNITY_PATHS)   # 访问路径配置
 
     【行为参数】
         通过 config.behavior.xxx 访问各主体行为参数

@@ -43,29 +43,22 @@ class GeoJSONRegionManager:
     - region_neighbors: 邻接关系 → 故障传播
     """
 
-    def __init__(self, contour_paths=None, sub_area_paths=None, community_paths=None):
+    def __init__(self, community_paths=None):
         """
         初始化区域管理器
 
         参数:
-            contour_paths: 【废弃】轮廓文件路径列表，不再使用，保留兼容性
-            sub_area_paths: 社区文件路径列表（兼容旧参数名）
-            community_paths: 社区文件路径列表（新参数名，优先使用）
+            community_paths: 社区 GeoJSON 文件路径列表
 
         抛出:
             FileNotFoundError: 文件不存在
             RuntimeError: 加载失败
             ValueError: 文件格式错误
         """
-        # 优先使用community_paths，其次sub_area_paths
-        self.community_paths = community_paths or sub_area_paths or []
+        self.community_paths = community_paths or []
 
         if not self.community_paths:
-            raise ValueError("[错误] 必须提供社区文件路径（community_paths或sub_area_paths）！")
-
-        # 保留兼容属性
-        self.contour_paths = contour_paths or []
-        self.sub_area_paths = self.community_paths
+            raise ValueError("[错误] 必须提供 community_paths！")
 
         # 区域数据 - 使用XZQDM作为key
         self.regions = {}  # {zone_id(XZQDM): {'name', 'geometry', 'centroid', 'bounds', 'area', ...}}
@@ -332,7 +325,7 @@ class NodeAttributeConfig:
     - industry: 工业企业
     - emergency: 应急机构
     - school: 学校
-    - community: 社区卫生院
+    - shop: 商店
 
     【功能说明】
     - 定义各类主体的可视化属性（颜色、标记、大小）
@@ -403,13 +396,13 @@ class NodeAttributeConfig:
                 'edgecolor': 'darkgreen',
                 'linewidth': 1.0,
             },
-            'community': {
-                'color': 'cyan',
-                'marker': 'o',  # o=圆形
-                'label': '社区卫生院',
-                'size': 80,
-                'alpha': 0.8,
-                'edgecolor': 'teal',
+            'shop': {
+                'color': 'magenta',
+                'marker': 'h',  # h=六边形
+                'label': '商店',
+                'size': 95,
+                'alpha': 0.85,
+                'edgecolor': 'darkmagenta',
                 'linewidth': 1.0,
             },
         }
@@ -461,13 +454,15 @@ class NodeAttributeConfig:
                 'vulnerable_ratio': 0.8,  # 脆弱人群比例（学生）
                 'evacuation_priority': 'high',  # 疏散优先级
             },
-            'community': {
-                'priority': 'high',
-                'backup_power': True,
-                'backup_duration': 24,
-                'influence_radius': 0.012,
-                'service_capacity': 100,  # 服务能力
-                'medical_supply': 0.5,  # 医疗物资储备
+            'shop': {
+                'priority': 'medium',
+                'backup_power': False,
+                'backup_duration': 0,
+                'influence_radius': 0.01,
+                # capacity 在 CSVPointLoader 按店铺规模关键词差异化注入
+                'capacity_large': 300,
+                'capacity_medium': 150,
+                'capacity_small': 80,
             },
         }
 
@@ -503,10 +498,10 @@ class NodeAttributeConfig:
                 'public_impact': 0.5,
                 'class_disruption': 1.0,  # 教学中断
             },
-            'community': {
-                'function_loss_rate': 0.5,
-                'recovery_priority': 2,
-                'public_impact': 0.6,
+            'shop': {
+                'function_loss_rate': 0.9,
+                'recovery_priority': 3,
+                'public_impact': 0.5,
             },
         }
 
@@ -582,7 +577,7 @@ class CSVPointLoader:
     CSV点位加载器 - 加载各类设施点位
 
     【功能说明】
-    - 读取6类CSV点位（政府/医院/工业/应急/学校/社区）
+    - 读取6类CSV点位（政府/医院/工业/应急/学校/商店）
     - 验证点位是否在边界内
     - 为每个点位附加属性配置
 
@@ -621,7 +616,7 @@ class CSVPointLoader:
         多路径时将所有文件合并加载。
         """
         print("\n" + "=" * 60)
-        print("[加载] CSV点位数据（政府/医院/工业/应急/学校/社区）")
+        print("[加载] CSV点位数据（政府/医院/工业/应急/学校/商店）")
         print("=" * 60)
 
         if not self.csv_paths:
@@ -715,9 +710,21 @@ class CSVPointLoader:
                                 elif category == 'emergency':
                                     node['response_capability'] = behavior_config.get('response_capability', 1.5)
                                     node['resource_deployment'] = behavior_config.get('resource_deployment', 2.0)
-                                elif category == 'community':
-                                    node['service_capacity'] = behavior_config.get('service_capacity', 100)
-                                    node['medical_supply'] = behavior_config.get('medical_supply', 0.5)
+                                elif category == 'shop':
+                                    # 按店铺名称关键词分级 capacity (大/中/小)
+                                    name = node['name']
+                                    large_kw = ('大润发', '夏商生活广场', '盒马鲜生')
+                                    medium_kw = ('物美超市', '七鲜超市', '新隆嘉超市')
+                                    if any(k in name for k in large_kw):
+                                        node['capacity'] = behavior_config.get('capacity_large', 300)
+                                        node['shop_scale'] = 'large'
+                                    elif any(k in name for k in medium_kw):
+                                        node['capacity'] = behavior_config.get('capacity_medium', 150)
+                                        node['shop_scale'] = 'medium'
+                                    else:
+                                        node['capacity'] = behavior_config.get('capacity_small', 80)
+                                        node['shop_scale'] = 'small'
+                                    node['occupancy'] = 0
 
                                 self.csv_nodes.append(node)
                             else:
@@ -1161,7 +1168,7 @@ class ResidentDistributor:
             print("[POI绑定] csv_nodes 为空, 跳过POI绑定")
             return False
 
-        # 默认权重: 工厂/学校承载居民最多, 政府/医院/应急较少
+        # 默认权重: 工厂/学校承载居民最多, 商业/政府/医院/应急较少
         if poi_weights is None:
             poi_weights = {
                 'industry': 0.40,  # 工厂 (大量职工)
@@ -1169,7 +1176,7 @@ class ResidentDistributor:
                 'hospital': 0.10,  # 医院
                 'government': 0.08,  # 政府
                 'emergency': 0.07,  # 应急机构
-                'community': 0.05,  # 社区卫生院 (兼容6类)
+                'shop': 0.05,  # 商店 (商业设施附近少量驻留)
             }
 
         # 按 category 分组 POI
