@@ -126,17 +126,18 @@ class CityManager:
 
             # 优先查找"无山水"版本
             if use_no_mountain:
-                # 尝试多种命名格式
+                # 厦门 GeoJSON 在 {区}/{区}map/ 嵌套子目录，沈阳/北京是平铺。
+                # 用 ** 递归 glob 同时兼容两种结构。
                 patterns = [
                     os.path.join(district_dir, f"{district}无山水.geojson"),
                     os.path.join(district_dir, f"{district}-无山水.geojson"),
-                    os.path.join(district_dir, f"*无山水*.geojson"),
+                    os.path.join(district_dir, "**", "*无山水*.geojson"),
                 ]
 
                 found = False
                 for pattern in patterns:
                     if '*' in pattern:
-                        matches = glob.glob(pattern)
+                        matches = glob.glob(pattern, recursive=True)
                         if matches:
                             paths.append(matches[0])
                             found = True
@@ -153,12 +154,12 @@ class CityManager:
             fallback_patterns = [
                 os.path.join(district_dir, f"{city_name}_{district}.geojson"),
                 os.path.join(district_dir, f"{district}.geojson"),
-                os.path.join(district_dir, "*.geojson"),
+                os.path.join(district_dir, "**", "*.geojson"),
             ]
 
             for pattern in fallback_patterns:
                 if '*' in pattern:
-                    matches = glob.glob(pattern)
+                    matches = glob.glob(pattern, recursive=True)
                     # 排除"无山水"版本（如果不想用的话）
                     matches = [m for m in matches if '无山水' not in m]
                     if matches:
@@ -196,8 +197,11 @@ class CityManager:
                 if os.path.exists(pattern):
                     return pattern
 
-            # 通配符查找
-            matches = glob.glob(os.path.join(district_dir, "*无山水*.geojson"))
+            # 通配符查找（递归，兼容嵌套 {区}/{区}map/）
+            matches = glob.glob(
+                os.path.join(district_dir, "**", "*无山水*.geojson"),
+                recursive=True,
+            )
             if matches:
                 return matches[0]
 
@@ -210,8 +214,11 @@ class CityManager:
             if os.path.exists(pattern):
                 return pattern
 
-        # 最后尝试通配符
-        matches = glob.glob(os.path.join(district_dir, "*.geojson"))
+        # 最后尝试通配符（递归）
+        matches = glob.glob(
+            os.path.join(district_dir, "**", "*.geojson"),
+            recursive=True,
+        )
         matches = [m for m in matches if '无山水' not in m]
         if matches:
             return matches[0]
