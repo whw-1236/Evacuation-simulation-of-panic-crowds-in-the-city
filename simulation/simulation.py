@@ -29,6 +29,7 @@ from core.agents import (GovernmentAgent, PowerGridAgent, EnterpriseAgent,
 from core.region_manager import (GeoJSONRegionManager, ResidentDistributor,
                                  CSVPointLoader, NODE_ATTR_CONFIG)
 from core.social_force import IntegratedForceCalculator
+from core.behavior_switching import init_store_state
 from core.event_recorder import EventRecorder, EventDetector
 from core.event_influence import EventInfluenceCalculator
 
@@ -107,15 +108,11 @@ class BlackoutSimulation:
             print(f"   使用城市配置: {self.district_name} ({len(community_paths)}个区县)")
         else:
             # 回退到旧配置
-            community_paths = getattr(config.paths, 'COMMUNITY_PATHS', None) or config.paths.SUB_AREA_PATHS
+            community_paths = config.paths.COMMUNITY_PATHS
             self.district_name = getattr(config.paths, 'DISTRICT_NAME', '默认行政区')
             self.city_districts = []
 
-        self.region_manager = GeoJSONRegionManager(
-            community_paths=community_paths,
-            contour_paths=config.paths.CONTOUR_PATHS if config.paths.CONTOUR_PATHS else None,
-            sub_area_paths=community_paths
-        )
+        self.region_manager = GeoJSONRegionManager(community_paths=community_paths)
 
         # 【0128新增】建立区县到区域的映射
         self._build_district_zone_mapping()
@@ -213,7 +210,7 @@ class BlackoutSimulation:
         # 因为 set_position 会把 home_position 设到 POI 圆内的随机点上。
         # ============================================================
 
-        # 1) 先加载CSV主体（政府、医院、工业、应急、学校、社区卫生院）
+        # 1) 先加载CSV主体（政府、医院、工业、应急、学校、商店）
         print("[*] 加载CSV主体点位...")
         self.csv_loader = CSVPointLoader(
             region_manager=self.region_manager,
@@ -228,6 +225,31 @@ class BlackoutSimulation:
         # 为CSV节点分配区域 (POI绑定时居民会从此继承zone)
         self._assign_csv_zones()
 
+        # 【I2 商店】从 csv_nodes 抽取 shop 构造 stores 列表（行为切换模型用）
+        # 字段约定: id/x/y/capacity/occupancy/name; node_id 由 road_graph snap 填充
+        self.stores = []
+        for n in self.csv_nodes:
+            if n.get('category') == 'shop':
+                self.stores.append({
+                    'id': f"shop_{n['id']}",
+                    'x': n['lon'],
+                    'y': n['lat'],
+                    'capacity': int(n.get('capacity', 150)),
+                    'occupancy': 0,
+                    'name': n.get('name', ''),
+                    'shop_scale': n.get('shop_scale', 'medium'),
+                    'node_id': None,
+                    'zone': n.get('zone'),
+                })
+        # 喂给 force_calculator 与 social_force_model，激活 I2 抢购/挤兑分支
+        self.force_calculator.stores = self.stores
+        try:
+            self.force_calculator.social_force_model.stores = self.stores
+        except AttributeError:
+            pass
+        print(f"[*] 商店数据: {len(self.stores)} 家 "
+              f"(总容量 {sum(s['capacity'] for s in self.stores)})")
+
         # 2) 分配Agent到区域 - 居民走POI绑定, 企业仍走原方法
         distributor = ResidentDistributor(self.region_manager)
         bound_by_poi = distributor.distribute_residents_by_poi(
@@ -239,6 +261,13 @@ class BlackoutSimulation:
             print("[警告] POI绑定失败, 回退到按区域面积分配")
             distributor.distribute_residents(self.residents)
         distributor.distribute_enterprises(self.enterprises)
+
+        # 【I2 商店】home_position 已就位 → 初始化每个 resident 对商店的
+        # familiarity (距离衰减) 与 perceived_occupancy = 0
+        if self.stores:
+            sw = self.force_calculator.sw
+            for r in self.residents:
+                init_store_state(r, self.stores, sw)
 
         # 建立社交网络
         self._build_social_network()
@@ -301,6 +330,16 @@ class BlackoutSimulation:
                   f'graph ({len(self.road_graph.nodes)} nodes / '
                   f'{len(self.road_graph.edges)} edges)')
 
+            # 【I2 商店】snap 每家商店到最近 road node，写回 store['node_id']，
+            # 让 I1 的 dom_action='hoard' 能通过 target_node 驱动路网寻路。
+            if getattr(self, 'stores', None):
+                sxs = [s['x'] for s in self.stores]
+                sys_ = [s['y'] for s in self.stores]
+                shop_nodes = snap_to_nodes_batch(self.road_graph, sxs, sys_)
+                for s, nid in zip(self.stores, shop_nodes):
+                    s['node_id'] = nid
+                print(f'[road_graph] snapped {len(self.stores)} shops to graph')
+
             # 【M3+】加载真实避难所并给每个 agent 分配最近 shelter (flee 行为目标)
             self._init_shelters_if_enabled(city, district)
         except Exception as ex:
@@ -327,14 +366,9 @@ class BlackoutSimulation:
             return
 
         # 找 map_data_dir
-        map_dir = None
-        for cand in (
-            os.path.join(_PROJECT_ROOT, 'simulation map data'),
-            os.path.join(_PROJECT_ROOT, '地图数据'),
-        ):
-            if os.path.isdir(cand):
-                map_dir = cand
-                break
+        map_dir = os.path.join(_PROJECT_ROOT, 'simulation map data')
+        if not os.path.isdir(map_dir):
+            map_dir = None
         if not map_dir:
             print('[shelter] 找不到 simulation map data 根目录')
             return
@@ -626,7 +660,7 @@ class BlackoutSimulation:
         用于支持按区县选择停电，将区县名映射到其包含的所有区域ID
 
         【核心逻辑】从每个区域的source_file路径中提取区县名
-        例如：.../地图数据/厦门市/思明区/思明区无山水.geojson -> 思明区
+        例如：.../simulation map data/厦门市/思明区/思明区无山水.geojson -> 思明区
         """
         self.district_to_zones = {}  # {区县名: [zone_id1, zone_id2, ...]}
         self.zone_to_district = {}  # {zone_id: 区县名}
@@ -636,7 +670,7 @@ class BlackoutSimulation:
             source_file = region_data.get('source_file', '')
 
             # 从路径中提取区县名
-            # 路径格式：.../地图数据/城市/区县/xxx.geojson
+            # 路径格式：.../simulation map data/城市/区县/xxx.geojson
             path_parts = source_file.replace('\\', '/').split('/')
 
             district_name = None
