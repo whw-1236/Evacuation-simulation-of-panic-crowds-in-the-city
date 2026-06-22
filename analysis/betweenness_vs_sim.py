@@ -2,21 +2,29 @@
 """T16: metrics (betweenness) ↔ 仿真观测 (cum_occupancy) Pearson 相关性。
 
 Pipeline:
-  1. 读 road_graph_cache/厦门市_思明区.graphml (已 snap 过的图)
+  1. 读 road_graph_cache/{城}_{区}.graphml (已 snap 过的图)
   2. 重新算 node betweenness (与 metrics.json 内部一致, k=200)
-  3. 读 trace_output/t15_graph_on/edge_observations.csv (仿真观测)
+  3. 读 trace_output/M4_F1_cross_city/{城}_{区}/graph_on/edge_observations.csv
   4. 给每个 node 算 observed_load = sum(incoming edges' cum_occupancy)
   5. Pearson correlation between betweenness vs observed_load
   6. 画散点图 + 标 top-10 betweenness 节点
 
+用法:
+    # 默认 厦门思明
+    python analysis/betweenness_vs_sim.py
+
+    # 三城外推 (F1 已有 edge_observations.csv)
+    python analysis/betweenness_vs_sim.py --city 沈阳市 --district 沈河区
+    python analysis/betweenness_vs_sim.py --city 北京市 --district 东城区
+
 输出:
-  - trace_output/t16_correlation.png
-  - trace_output/t16_correlation.json
+  - trace_output/M4_T16_cross_city/{城}_{区}/correlation.{png,json}
 """
 import os
 import sys
 import csv
 import json
+import argparse
 
 try:
     sys.stdout.reconfigure(encoding='utf-8')
@@ -34,15 +42,35 @@ import matplotlib.pyplot as plt
 from scipy import stats as scipy_stats
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GRAPHML = os.path.join(ROOT, 'road_graph_cache', '厦门市_思明区.graphml')
-EDGE_CSV = os.path.join(ROOT, 'trace_output', 't15_graph_on', 'edge_observations.csv')
-OUT_PNG = os.path.join(ROOT, 'trace_output', 't16_correlation.png')
-OUT_JSON = os.path.join(ROOT, 'trace_output', 't16_correlation.json')
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(description='T16: betweenness vs sim cum_occupancy')
+    p.add_argument('--city',     default='厦门市')
+    p.add_argument('--district', default='思明区')
+    p.add_argument('--edge-csv', default=None, dest='edge_csv',
+                   help='默认从 M4_F1_cross_city/{city}_{district}/graph_on/ 读')
+    p.add_argument('--out-dir',  default=None, dest='out_dir',
+                   help='默认输出到 M4_T16_cross_city/{city}_{district}/')
+    return p.parse_args()
 
 
 def main():
-    print(f'[1/4] load graph {GRAPHML}')
-    G = ox.io.load_graphml(GRAPHML)
+    args = _parse_args()
+    graphml = os.path.join(ROOT, 'road_graph_cache', f'{args.city}_{args.district}.graphml')
+    edge_csv = args.edge_csv or os.path.join(
+        ROOT, 'trace_output', 'M4_F1_cross_city',
+        f'{args.city}_{args.district}', 'graph_on', 'edge_observations.csv')
+    out_dir = args.out_dir or os.path.join(
+        ROOT, 'trace_output', 'M4_T16_cross_city',
+        f'{args.city}_{args.district}')
+    os.makedirs(out_dir, exist_ok=True)
+    out_png = os.path.join(out_dir, 'correlation.png')
+    out_json = os.path.join(out_dir, 'correlation.json')
+
+    print(f'[city] {args.city}/{args.district}')
+    print(f'[1/4] load graph {graphml}')
+    G = ox.io.load_graphml(graphml)
     print(f'  nodes={len(G.nodes)} edges={len(G.edges)}')
 
     print(f'[2/4] compute node betweenness (k=200, weight=length)')
@@ -56,9 +84,9 @@ def main():
     )
     print(f'  bc max={max(bc.values()):.4f}, mean={np.mean(list(bc.values())):.5f}')
 
-    print(f'[3/4] read sim edge observations {EDGE_CSV}')
+    print(f'[3/4] read sim edge observations {edge_csv}')
     edge_obs = {}
-    with open(EDGE_CSV, 'r', encoding='utf-8') as f:
+    with open(edge_csv, 'r', encoding='utf-8') as f:
         rdr = csv.DictReader(f)
         for row in rdr:
             u = row['u']
@@ -134,9 +162,9 @@ def main():
                 ha='center', va='center', transform=ax.transAxes)
 
     plt.tight_layout()
-    fig.savefig(OUT_PNG, dpi=150, bbox_inches='tight', facecolor='white')
+    fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    print(f'\n[plot] saved {OUT_PNG}')
+    print(f'\n[plot] saved {out_png}')
 
     # JSON 摘要
     summary = {
@@ -153,9 +181,9 @@ def main():
             'r ≈ 0: cascade 未充分触发或路径分布与拓扑无关'
         ),
     }
-    with open(OUT_JSON, 'w', encoding='utf-8') as f:
+    with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f'[summary] saved {OUT_JSON}')
+    print(f'[summary] saved {out_json}')
 
     print(f'\n=== T16 结论 ===')
     if not np.isnan(r_all):
