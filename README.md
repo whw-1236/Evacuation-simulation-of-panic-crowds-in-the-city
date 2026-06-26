@@ -1,10 +1,12 @@
-# Evacuation-simulation-of-panic-crowds-in-the-city
-Python simulation model for panic crowd evacuation in urban public space.
-# 城市大停电人群行为动态仿真系统 — 功能说明文档
+# 城市大停电人群行为动态仿真系统
+
+> Evacuation Simulation of Panic Crowds in the City — multi-agent Python simulation for panic crowd evacuation in urban public space.
 
 本项目是基于多智能体的城市停电应急仿真系统，用于模拟大规模停电事件下居民的心理-行为动态、基础设施响应以及政府/电网的应急决策过程。该系统对应 IJDRR 论文 *"城市大停电下的人群行为动态仿真研究"* 的 Methodology 第3章，所有模块均与论文公式对齐。
 
-> **PTS 定义修订 **：`pts_status` 由 **σ 迟滞带** 控制：进入 σ ≥ 0.8 × 性格系数（封顶 0.95）、退出 σ < 0.5 × 性格系数（迟滞带 0.3）；非永久锁存。基准取 EXTREME（0.8），PTS 为少数极端态。依据文献（SIR 含 Recovered 态、P-SIS 情绪可逆、伊比利亚大停电情绪随恢复消退）：PTS 不永久锁存但需迟滞。
+> **PTS 定义修订**：`pts_status` 由 **σ 迟滞带** 控制：进入 σ ≥ 0.8 × 性格系数（封顶 0.95）、退出 σ < 0.5 × 性格系数（迟滞带 0.3）；非永久锁存。基准取 EXTREME（0.8），PTS 为少数极端态。依据文献（SIR 含 Recovered 态、P-SIS 情绪可逆、伊比利亚大停电情绪随恢复消退）：PTS 不永久锁存但需迟滞。
+
+> **运行环境**：必须用 conda env `Crowds_sim` 跑 sim (含 networkx / osmnx 路网依赖)；matplotlib 画图建议用 Python 3.12 系统解释器 (Crowds_sim env 当前 matplotlib 在长 array savefig 时偶发 0xC00000FF kernel-level crash, 已在 batch runner 里做 summary-first 容错, 详见 §13)。
 
 ---
 
@@ -360,6 +362,84 @@ edge occupancy↑ → cong↑ (循环)
 
 ---
 
+## 13. M4 实验框架 ⭐（2026-06 新增）
+
+为论文 §4-§5 准备的批量实验脚本族, 与 [[2026-06-22 后续优化清单 (M4 实验计划)]] 中的 F1-F19 任务对齐。所有 batch runner 通过 `scripts/run_ablation.py` 跑单个 (city, seed, N, home_dist) 组合, 由 batch runner 循环调度。
+
+### 13.1 单跑 harness — `scripts/run_ablation.py`
+
+graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
+
+```powershell
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py `
+    --city 厦门市 --district 思明区 `
+    --n-residents 800 --seed 42 `
+    --tag baseline --output-base M4_F1_cross_city `
+    --home-distribution poi          # 'poi' 默认 / 'uniform' 见 §F2
+```
+
+每次跑会跑 graph-off + graph-on 各 120 步, 输出:
+- `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_off/global_metrics.csv`
+- `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_on/{global_metrics.csv, edge_observations.csv}`
+- `summary.json` (config + final / peak 关键指标, **summary-first** 保证即使 plot crash 也落盘)
+- `comparison.png` (matplotlib 易 crash, 失败时用 `analysis/replot_from_csv.py` 兜底)
+
+### 13.2 批量 runner
+
+| 脚本 | 任务编号 | 跑多少次 | 用途 |
+|---|---|---|---|
+| `scripts/run_f4_multi_seed.py` | F4 | 30 (三城 × seed 42-51) | 多 seed 95% CI |
+| `scripts/run_f7_n_scan.py` | F7 | 15 (三城 × N ∈ {200, 500, 800, 1500, 3000}) | cascade vs N 临界曲线 |
+| `scripts/run_f2_home_dist.py` | F2 | 6 (三城 × {poi, uniform}) | 去 POI bias 控制实验 |
+
+所有 batch runner subprocess 模式 + fail-fast 检查 networkx/osmnx, 启动命令统一:
+
+```powershell
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_<f4|f7|f2>_<name>.py
+```
+
+长任务建议用 PowerShell `Start-Process -NoNewWindow -PassThru -RedirectStandardOutput` detach 模式 (Bash 工具 timeout 上限 10 min 杀进程)。
+
+### 13.3 后处理 / aggregate 脚本
+
+| 脚本 | 输入 | 输出 | 用途 |
+|---|---|---|---|
+| `analysis/f4_aggregate.py` | `M4_F4_multi_seed/t15_*/summary.json` (×30) | `aggregate_ci.{csv,json}` + `errorbar.png` | 三城 × 4 指标 95% CI 表 + 误差棒图 |
+| `analysis/f7_n_curve.py` | `M4_F7_N_scan/t15_*/summary.json` (×15) | `n_curve.{csv,png}` | cascade 指标 vs N log-x 曲线 |
+| `analysis/f2_compare_r.py` | `M4_F2_home_dist/t15_*/graph_on/edge_observations.csv` (×6) | `r_compare.{csv,json}` + `_corr/<...>/correlation.json` | poi vs uniform 的 Pearson r 对照 |
+| `analysis/replot_from_csv.py` | 任意 `<output-base>/t15_*/graph_*/global_metrics.csv` | `comparison.png` | 从 csv 重画 comparison (matplotlib crash 兜底) |
+| `analysis/betweenness_vs_sim.py` | `<output-base>/.../edge_observations.csv` + `road_graph_cache/<城>_<区>.graphml` | `correlation.{png,json}` | T16: BC vs 仿真累计 occupancy 的 Pearson/Spearman |
+
+**画图建议用 Python 3.12**:
+
+```powershell
+"C:/Program Files/Python312/python.exe" analysis/f4_aggregate.py
+```
+
+Crowds_sim env 的 matplotlib 在 `fig.savefig` 时偶发 0xC00000FF kernel crash (numpy 2.2 + freetype/png 兼容问题), 但 `analysis/betweenness_vs_sim.py` 需要 networkx 必须用 Crowds_sim env — 它内部已经做 summary-first + try/except + 手算 Pearson 绕过 BLAS。
+
+### 13.4 实测数据落盘
+
+```
+trace_output/
+├── M3_baseline/                     # 早期实验留存
+├── M4_F1_cross_city/                # F1 三城跨城市验证 (6-22)
+├── M4_T16_cross_city/               # T16 BC vs sim 相关性三城外推 (6-22)
+├── M4_F4_multi_seed/                # F4 三城 × 10 seed (6-26)
+│   ├── aggregate_ci.{csv,json}
+│   ├── errorbar.png
+│   └── t15_<城>_<区>_seed{42..51}/  (×30)
+├── M4_F7_N_scan/                    # F7 三城 × 5 N (6-26)
+│   ├── n_curve.{csv,png}
+│   └── t15_<城>_<区>_N{200..3000}/  (×15)
+└── M4_F2_home_dist/                 # F2 三城 × {poi, uniform} (6-26)
+    ├── r_compare.{csv,json}
+    ├── _corr/<城>_<区>_<hd>/correlation.json  (×6)
+    └── t15_<城>_<区>_{poi,uniform}/  (×6)
+```
+
+---
+
 ## 代码模块总览
 
 ```
@@ -368,43 +448,103 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 │   ├── agents.py              # 5类Agent (~3100行) +graph state字段
 │   ├── behavior_switching.py  # ⭐ I1/I2/I3 + P1.A/P1.B/P2/P3 + 拥堵反馈 + flee 行为
 │   ├── social_force.py        # 社会力 + path-based driving + Greenshields 速度衰减
-│   ├── unified_stress_model.py # Lazarus统一压力模型 (637行)
-│   ├── region_manager.py      # GeoJSON区域管理 (1276行)
+│   ├── unified_stress_model.py # Lazarus统一压力模型
+│   ├── region_manager.py      # GeoJSON区域管理 + distribute_residents_{by_poi, uniform}
 │   ├── event_types.py         # 事件类型定义
 │   ├── event_recorder.py      # 事件记录器
 │   ├── event_influence.py     # 事件影响计算
-│   ├── road_graph.py          # ⭐ 【M2 新增】osmnx 下载 + edge 标注 + snap helper
-│   ├── path_planner.py        # ⭐ 【M2 新增】Dijkstra + congestion-aware + 动态重路由
-│   ├── movement_layer.py      # ⭐ 【M2 新增】Greenshields + node load + occupancy decay
-│   ├── city_metrics.py        # ⭐ 【M2 新增】4 组路网指标 + Gini + 玫瑰图 + 热力图
-│   └── shelter_loader.py      # ⭐ 【M3+ 新增】应急.csv 加载 + name 过滤
+│   ├── road_graph.py          # 【M2】osmnx 下载 + edge 标注 + snap helper
+│   ├── path_planner.py        # 【M2】Dijkstra + congestion-aware + 动态重路由
+│   ├── movement_layer.py      # 【M2】Greenshields + node load + occupancy decay
+│   ├── city_metrics.py        # 【M2】4 组路网指标 + Gini + 玫瑰图 + 热力图
+│   └── shelter_loader.py      # 【M3+】应急.csv 加载 + name 过滤
 ├── decision/
-│   ├── base.py rule_based.py utility.py
+│   ├── base.py / rule_based.py / utility.py
 ├── config/
-│   ├── config.py simulation_config.py behavior_config.py
-│   └── city_manager.py        # ⭐ +load_road_graph 方法
+│   ├── config.py              # 含 SimulationConfig.HOME_DISTRIBUTION ('poi'/'uniform')
+│   ├── simulation_config.py / behavior_config.py
+│   └── city_manager.py        # 【M2】+load_road_graph
 ├── simulation/
-│   └── simulation.py          # ⭐ +_init_road_graph + _init_shelters + _path_planning_hook
+│   └── simulation.py          # 【M2/M3+】+_init_road_graph + _init_shelters + _path_planning_hook
 ├── visualization/
-│   ├── dashboard.py           # ⭐ +avg_edge_congestion/pct_on_path/max_edge_occupancy 字段
-│   ├── small_area_viewer.py
-│   └── trace_plotter.py
-├── road_graph_cache/          # ⭐ 【M2 新增】OSM graphml + metrics.json + plots
-│   ├── 厦门市_思明区.graphml
-│   ├── 沈阳市_沈河区.graphml
-│   ├── 北京市_东城区.graphml
+│   ├── dashboard.py           # +avg_edge_congestion/pct_on_path/max_edge_occupancy 字段
+│   ├── small_area_viewer.py / trace_plotter.py
+├── scripts/                   # ⭐【M4】实验 runner 族
+│   ├── run_ablation.py            # 单跑 harness (graph-on vs graph-off, 支持 --home-distribution)
+│   ├── run_f4_multi_seed.py       # F4 batch: 三城 × seed 42-51
+│   ├── run_f7_n_scan.py           # F7 batch: 三城 × N ∈ {200, 500, 800, 1500, 3000}
+│   └── run_f2_home_dist.py        # F2 batch: 三城 × {poi, uniform}
+├── analysis/                  # ⭐【M4】后处理 / 画图
+│   ├── betweenness_vs_sim.py      # T16: BC vs cum_occupancy, summary-first + 手算 Pearson 绕过 BLAS
+│   ├── f4_aggregate.py            # F4: 95% CI 表 + errorbar.png
+│   ├── f7_n_curve.py              # F7: log-x N 曲线
+│   ├── f2_compare_r.py            # F2: poi vs uniform 的 Pearson r 对比
+│   └── replot_from_csv.py         # matplotlib crash 兜底, 从 csv 重画 comparison.png
+├── road_graph_cache/          # 【M2】OSM graphml + metrics.json + plots (gitignored)
+│   ├── 厦门市_思明区.graphml / 沈阳市_沈河区.graphml / 北京市_东城区.graphml
 │   └── {城市}_{区}/{metrics.json, orientation_rose.png, betweenness_heatmap.png}
-├── _compare_cities.py         # ⭐ 【M2 新增】三城 metrics 对比脚本
-├── _t5_validate.py            # ⭐ 【M1 新增】单城市 metrics 验证
-├── _t15_harness.py            # ⭐ 【M3 新增】graph-on vs off 对照实验 harness
-├── _t16_correlation.py        # ⭐ 【M3 新增】betweenness ↔ 仿真观测相关性
-├── _t16b_shelter_aware.py     # ⭐ 【M3+ 新增】shelter-aware betweenness 对照
 ├── run_dashboard.py           # 一键启动仪表盘
-├── output/                    # 截图 / 概览图
-├── trace_output/              # ⭐ 每次 run 的 trace CSV +edge_observations.csv
-├── simulation map data/       # Layer 1 polygon + POI CSV
+├── output/                    # 截图 / 概览图 (gitignored)
+├── trace_output/              # 每次 run 的 trace CSV / summary.json / aggregate (gitignored)
+├── simulation map data/       # Layer 1 polygon + POI CSV (沈阳/北京 gitignored)
 ├── 属性说明.md                 # 输出数据JSON属性详解
 └── README.md                  # 本文档
 ```
 
-### 复现命令（必须先 conda activate Crowds_sim）
+### 复现命令
+
+> 所有命令在 Windows 下用 `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe` 直接调用 (或先 `conda activate Crowds_sim` 后用 `python`)。Linux/macOS 类似, 替换为你的 conda env 路径即可。
+
+```powershell
+# 1. 启动交互仪表盘 (本地 GUI)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe run_dashboard.py
+
+# 2. 单次对照实验 (graph-on vs graph-off, 默认厦门思明 N=800 seed=42)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py
+
+# 3. 跨城市验证 (F1)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py `
+    --city 沈阳市 --district 沈河区 --output-base M4_F1_cross_city
+
+# 4. 多 seed 批量 (F4, ~25 min, 30 个 subprocess)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_f4_multi_seed.py
+
+# 5. N 扫描批量 (F7, ~20 min)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_f7_n_scan.py
+
+# 6. home 分布对照批量 (F2, ~6 min)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_f2_home_dist.py
+
+# 7. 后处理 / aggregate (推荐用 Python 3.12, matplotlib 在 Crowds_sim env 偶发崩溃)
+"C:/Program Files/Python312/python.exe" analysis/f4_aggregate.py
+"C:/Program Files/Python312/python.exe" analysis/f7_n_curve.py
+"C:/Program Files/Python312/python.exe" analysis/replot_from_csv.py M4_F4_multi_seed
+
+# 8. F2 r 对比 (需要 networkx → Crowds_sim env, 内部已 summary-first 容错 plot crash)
+D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe analysis/f2_compare_r.py
+```
+
+### 长任务的 detach 模式 (避免 Bash/PowerShell tool 10 min timeout)
+
+```powershell
+Set-Location "<repo-root>"
+$proc = Start-Process -FilePath "D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe" `
+    -ArgumentList @("-u", "scripts/run_f4_multi_seed.py") `
+    -RedirectStandardOutput "trace_output/M4_F4_multi_seed.log" `
+    -RedirectStandardError "trace_output/M4_F4_multi_seed.err" `
+    -NoNewWindow -PassThru
+"PID=$($proc.Id)"
+# 监控: until grep -q "F4 complete" trace_output/M4_F4_multi_seed.log; do sleep 30; done
+```
+
+---
+
+## 14. 已知问题与环境注意事项
+
+| 问题 | 现象 | 处理 |
+|---|---|---|
+| **默认 `python` 没装 networkx/osmnx** | graph-on silent fallback 到 graph-off, 数据失效但不报错 | 所有 batch runner 加 fail-fast import 检查; 必须用 `Crowds_sim` env |
+| **Bash/PowerShell tool timeout 上限 10 min** | F4 (30 min) / F7 (20 min) 长任务被超时杀进程 | 用 `Start-Process -NoNewWindow -PassThru` detach 出独立进程 + log file 监控 |
+| **Crowds_sim matplotlib `fig.savefig` 0xC00000FF crash** | run_ablation 的 plot_compare / betweenness_vs_sim 的散点图随机 kernel-level crash, except 接不到 | `run_ablation.py` / `betweenness_vs_sim.py` 都改 summary-first (json 先落盘); `analysis/replot_from_csv.py` 用 Python 3.12 兜底重画 |
+| **Crowds_sim scipy/numpy BLAS 长 array crash** | `scipy.stats.pearsonr` / `np.corrcoef` 在 >5000 长 array 上 0xC00000FF | `betweenness_vs_sim.py` 改用纯 Python 求和公式手算 Pearson r + Spearman ρ, 绕过 BLAS |
+| **Crowds_sim env 修复建议 (待办, low priority)** | 上述 matplotlib + scipy crash | `conda install -n Crowds_sim -c conda-forge matplotlib=3.10 numpy=1.26 scipy=1.13 --force-reinstall` (注: numpy 2.x 跟 osmnx 2.1.0 有兼容问题, 用 1.26 LTS 更稳) |
