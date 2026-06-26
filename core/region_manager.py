@@ -1252,6 +1252,102 @@ class ResidentDistributor:
             print(f"   {c}: {n}人 / {n_pois}个POI (平均{avg:.1f}人/POI)")
         return True
 
+    def distribute_residents_uniform(self, residents):
+        """
+        F2 控制实验: 在 polygon 内按面积均匀采样 home 位置 (去除 POI bias)。
+
+        【设计意图】
+        与 distribute_residents_by_poi 对照:
+          - POI 模式: home 聚集在 industry/school 等 CSV 点位附近 (0.002° 圆内)
+          - uniform 模式: home 在每个 polygon 内 rejection sampling 均匀分布
+        用于检验 "L 形 BC 反相关" 是否由 POI 聚类导致 (F2/T16 控制实验)。
+
+        【与 by_poi 一致的部分】
+          - 仍按区域面积加权选择 region (大区多分配)
+          - 仍生成 region_spread_index / region_vulnerability_index 喂给 unified_stress_model
+          - 仍写 home_position (通过 set_position)
+        【差异】
+          - home_poi = None, home_poi_category = 'uniform'
+          - 不依赖 csv_nodes
+
+        参数:
+            residents: ResidentAgent 列表
+        返回:
+            True 成功; False 区域为空
+        """
+        if not self.region_manager.regions:
+            print("[uniform] 无可用区域, 跳过 uniform 分配")
+            return False
+
+        region_ids = list(self.region_manager.regions.keys())
+        n_regions = len(region_ids)
+
+        # 区域特征指数 (与 distribute_residents_by_poi 完全一致, 让下游一致)
+        region_spread_index = {}
+        region_vulnerability_index = {}
+        for i, rid in enumerate(region_ids):
+            if i < n_regions // 3:
+                region_spread_index[rid] = random.uniform(0.7, 1.0)
+            elif i < 2 * n_regions // 3:
+                region_spread_index[rid] = random.uniform(0.0, 0.3)
+            else:
+                region_spread_index[rid] = random.uniform(0.3, 0.7)
+            rand = random.random()
+            if rand < 0.2:
+                region_vulnerability_index[rid] = random.uniform(0.75, 1.0)
+            elif rand < 0.4:
+                region_vulnerability_index[rid] = random.uniform(0.0, 0.25)
+            else:
+                region_vulnerability_index[rid] = random.uniform(0.25, 0.75)
+
+        # 按区域面积加权 (大区多分配 — 与"每平方米同等住人概率"的均匀极限一致)
+        total_area = sum(r['area'] for r in self.region_manager.regions.values())
+        if total_area <= 0:
+            region_weights = [1.0 / n_regions] * n_regions
+        else:
+            region_weights = [self.region_manager.regions[rid]['area'] / total_area
+                              for rid in region_ids]
+
+        sampled_per_region = {rid: 0 for rid in region_ids}
+        fallback_count = 0
+        REJECTION_TRIES = 200  # 薄长 polygon 可能需要多试几次
+
+        for r in residents:
+            rid = random.choices(region_ids, weights=region_weights, k=1)[0]
+            region_data = self.region_manager.regions[rid]
+            geom = region_data['geometry']
+            minx, miny, maxx, maxy = region_data['bounds']
+
+            x = y = None
+            for _ in range(REJECTION_TRIES):
+                cx = random.uniform(minx, maxx)
+                cy = random.uniform(miny, maxy)
+                if geom.contains(Point(cx, cy)):
+                    x, y = cx, cy
+                    break
+            if x is None:
+                # 极薄/退化 polygon 兜底: 用 centroid
+                centroid = region_data['centroid']
+                x, y = centroid.x, centroid.y
+                fallback_count += 1
+
+            r.set_position(x, y, rid)
+            r.home_poi = None
+            r.home_poi_category = 'uniform'
+            r.zone_spread_index = region_spread_index.get(rid, 0.5)
+            r.zone_vulnerability_index = region_vulnerability_index.get(rid, 0.5)
+            sampled_per_region[rid] += 1
+
+        self.region_spread_index = region_spread_index
+        self.region_vulnerability_index = region_vulnerability_index
+
+        used_regions = sum(1 for c in sampled_per_region.values() if c > 0)
+        avg_per_region = len(residents) / max(1, used_regions)
+        print(f"[uniform] {len(residents)} 居民 polygon 内均匀采样: "
+              f"覆盖 {used_regions}/{n_regions} 区域, "
+              f"平均 {avg_per_region:.1f} 人/区, fallback {fallback_count}")
+        return True
+
     def _get_safe_point(self, region_id, max_attempts=100):
         """在安全区域内生成点位"""
         safe_geom = self.safe_regions.get(region_id)
