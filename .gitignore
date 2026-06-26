@@ -226,5 +226,16 @@ cache/
 simulation map data/沈阳市/
 simulation map data/北京市/
 
+# 临时调试输出 (2026-06-26 加: aggregate 重定向 / matplotlib smoke test 残留)
+# 注: 项目代码 `_compare_cities.py` / `_t*_*.py` 是 .py, 不会被以下 .txt/.png/.err 模式误伤
+_agg_*.txt
+_agg_*.err
+_test_*.png
+_test_*.txt
+_smoke_*.txt
+
+# Obsidian 笔记本 (笔记本通常不在仓库内, belt-and-suspenders)
+.obsidian/
+
 # IDE
 .vscode/

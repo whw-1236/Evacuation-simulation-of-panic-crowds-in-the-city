@@ -249,6 +249,12 @@ class SimulationConfig:
     EMERGENCY_RESPONSE_DELAY = 5  # 应急响应延迟步数（前N步禁止恢复）
     INITIAL_OUTAGE_RATIO = 0.5  # 初始停电区域比例（50%）
 
+    # ==================== 居民 home 分布策略 (F2 控制实验) ====================
+    # 'poi'     : 按 CSV POI 圆内 0.002° 随机 (默认, 与 6-22 baseline 一致)
+    # 'uniform' : 在 polygon 内面积均匀 rejection sampling (去除 POI bias)
+    # 用途: 检验"L 形 BC 反相关"是否由 POI 聚类导致 (F2/T16 控制实验)
+    HOME_DISTRIBUTION = 'poi'
+
 
 class AgentConfig:
     """Agent参数配置"""

@@ -137,6 +137,10 @@ def run_one(label, use_road_graph, args, run_dir):
     cfg.simulation.N_RESIDENTS = args.n_residents
     cfg.simulation.N_ENTERPRISES = args.n_enterprises
     cfg.simulation.TOTAL_STEPS = args.total_steps
+    # F2 控制实验: home 分布策略 ('poi' 默认 / 'uniform' 去 POI bias)
+    home_dist = getattr(args, 'home_distribution', None)
+    if home_dist:
+        cfg.simulation.HOME_DISTRIBUTION = home_dist
 
     t0 = time.time()
     sim = BlackoutSimulation(config=cfg, city_config=city_config)
@@ -189,7 +193,7 @@ def run_one(label, use_road_graph, args, run_dir):
 # 对比 + 画图
 # =============================================================================
 def plot_compare(h_off, h_on, args, run_dir):
-    steps = [r['step'] for r in h_off]
+    """先写 summary.json (机器可读, 关键路径), 再画图 (易碎, 兜底)。"""
     metrics_to_plot = [
         ('avg_stress', '平均 σ (stress)'),
         ('max_stress', '最大个体 σ'),
@@ -198,29 +202,8 @@ def plot_compare(h_off, h_on, args, run_dir):
         ('flee_ratio', 'flee ratio (向 shelter 逃)'),
         ('avg_edge_congestion', '平均 edge congestion'),
     ]
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    for ax, (k, lab) in zip(axes.flat, metrics_to_plot):
-        off = [r[k] for r in h_off]
-        on  = [r[k] for r in h_on]
-        ax.plot(steps, off, label='graph-off', color='#888', linewidth=1.5)
-        ax.plot(steps, on,  label='graph-on',  color='#d62728', linewidth=1.5)
-        ax.axvline(args.outage_step, color='#666', linestyle=':', alpha=0.5)
-        ax.set_title(lab, fontsize=11)
-        ax.set_xlabel('step')
-        ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=9)
-    fig.suptitle(
-        f'T15: {args.city}/{args.district} | '
-        f'N={args.n_residents} seed={args.seed}'
-        + (f' | tag={args.tag}' if args.tag else ''),
-        fontsize=12,
-    )
-    plt.tight_layout()
-    out = os.path.join(run_dir, 'comparison.png')
-    fig.savefig(out, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f'\n[plot] saved {out}')
 
+    # ---- 1) 关键路径: 先写 summary.json (matplotlib 不参与, 不会 crash) ----
     summary = {
         'config': {
             'city':          args.city,
@@ -231,6 +214,7 @@ def plot_compare(h_off, h_on, args, run_dir):
             'outage_step':   args.outage_step,
             'seed':          args.seed,
             'tag':           args.tag,
+            'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
         },
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
@@ -249,6 +233,37 @@ def plot_compare(h_off, h_on, args, run_dir):
     with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f'[summary] saved {out_json}')
+
+    # ---- 2) 易碎: matplotlib 画图 (subprocess 模式下偶有 0xC00000FF 类
+    #         kernel-level crash, 包 try/except + 单独函数让进程独立挂掉
+    #         也不影响 summary.json 落盘) ----
+    try:
+        steps = [r['step'] for r in h_off]
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        for ax, (k, lab) in zip(axes.flat, metrics_to_plot):
+            off = [r[k] for r in h_off]
+            on  = [r[k] for r in h_on]
+            ax.plot(steps, off, label='graph-off', color='#888', linewidth=1.5)
+            ax.plot(steps, on,  label='graph-on',  color='#d62728', linewidth=1.5)
+            ax.axvline(args.outage_step, color='#666', linestyle=':', alpha=0.5)
+            ax.set_title(lab, fontsize=11)
+            ax.set_xlabel('step')
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=9)
+        fig.suptitle(
+            f'T15: {args.city}/{args.district} | '
+            f'N={args.n_residents} seed={args.seed}'
+            + (f' | tag={args.tag}' if args.tag else ''),
+            fontsize=12,
+        )
+        plt.tight_layout()
+        out = os.path.join(run_dir, 'comparison.png')
+        fig.savefig(out, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f'\n[plot] saved {out}')
+    except Exception as ex:
+        print(f'[plot] WARN: {type(ex).__name__}: {ex} (summary.json 已落盘, 不影响数据)')
+
     return summary
 
 
@@ -281,6 +296,9 @@ def _parse_args():
     p.add_argument('--output-base',   default=None, dest='output_base',
                    help='输出根目录, 默认 trace_output/。可指定 M4 子组如 '
                         'M4_F4_multi_seed 让结果直接落子文件夹, 省去手动 mv')
+    p.add_argument('--home-distribution', default=None, dest='home_distribution',
+                   choices=['poi', 'uniform'],
+                   help='F2: 居民 home 分布策略 (poi 默认 / uniform 去 POI bias)')
     return p.parse_args()
 
 

@@ -39,7 +39,43 @@ matplotlib.use('Agg')
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
-from scipy import stats as scipy_stats
+# 不再用 scipy.stats: Crowds_sim env 的 scipy 1.18 + numpy 2.2 在长 array (>5000)
+# 上调 pearsonr 会触发 0xC00000FF kernel-level crash。改用 numpy 手写。
+
+
+def _pearson_r_p(x, y):
+    """Pearson r 手算 (避免 np.corrcoef / scipy.stats —— 它们在 Crowds_sim
+    numpy 2.2 + scipy 1.18 上对 >5000 长 array 触发 0xC00000FF kernel crash)。
+    用最朴素的求和公式: r = Σ((x-μx)(y-μy)) / (n σx σy)。p 用 t 分布近似。"""
+    import math
+    n = len(x)
+    if n < 3:
+        return float('nan'), float('nan')
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64)
+    mx = float(x_arr.mean())
+    my = float(y_arr.mean())
+    dx = x_arr - mx
+    dy = y_arr - my
+    sxx = float((dx * dx).sum())
+    syy = float((dy * dy).sum())
+    sxy = float((dx * dy).sum())
+    if sxx <= 1e-20 or syy <= 1e-20:
+        return float('nan'), float('nan')
+    r = sxy / math.sqrt(sxx * syy)
+    r = max(-1.0, min(1.0, r))
+    if abs(r) >= 1.0 - 1e-12:
+        return r, 0.0
+    t = r * math.sqrt(n - 2) / math.sqrt(1 - r * r)
+    p = math.erfc(abs(t) / math.sqrt(2))
+    return r, p
+
+
+def _spearman_rho_p(x, y):
+    """numpy 实现 Spearman ρ: 排名后 Pearson。"""
+    rx = np.argsort(np.argsort(x))
+    ry = np.argsort(np.argsort(y))
+    return _pearson_r_p(rx, ry)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -97,7 +133,7 @@ def main():
     nonzero = sum(1 for v in edge_obs.values() if v > 0)
     print(f'  edges with cum > 0: {nonzero} / {len(edge_obs)}')
 
-    print(f'[4/4] correlate node betweenness vs observed in-edge load')
+    print(f'[4/4] correlate node betweenness vs observed in-edge load', flush=True)
     # 把 OSM id 字符串化 (graphml 加载后是 int, csv 是 str)
     node_load = {}
     for n in UG_main.nodes:
@@ -107,66 +143,42 @@ def main():
         for u in G.predecessors(n) if G.is_directed() else G.neighbors(n):
             load += edge_obs.get((str(u), n_str), 0.0)
         node_load[n] = load
+    print(f'  [4.1] node_load built ({len(node_load)} nodes)', flush=True)
 
     pairs = [(bc[n], node_load[n]) for n in UG_main.nodes if n in bc]
     bc_arr = np.array([p[0] for p in pairs])
     load_arr = np.array([p[1] for p in pairs])
+    print(f'  [4.2] bc_arr/load_arr built (len={len(bc_arr)})', flush=True)
 
     # 全集 Pearson
-    if load_arr.std() < 1e-12 or bc_arr.std() < 1e-12:
+    print(f'  [4.3a] calling std()', flush=True)
+    s_load = float(load_arr.std())
+    s_bc = float(bc_arr.std())
+    print(f'  [4.3b] std OK: load={s_load:.6f} bc={s_bc:.6f}', flush=True)
+    if s_load < 1e-12 or s_bc < 1e-12:
         r_all, p_all = float('nan'), float('nan')
     else:
-        r_all, p_all = scipy_stats.pearsonr(bc_arr, load_arr)
-    print(f'  Pearson r (all nodes)         = {r_all:.4f}  (p={p_all:.2e})')
+        print(f'  [4.3c] calling _pearson_r_p', flush=True)
+        r_all, p_all = _pearson_r_p(bc_arr, load_arr)
+        print(f'  [4.3d] pearson OK', flush=True)
+    print(f'  Pearson r (all nodes)         = {r_all:.4f}  (p={p_all:.2e})', flush=True)
 
     # 仅看有非零 load 的 (噪声节点会掩盖信号)
     mask_nz = load_arr > 0
     if mask_nz.sum() >= 3 and load_arr[mask_nz].std() > 1e-12:
-        r_nz, p_nz = scipy_stats.pearsonr(bc_arr[mask_nz], load_arr[mask_nz])
+        r_nz, p_nz = _pearson_r_p(bc_arr[mask_nz], load_arr[mask_nz])
         print(f'  Pearson r (load>0, n={int(mask_nz.sum())}) = {r_nz:.4f}  (p={p_nz:.2e})')
     else:
         r_nz, p_nz = float('nan'), float('nan')
 
     # Spearman (rank-based, 抗重尾)
     if load_arr.std() > 1e-12 and bc_arr.std() > 1e-12:
-        rho_all, sp_p_all = scipy_stats.spearmanr(bc_arr, load_arr)
+        rho_all, sp_p_all = _spearman_rho_p(bc_arr, load_arr)
         print(f'  Spearman ρ (all)              = {rho_all:.4f}  (p={sp_p_all:.2e})')
     else:
         rho_all, sp_p_all = float('nan'), float('nan')
 
-    # 画散点
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    ax = axes[0]
-    ax.scatter(bc_arr, load_arr, alpha=0.3, s=8, color='#3b82f6')
-    # 标 top-10 betweenness 节点
-    top10_idx = np.argsort(-bc_arr)[:10]
-    ax.scatter(bc_arr[top10_idx], load_arr[top10_idx],
-               color='#dc2626', s=40, label='top-10 betweenness', zorder=5)
-    ax.set_xlabel('node betweenness (metrics 预测)')
-    ax.set_ylabel('observed in-edge load (cum_occupancy)')
-    ax.set_title(f'全节点散点 (Pearson r={r_all:.3f})')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1]
-    if mask_nz.sum() > 0:
-        ax.scatter(bc_arr[mask_nz], load_arr[mask_nz],
-                   alpha=0.5, s=12, color='#10b981')
-        ax.set_xlabel('node betweenness (metrics 预测)')
-        ax.set_ylabel('observed in-edge load')
-        ax.set_title(f'非零 load 节点 (n={int(mask_nz.sum())}, Pearson r={r_nz:.3f})')
-        ax.grid(True, alpha=0.3)
-    else:
-        ax.text(0.5, 0.5, '所有 load=0 (cascade 未触发)',
-                ha='center', va='center', transform=ax.transAxes)
-
-    plt.tight_layout()
-    fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f'\n[plot] saved {out_png}')
-
-    # JSON 摘要
+    # 关键路径: 先写 json (Crowds_sim env 的 matplotlib 易 crash, json 必须先落盘)
     summary = {
         'n_nodes': int(len(bc_arr)),
         'n_nodes_with_observed_load': int(mask_nz.sum()),
@@ -184,6 +196,41 @@ def main():
     with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(f'[summary] saved {out_json}')
+
+    # 易碎: 画散点 (Crowds_sim matplotlib 在 fig.savefig 时可能 0xC00000FF
+    # 进程级 crash, try/except 不一定能救; json 在上面已落盘, plot 缺失也无碍)
+    try:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        ax = axes[0]
+        ax.scatter(bc_arr, load_arr, alpha=0.3, s=8, color='#3b82f6')
+        # 标 top-10 betweenness 节点
+        top10_idx = np.argsort(-bc_arr)[:10]
+        ax.scatter(bc_arr[top10_idx], load_arr[top10_idx],
+                   color='#dc2626', s=40, label='top-10 betweenness', zorder=5)
+        ax.set_xlabel('node betweenness (metrics 预测)')
+        ax.set_ylabel('observed in-edge load (cum_occupancy)')
+        ax.set_title(f'全节点散点 (Pearson r={r_all:.3f})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        ax = axes[1]
+        if mask_nz.sum() > 0:
+            ax.scatter(bc_arr[mask_nz], load_arr[mask_nz],
+                       alpha=0.5, s=12, color='#10b981')
+            ax.set_xlabel('node betweenness (metrics 预测)')
+            ax.set_ylabel('observed in-edge load')
+            ax.set_title(f'非零 load 节点 (n={int(mask_nz.sum())}, Pearson r={r_nz:.3f})')
+            ax.grid(True, alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, '所有 load=0 (cascade 未触发)',
+                    ha='center', va='center', transform=ax.transAxes)
+
+        plt.tight_layout()
+        fig.savefig(out_png, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        print(f'\n[plot] saved {out_png}')
+    except Exception as ex:
+        print(f'[plot] WARN: {type(ex).__name__}: {ex} (json 已落盘, 不影响数据)')
 
     print(f'\n=== T16 结论 ===')
     if not np.isnan(r_all):

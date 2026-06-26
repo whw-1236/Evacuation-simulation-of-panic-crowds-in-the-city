@@ -250,16 +250,24 @@ class BlackoutSimulation:
         print(f"[*] 商店数据: {len(self.stores)} 家 "
               f"(总容量 {sum(s['capacity'] for s in self.stores)})")
 
-        # 2) 分配Agent到区域 - 居民走POI绑定, 企业仍走原方法
+        # 2) 分配Agent到区域 - 居民走 home_distribution 策略
+        # config.simulation.HOME_DISTRIBUTION: 'poi' (默认) 或 'uniform' (F2 控制实验)
         distributor = ResidentDistributor(self.region_manager)
-        bound_by_poi = distributor.distribute_residents_by_poi(
-            self.residents, self.csv_nodes,
-            poi_radius=0.002,  # ~222m, 与 agent._update_position 的 max_range 一致
-        )
-        if not bound_by_poi:
-            # 回退到原方法 (CSV为空时)
-            print("[警告] POI绑定失败, 回退到按区域面积分配")
-            distributor.distribute_residents(self.residents)
+        home_dist = getattr(config.simulation, 'HOME_DISTRIBUTION', 'poi')
+        if home_dist == 'uniform':
+            ok = distributor.distribute_residents_uniform(self.residents)
+            if not ok:
+                print("[警告] uniform 分配失败, 回退到按区域面积分配")
+                distributor.distribute_residents(self.residents)
+        else:  # 'poi' 默认
+            bound_by_poi = distributor.distribute_residents_by_poi(
+                self.residents, self.csv_nodes,
+                poi_radius=0.002,  # ~222m, 与 agent._update_position 的 max_range 一致
+            )
+            if not bound_by_poi:
+                # 回退到原方法 (CSV为空时)
+                print("[警告] POI绑定失败, 回退到按区域面积分配")
+                distributor.distribute_residents(self.residents)
         distributor.distribute_enterprises(self.enterprises)
 
         # 【I2 商店】home_position 已就位 → 初始化每个 resident 对商店的
