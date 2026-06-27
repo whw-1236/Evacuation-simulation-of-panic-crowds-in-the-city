@@ -53,7 +53,7 @@ CITIES = [
 HOME_DISTS = ['poi', 'uniform']
 SEED = 42
 
-USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+USE_MML = os.environ.get('BLACKOUT_USE_MML', '1') != '0'   # MML default since 2026-06-28; set '0' for sigmoid legacy
 OUTPUT_BASE = 'M4_MML_F2_home_dist' if USE_MML else 'M4_F2_home_dist'
 TRACE_ROOT = os.path.join(ROOT, 'trace_output')
 PYTHON_EXE = sys.executable
@@ -87,8 +87,8 @@ def main():
                 '--home-distribution', hd,
                 '--output-base', OUTPUT_BASE,
             ]
-            if USE_MML:
-                cmd.append('--use-mml')
+            if not USE_MML:
+                cmd.append('--no-mml')
             print(f'\n{"#"*70}', flush=True)
             print(f'[{done}/{total}] {city}/{district} home_dist={hd}', flush=True)
             print(f'{"#"*70}', flush=True)

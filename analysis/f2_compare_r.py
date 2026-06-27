@@ -30,7 +30,7 @@ except Exception:
     pass
 
 
-_USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+_USE_MML = os.environ.get('BLACKOUT_USE_MML', '1') != '0'   # MML default since 2026-06-28; set '0' for sigmoid legacy supplementary
 F2_DIR = os.path.join(ROOT, 'trace_output',
                       'M4_MML_F2_home_dist' if _USE_MML else 'M4_F2_home_dist')
 CORR_BASE = os.path.join(F2_DIR, '_corr')
