@@ -542,7 +542,7 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 │   ├── f7_n_curve.py              # F7 → log-x N 曲线 (§5.2.1 主图 source)
 │   ├── f5_phase_transition.py     # F5 → θ_flee phase transition 曲线 (§5.2.2 sigmoid 主图)
 │   └── f2_compare_r.py            # F2 → poi vs uniform 的 Pearson r 对比 (§5.3 主图 source)
-├── tools/
+├── .venv/
 │   └── run_in_crowds_env.ps1      # ⭐ Crowds_sim env wrapper (走 cmd /c "call activate.bat" 解 DLL 路径)
 ├── road_graph_cache/          # 【M2】OSM graphml + metrics.json + plots (gitignored)
 │   ├── 厦门市_思明区.graphml / 沈阳市_沈河区.graphml / 北京市_东城区.graphml
@@ -557,44 +557,44 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 
 ### 复现命令
 
-> 所有命令通过 `tools/run_in_crowds_env.ps1` wrapper 启动 (内部 `cmd /c "call activate.bat Crowds_sim && python ..."`, 确保 `Library\bin\` 的 DLL 进 PATH; 不要直接调 `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe`, 否则 matplotlib/scipy 的 C 扩展会抛 0xC00000FF, 详见 §14)。
+> 所有命令通过 `.venv/run_in_crowds_env.ps1` wrapper 启动 (内部 `cmd /c "call activate.bat Crowds_sim && python ..."`, 确保 `Library\bin\` 的 DLL 进 PATH; 不要直接调 `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe`, 否则 matplotlib/scipy 的 C 扩展会抛 0xC00000FF, 详见 §14)。
 
 ```powershell
 # 1. 启动交互仪表盘 (本地 GUI)
-.\tools\run_in_crowds_env.ps1 run_dashboard.py
+.\.venv\run_in_crowds_env.ps1 run_dashboard.py
 
 # 2. 单次对照实验 (graph-on vs graph-off, 默认厦门思明 N=800 seed=42)
-.\tools\run_in_crowds_env.ps1 scripts\run_ablation.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_ablation.py
 
 # 3. 跨城市验证 (F1)
-.\tools\run_in_crowds_env.ps1 scripts\run_ablation.py `
+.\.venv\run_in_crowds_env.ps1 scripts\run_ablation.py `
     --city 沈阳市 --district 沈河区 --output-base M4_F1_cross_city
 
 # 4. 多 seed 批量 (F4, ~25 min, 30 个 subprocess)
-.\tools\run_in_crowds_env.ps1 scripts\run_f4_multi_seed.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_f4_multi_seed.py
 
 # 5. N 扫描批量 (F7, ~20 min)
-.\tools\run_in_crowds_env.ps1 scripts\run_f7_n_scan.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_f7_n_scan.py
 
 # 6. home 分布对照批量 (F2, ~6 min)
-.\tools\run_in_crowds_env.ps1 scripts\run_f2_home_dist.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_f2_home_dist.py
 
 # 7. θ_flee 扫描 (F5, ~10 min)
-.\tools\run_in_crowds_env.ps1 scripts\run_f5_theta_flee.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_f5_theta_flee.py
 
 # 8. 后处理 / aggregate (统一通过 wrapper, matplotlib + scipy 都正常)
-.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py
-.\tools\run_in_crowds_env.ps1 analysis\f7_n_curve.py
-.\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py
-.\tools\run_in_crowds_env.ps1 analysis\f5_phase_transition.py
-.\tools\run_in_crowds_env.ps1 analysis\betweenness_vs_sim.py
+.\.venv\run_in_crowds_env.ps1 analysis\f4_aggregate.py
+.\.venv\run_in_crowds_env.ps1 analysis\f7_n_curve.py
+.\.venv\run_in_crowds_env.ps1 analysis\f2_compare_r.py
+.\.venv\run_in_crowds_env.ps1 analysis\f5_phase_transition.py
+.\.venv\run_in_crowds_env.ps1 analysis\betweenness_vs_sim.py
 
 # 9. F13 MML 双形式 re-run (~40 min, 输出到 M4_MML_*/) + analysis
 $env:BLACKOUT_USE_MML="1"
-.\tools\run_in_crowds_env.ps1 scripts\run_mml_all.py
-.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
-.\tools\run_in_crowds_env.ps1 analysis\f7_n_curve.py
-.\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_mml_all.py
+.\.venv\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
+.\.venv\run_in_crowds_env.ps1 analysis\f7_n_curve.py
+.\.venv\run_in_crowds_env.ps1 analysis\f2_compare_r.py
 Remove-Item Env:\BLACKOUT_USE_MML                              # 切回 sigmoid baseline 模式
 ```
 
@@ -602,7 +602,7 @@ Remove-Item Env:\BLACKOUT_USE_MML                              # 切回 sigmoid 
 
 ```powershell
 $p = Start-Process -FilePath "powershell" -ArgumentList @(
-    "-NoProfile", "-File", ".\tools\run_in_crowds_env.ps1", "scripts\run_f4_multi_seed.py"
+    "-NoProfile", "-File", ".\.venv\run_in_crowds_env.ps1", "scripts\run_f4_multi_seed.py"
 ) -RedirectStandardOutput "trace_output\M4_F4_multi_seed.log" `
   -RedirectStandardError  "trace_output\M4_F4_multi_seed.err" `
   -NoNewWindow -PassThru
@@ -618,4 +618,4 @@ $p = Start-Process -FilePath "powershell" -ArgumentList @(
 |---|---|---|
 | **默认 `python` 没装 networkx/osmnx** | graph-on silent fallback 到 graph-off, 数据失效但不报错 | 所有 batch runner 加 fail-fast import 检查; 必须用 `Crowds_sim` env |
 | **Bash/PowerShell tool timeout 上限 10 min** | F4 (30 min) / F7 (20 min) 长任务被超时杀进程 | 用 `Start-Process -NoNewWindow -PassThru` detach 出独立进程 + log file 监控 |
-| **直接调 Crowds_sim env 的 python.exe 会让 matplotlib/scipy 抛 `0xC00000FF`** | `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe script.py` 跑到 `fig.savefig` 或 `scipy.stats.pearsonr` 时整个进程 kernel-level crash (`STATUS_INVALID_IMAGE_FORMAT`, except 接不到) | **必须通过 `tools/run_in_crowds_env.ps1` wrapper 启动** (`cmd /c "call activate.bat Crowds_sim && python ..."`)。原因: conda env 的 freetype/libpng/zlib DLL 装在 `{env}\Library\bin\`, activate 时才会加入 PATH。详细诊断: 6-26 误诊为 env 损坏 (P3/P4), 6-27 翻案确认为 PATH 问题。env 本身完好 (scipy 1.18.0 + numpy 2.2.6 + matplotlib 3.11.0 在 n=6000 长 array 上 pearsonr 正常)。|
+| **直接调 Crowds_sim env 的 python.exe 会让 matplotlib/scipy 抛 `0xC00000FF`** | `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe script.py` 跑到 `fig.savefig` 或 `scipy.stats.pearsonr` 时整个进程 kernel-level crash (`STATUS_INVALID_IMAGE_FORMAT`, except 接不到) | **必须通过 `.venv/run_in_crowds_env.ps1` wrapper 启动** (`cmd /c "call activate.bat Crowds_sim && python ..."`)。原因: conda env 的 freetype/libpng/zlib DLL 装在 `{env}\Library\bin\`, activate 时才会加入 PATH。详细诊断: 6-26 误诊为 env 损坏 (P3/P4), 6-27 翻案确认为 PATH 问题。env 本身完好 (scipy 1.18.0 + numpy 2.2.6 + matplotlib 3.11.0 在 n=6000 长 array 上 pearsonr 正常)。|
