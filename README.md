@@ -6,7 +6,7 @@
 
 > **PTS 定义修订**：`pts_status` 由 **σ 迟滞带** 控制：进入 σ ≥ 0.8 × 性格系数（封顶 0.95）、退出 σ < 0.5 × 性格系数（迟滞带 0.3）；非永久锁存。基准取 EXTREME（0.8），PTS 为少数极端态。依据文献（SIR 含 Recovered 态、P-SIS 情绪可逆、伊比利亚大停电情绪随恢复消退）：PTS 不永久锁存但需迟滞。
 
-> **运行环境**：必须用 conda env `Crowds_sim` 跑 sim (含 networkx / osmnx 路网依赖)；matplotlib 画图建议用 Python 3.12 系统解释器 (Crowds_sim env 当前 matplotlib 在长 array savefig 时偶发 0xC00000FF kernel-level crash, 已在 batch runner 里做 summary-first 容错, 详见 §13)。
+> **运行环境**：必须用 conda env `Crowds_sim` 跑 sim (含 networkx / osmnx 路网依赖)；推荐通过 `tools/run_in_crowds_env.ps1` wrapper 启动 (内部走 `cmd /c "call activate.bat ..."`，确保 `Library\bin\` 的 freetype/libpng/zlib DLL 进 PATH，否则 matplotlib/scipy 的 C 扩展会抛 `0xC00000FF / 0xc06d007f` STATUS_INVALID_IMAGE_FORMAT，详见 §14)。
 
 ---
 
@@ -382,7 +382,7 @@ D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py `
 - `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_off/global_metrics.csv`
 - `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_on/{global_metrics.csv, edge_observations.csv}`
 - `summary.json` (config + final / peak 关键指标, **summary-first** 保证即使 plot crash 也落盘)
-- `comparison.png` (matplotlib 易 crash, 失败时用 `analysis/replot_from_csv.py` 兜底)
+- `comparison.png` (matplotlib 出图)
 
 ### 13.2 批量 runner
 
@@ -392,13 +392,21 @@ D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py `
 | `scripts/run_f7_n_scan.py` | F7 | 15 (三城 × N ∈ {200, 500, 800, 1500, 3000}) | cascade vs N 临界曲线 |
 | `scripts/run_f2_home_dist.py` | F2 | 6 (三城 × {poi, uniform}) | 去 POI bias 控制实验 |
 
-所有 batch runner subprocess 模式 + fail-fast 检查 networkx/osmnx, 启动命令统一:
+所有 batch runner subprocess 模式 + fail-fast 检查 networkx/osmnx。启动方式 (推荐通过 wrapper, 自动处理 conda env 激活):
 
 ```powershell
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_<f4|f7|f2>_<name>.py
+.\tools\run_in_crowds_env.ps1 scripts\run_<f4|f5|f7|f2>_<name>.py
 ```
 
-长任务建议用 PowerShell `Start-Process -NoNewWindow -PassThru -RedirectStandardOutput` detach 模式 (Bash 工具 timeout 上限 10 min 杀进程)。
+长任务建议 detach 模式 (避免 Bash 工具 10 min timeout):
+
+```powershell
+$p = Start-Process -FilePath "powershell" -ArgumentList @(
+    "-NoProfile", "-File", ".\tools\run_in_crowds_env.ps1", "scripts\run_f4_multi_seed.py"
+) -RedirectStandardOutput "trace_output\F4.log" `
+  -RedirectStandardError  "trace_output\F4.err" `
+  -NoNewWindow -PassThru
+```
 
 ### 13.3 后处理 / aggregate 脚本
 
@@ -407,16 +415,14 @@ D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_<f4|f7|f2>_<nam
 | `analysis/f4_aggregate.py` | `M4_F4_multi_seed/t15_*/summary.json` (×30) | `aggregate_ci.{csv,json}` + `errorbar.png` | 三城 × 4 指标 95% CI 表 + 误差棒图 |
 | `analysis/f7_n_curve.py` | `M4_F7_N_scan/t15_*/summary.json` (×15) | `n_curve.{csv,png}` | cascade 指标 vs N log-x 曲线 |
 | `analysis/f2_compare_r.py` | `M4_F2_home_dist/t15_*/graph_on/edge_observations.csv` (×6) | `r_compare.{csv,json}` + `_corr/<...>/correlation.json` | poi vs uniform 的 Pearson r 对照 |
-| `analysis/replot_from_csv.py` | 任意 `<output-base>/t15_*/graph_*/global_metrics.csv` | `comparison.png` | 从 csv 重画 comparison (matplotlib crash 兜底) |
+| `analysis/f5_phase_transition.py` | `M4_F5_theta_flee/t15_*/summary.json` (×24) | `theta_curve.{csv,png}` | cascade 指标 vs θ_flee phase transition |
 | `analysis/betweenness_vs_sim.py` | `<output-base>/.../edge_observations.csv` + `road_graph_cache/<城>_<区>.graphml` | `correlation.{png,json}` | T16: BC vs 仿真累计 occupancy 的 Pearson/Spearman |
 
-**画图建议用 Python 3.12**:
+所有 analysis 脚本通过 wrapper 启动:
 
 ```powershell
-"C:/Program Files/Python312/python.exe" analysis/f4_aggregate.py
+.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py
 ```
-
-Crowds_sim env 的 matplotlib 在 `fig.savefig` 时偶发 0xC00000FF kernel crash (numpy 2.2 + freetype/png 兼容问题), 但 `analysis/betweenness_vs_sim.py` 需要 networkx 必须用 Crowds_sim env — 它内部已经做 summary-first + try/except + 手算 Pearson 绕过 BLAS。
 
 ### 13.4 实测数据落盘
 
@@ -479,7 +485,7 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 │   ├── f4_aggregate.py            # F4: 95% CI 表 + errorbar.png
 │   ├── f7_n_curve.py              # F7: log-x N 曲线
 │   ├── f2_compare_r.py            # F2: poi vs uniform 的 Pearson r 对比
-│   └── replot_from_csv.py         # matplotlib crash 兜底, 从 csv 重画 comparison.png
+│   └── f5_phase_transition.py     # F5: cascade vs θ_flee phase transition (M4)
 ├── road_graph_cache/          # 【M2】OSM graphml + metrics.json + plots (gitignored)
 │   ├── 厦门市_思明区.graphml / 沈阳市_沈河区.graphml / 北京市_东城区.graphml
 │   └── {城市}_{区}/{metrics.json, orientation_rose.png, betweenness_heatmap.png}
@@ -493,47 +499,48 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 
 ### 复现命令
 
-> 所有命令在 Windows 下用 `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe` 直接调用 (或先 `conda activate Crowds_sim` 后用 `python`)。Linux/macOS 类似, 替换为你的 conda env 路径即可。
+> 所有命令通过 `tools/run_in_crowds_env.ps1` wrapper 启动 (内部 `cmd /c "call activate.bat Crowds_sim && python ..."`, 确保 `Library\bin\` 的 DLL 进 PATH; 不要直接调 `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe`, 否则 matplotlib/scipy 的 C 扩展会抛 0xC00000FF, 详见 §14)。
 
 ```powershell
 # 1. 启动交互仪表盘 (本地 GUI)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe run_dashboard.py
+.\tools\run_in_crowds_env.ps1 run_dashboard.py
 
 # 2. 单次对照实验 (graph-on vs graph-off, 默认厦门思明 N=800 seed=42)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py
+.\tools\run_in_crowds_env.ps1 scripts\run_ablation.py
 
 # 3. 跨城市验证 (F1)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py `
+.\tools\run_in_crowds_env.ps1 scripts\run_ablation.py `
     --city 沈阳市 --district 沈河区 --output-base M4_F1_cross_city
 
 # 4. 多 seed 批量 (F4, ~25 min, 30 个 subprocess)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_f4_multi_seed.py
+.\tools\run_in_crowds_env.ps1 scripts\run_f4_multi_seed.py
 
 # 5. N 扫描批量 (F7, ~20 min)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_f7_n_scan.py
+.\tools\run_in_crowds_env.ps1 scripts\run_f7_n_scan.py
 
 # 6. home 分布对照批量 (F2, ~6 min)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe -u scripts/run_f2_home_dist.py
+.\tools\run_in_crowds_env.ps1 scripts\run_f2_home_dist.py
 
-# 7. 后处理 / aggregate (推荐用 Python 3.12, matplotlib 在 Crowds_sim env 偶发崩溃)
-"C:/Program Files/Python312/python.exe" analysis/f4_aggregate.py
-"C:/Program Files/Python312/python.exe" analysis/f7_n_curve.py
-"C:/Program Files/Python312/python.exe" analysis/replot_from_csv.py M4_F4_multi_seed
+# 7. θ_flee 扫描 (F5, ~10 min)
+.\tools\run_in_crowds_env.ps1 scripts\run_f5_theta_flee.py
 
-# 8. F2 r 对比 (需要 networkx → Crowds_sim env, 内部已 summary-first 容错 plot crash)
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe analysis/f2_compare_r.py
+# 8. 后处理 / aggregate (统一通过 wrapper, matplotlib + scipy 都正常)
+.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py
+.\tools\run_in_crowds_env.ps1 analysis\f7_n_curve.py
+.\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py
+.\tools\run_in_crowds_env.ps1 analysis\f5_phase_transition.py
+.\tools\run_in_crowds_env.ps1 analysis\betweenness_vs_sim.py
 ```
 
 ### 长任务的 detach 模式 (避免 Bash/PowerShell tool 10 min timeout)
 
 ```powershell
-Set-Location "<repo-root>"
-$proc = Start-Process -FilePath "D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe" `
-    -ArgumentList @("-u", "scripts/run_f4_multi_seed.py") `
-    -RedirectStandardOutput "trace_output/M4_F4_multi_seed.log" `
-    -RedirectStandardError "trace_output/M4_F4_multi_seed.err" `
-    -NoNewWindow -PassThru
-"PID=$($proc.Id)"
+$p = Start-Process -FilePath "powershell" -ArgumentList @(
+    "-NoProfile", "-File", ".\tools\run_in_crowds_env.ps1", "scripts\run_f4_multi_seed.py"
+) -RedirectStandardOutput "trace_output\M4_F4_multi_seed.log" `
+  -RedirectStandardError  "trace_output\M4_F4_multi_seed.err" `
+  -NoNewWindow -PassThru
+"PID=$($p.Id)"
 # 监控: until grep -q "F4 complete" trace_output/M4_F4_multi_seed.log; do sleep 30; done
 ```
 
@@ -545,6 +552,4 @@ $proc = Start-Process -FilePath "D:/EnvironmentAnaconda/envs/Crowds_sim/python.e
 |---|---|---|
 | **默认 `python` 没装 networkx/osmnx** | graph-on silent fallback 到 graph-off, 数据失效但不报错 | 所有 batch runner 加 fail-fast import 检查; 必须用 `Crowds_sim` env |
 | **Bash/PowerShell tool timeout 上限 10 min** | F4 (30 min) / F7 (20 min) 长任务被超时杀进程 | 用 `Start-Process -NoNewWindow -PassThru` detach 出独立进程 + log file 监控 |
-| **Crowds_sim matplotlib `fig.savefig` 0xC00000FF crash** | run_ablation 的 plot_compare / betweenness_vs_sim 的散点图随机 kernel-level crash, except 接不到 | `run_ablation.py` / `betweenness_vs_sim.py` 都改 summary-first (json 先落盘); `analysis/replot_from_csv.py` 用 Python 3.12 兜底重画 |
-| **Crowds_sim scipy/numpy BLAS 长 array crash** | `scipy.stats.pearsonr` / `np.corrcoef` 在 >5000 长 array 上 0xC00000FF | `betweenness_vs_sim.py` 改用纯 Python 求和公式手算 Pearson r + Spearman ρ, 绕过 BLAS |
-| **Crowds_sim env 修复建议 (待办, low priority)** | 上述 matplotlib + scipy crash | `conda install -n Crowds_sim -c conda-forge matplotlib=3.10 numpy=1.26 scipy=1.13 --force-reinstall` (注: numpy 2.x 跟 osmnx 2.1.0 有兼容问题, 用 1.26 LTS 更稳) |
+| **直接调 Crowds_sim env 的 python.exe 会让 matplotlib/scipy 抛 `0xC00000FF`** | `D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe script.py` 跑到 `fig.savefig` 或 `scipy.stats.pearsonr` 时整个进程 kernel-level crash (`STATUS_INVALID_IMAGE_FORMAT`, except 接不到) | **必须通过 `tools/run_in_crowds_env.ps1` wrapper 启动** (`cmd /c "call activate.bat Crowds_sim && python ..."`)。原因: conda env 的 freetype/libpng/zlib DLL 装在 `{env}\Library\bin\`, activate 时才会加入 PATH。详细诊断: 6-26 误诊为 env 损坏 (P3/P4), 6-27 翻案确认为 PATH 问题。env 本身完好 (scipy 1.18.0 + numpy 2.2.6 + matplotlib 3.11.0 在 n=6000 长 array 上 pearsonr 正常)。|
