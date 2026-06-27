@@ -163,6 +163,22 @@ def run_one(label, use_road_graph, args, run_dir):
                 n_overridden += 1
         print(f'[F5] flee_threshold → {flee_th} (force_calculator + {n_overridden} agents)')
 
+    # F13 控制实验: MML (McFadden conditional logit) 替代 sigmoid soft-switch
+    if getattr(args, 'use_mml', False):
+        fc = getattr(sim, 'force_calculator', None)
+        if fc is not None:
+            if hasattr(fc, 'sw'):
+                fc.sw.use_mml = True
+            sfm = getattr(fc, 'social_force_model', None)
+            if sfm is not None and hasattr(sfm, 'sw'):
+                sfm.sw.use_mml = True
+        n_overridden = 0
+        for r in sim.residents:
+            if getattr(r, 'sw', None) is not None:
+                r.sw.use_mml = True
+                n_overridden += 1
+        print(f'[F13] use_mml = True (force_calculator + {n_overridden} agents)')
+
     history = []
     triggered = False
     t_start = time.time()
@@ -233,6 +249,7 @@ def plot_compare(h_off, h_on, args, run_dir):
             'tag':           args.tag,
             'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
             'flee_threshold':    getattr(args, 'flee_threshold', None),
+            'use_mml':           bool(getattr(args, 'use_mml', False)),
         },
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
@@ -319,6 +336,8 @@ def _parse_args():
                    help='F2: 居民 home 分布策略 (poi 默认 / uniform 去 POI bias)')
     p.add_argument('--flee-threshold', type=float, default=None, dest='flee_threshold',
                    help='F5: SwitchParams.flee_threshold 覆盖值 (默认 0.6, 扫 {0.4..0.8} 验证 phase transition)')
+    p.add_argument('--use-mml', action='store_true', dest='use_mml',
+                   help='F13: 启用 Mixed Multinomial Logit (McFadden 1973) 替代 sigmoid soft-switch')
     return p.parse_args()
 
 
