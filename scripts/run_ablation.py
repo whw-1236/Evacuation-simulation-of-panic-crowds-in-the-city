@@ -163,21 +163,25 @@ def run_one(label, use_road_graph, args, run_dir):
                 n_overridden += 1
         print(f'[F5] flee_threshold → {flee_th} (force_calculator + {n_overridden} agents)')
 
-    # F13 控制实验: MML (McFadden conditional logit) 替代 sigmoid soft-switch
-    if getattr(args, 'use_mml', False):
+    # F13: MML 默认开 (SwitchParams.use_mml=True 自 2026-06-28 起为默认).
+    # --no-mml 显式切回 sigmoid legacy fallback; --use-mml 显式确认 (no-op)
+    effective_use_mml = not bool(getattr(args, 'no_mml', False))
+    if not effective_use_mml:
         fc = getattr(sim, 'force_calculator', None)
         if fc is not None:
             if hasattr(fc, 'sw'):
-                fc.sw.use_mml = True
+                fc.sw.use_mml = False
             sfm = getattr(fc, 'social_force_model', None)
             if sfm is not None and hasattr(sfm, 'sw'):
-                sfm.sw.use_mml = True
+                sfm.sw.use_mml = False
         n_overridden = 0
         for r in sim.residents:
             if getattr(r, 'sw', None) is not None:
-                r.sw.use_mml = True
+                r.sw.use_mml = False
                 n_overridden += 1
-        print(f'[F13] use_mml = True (force_calculator + {n_overridden} agents)')
+        print(f'[F13] use_mml = False (sigmoid legacy fallback, {n_overridden} agents)')
+    else:
+        print(f'[F13] use_mml = True (MML default since 2026-06-28)')
 
     history = []
     triggered = False
@@ -249,7 +253,7 @@ def plot_compare(h_off, h_on, args, run_dir):
             'tag':           args.tag,
             'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
             'flee_threshold':    getattr(args, 'flee_threshold', None),
-            'use_mml':           bool(getattr(args, 'use_mml', False)),
+            'use_mml':           not bool(getattr(args, 'no_mml', False)),
         },
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
@@ -337,7 +341,9 @@ def _parse_args():
     p.add_argument('--flee-threshold', type=float, default=None, dest='flee_threshold',
                    help='F5: SwitchParams.flee_threshold 覆盖值 (默认 0.6, 扫 {0.4..0.8} 验证 phase transition)')
     p.add_argument('--use-mml', action='store_true', dest='use_mml',
-                   help='F13: 启用 Mixed Multinomial Logit (McFadden 1973) 替代 sigmoid soft-switch')
+                   help='F13: 显式确认 MML (2026-06-28 起 SwitchParams 默认就开, 此 flag 现为 no-op, 留作向后兼容)')
+    p.add_argument('--no-mml',  action='store_true', dest='no_mml',
+                   help='supplementary: 强制 sigmoid legacy fallback (use_mml=False), 用于复现 §5 supplementary Tables S1-S3')
     return p.parse_args()
 
 
