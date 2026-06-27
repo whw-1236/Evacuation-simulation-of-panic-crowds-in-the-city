@@ -47,7 +47,8 @@ CITIES = [
 ]
 SEEDS = list(range(42, 52))  # 包含 6-22 baseline seed=42, 共 10 个
 
-OUTPUT_BASE = 'M4_F4_multi_seed'
+USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+OUTPUT_BASE = 'M4_MML_F4_multi_seed' if USE_MML else 'M4_F4_multi_seed'
 TRACE_ROOT = os.path.join(ROOT, 'trace_output')
 PYTHON_EXE = sys.executable  # 用当前解释器 (已通过 fail-fast 检查)
 
@@ -79,6 +80,8 @@ def main():
                 '--seed', str(seed), '--tag', tag,
                 '--output-base', OUTPUT_BASE,
             ]
+            if USE_MML:
+                cmd.append('--use-mml')
             print(f'\n{"#"*70}', flush=True)
             print(f'[{done}/{total}] {city}/{district} {tag}', flush=True)
             print(f'{"#"*70}', flush=True)

@@ -371,31 +371,53 @@ edge occupancy↑ → cong↑ (循环)
 graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
 
 ```powershell
-D:/EnvironmentAnaconda/envs/Crowds_sim/python.exe scripts/run_ablation.py `
+.\tools\run_in_crowds_env.ps1 scripts\run_ablation.py `
     --city 厦门市 --district 思明区 `
     --n-residents 800 --seed 42 `
     --tag baseline --output-base M4_F1_cross_city `
-    --home-distribution poi          # 'poi' 默认 / 'uniform' 见 §F2
+    --home-distribution poi          # 'poi' 默认 / 'uniform' 见 §F2 (POI 控制实验)
+    # --flee-threshold 0.6          # 可选: 覆盖 σ 触发 flee 的阈值 (F5 扫描用)
+    # --use-mml                     # 可选: 用 MML 离散选择替代 sigmoid soft-blend (F13)
 ```
+
+**CLI 参数清单** (定义在 `_parse_args()`):
+
+| flag | 默认 | 用途 |
+|---|---|---|
+| `--city` / `--district` | 厦门市/思明区 | 选区县 |
+| `--n-residents` / `--n-enterprises` | 800 / 30 | 人口规模 |
+| `--total-steps` / `--outage-step` | 120 / 16 | 仿真步数 / 停电触发步 |
+| `--seed` | 42 | RNG seed |
+| `--tag` | '' | 输出目录后缀 (e.g. `seed42`, `N500`) |
+| `--output-base` | `trace_output/` | 输出根目录 (M4 子组传 `M4_F4_multi_seed` 等) |
+| `--home-distribution` | `poi` | 居民 home 分布: `poi` (按 POI 圆) / `uniform` (polygon 面积均匀) |
+| `--flee-threshold` | None (=0.6) | **F5**: SwitchParams.flee_threshold 覆盖, 扫描 phase transition 用 |
+| `--use-mml` | False | **F13**: 启用 Mixed Multinomial Logit (McFadden 1973), 替代 sigmoid soft-blend |
 
 每次跑会跑 graph-off + graph-on 各 120 步, 输出:
 - `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_off/global_metrics.csv`
 - `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_on/{global_metrics.csv, edge_observations.csv}`
-- `summary.json` (config + final / peak 关键指标, **summary-first** 保证即使 plot crash 也落盘)
+- `summary.json` (config + final / peak 关键指标, **summary-first** 保证即使 plot crash 也落盘; config 段含 `home_distribution / flee_threshold / use_mml` 字段供后处理筛选)
 - `comparison.png` (matplotlib 出图)
 
 ### 13.2 批量 runner
 
 | 脚本 | 任务编号 | 跑多少次 | 用途 |
 |---|---|---|---|
-| `scripts/run_f4_multi_seed.py` | F4 | 30 (三城 × seed 42-51) | 多 seed 95% CI |
-| `scripts/run_f7_n_scan.py` | F7 | 15 (三城 × N ∈ {200, 500, 800, 1500, 3000}) | cascade vs N 临界曲线 |
-| `scripts/run_f2_home_dist.py` | F2 | 6 (三城 × {poi, uniform}) | 去 POI bias 控制实验 |
+| `scripts/run_f4_multi_seed.py` | F4 | 30 (三城 × seed 42-51) | 多 seed 95% CI; §5.1 主表 |
+| `scripts/run_f7_n_scan.py` | F7 | 15 (三城 × N ∈ {200, 500, 800, 1500, 3000}) | cascade vs N 临界曲线; §5.2.1 N-invariance |
+| `scripts/run_f5_theta_flee.py` | F5 | 24 (三城 × θ ∈ {0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.80}) | flee 阈值 phase transition; §5.2.2 (sigmoid 专属) |
+| `scripts/run_f2_home_dist.py` | F2 | 6 (三城 × {poi, uniform}) | 去 POI bias 控制实验; §5.3 |
+| `scripts/run_mml_all.py` ⭐ | F13 | 54 (F1+F4+F7+F2 全套, 受 BLACKOUT_USE_MML=1 触发) | MML 双形式 re-run master launcher |
 
 所有 batch runner subprocess 模式 + fail-fast 检查 networkx/osmnx。启动方式 (推荐通过 wrapper, 自动处理 conda env 激活):
 
 ```powershell
 .\tools\run_in_crowds_env.ps1 scripts\run_<f4|f5|f7|f2>_<name>.py
+
+# F13 MML 全套 re-run (输出到 M4_MML_* 平行目录, 不覆盖 sigmoid baseline)
+$env:BLACKOUT_USE_MML="1"
+.\tools\run_in_crowds_env.ps1 scripts\run_mml_all.py
 ```
 
 长任务建议 detach 模式 (避免 Bash 工具 10 min timeout):
@@ -408,20 +430,33 @@ $p = Start-Process -FilePath "powershell" -ArgumentList @(
   -NoNewWindow -PassThru
 ```
 
+**MML 双形式开关**: 4 个 F-runner (run_f4 / run_f7 / run_f2 / run_mml_all) 都读环境变量 `BLACKOUT_USE_MML`:
+- `BLACKOUT_USE_MML=1` → 输出到 `trace_output/M4_MML_*/`, 内部 subprocess 自动加 `--use-mml`
+- 不设 (或 `=0`) → 输出到 `trace_output/M4_*/` (sigmoid baseline)
+- 两套数据**并列存放, 互不覆盖**, 后处理 analysis 脚本同样读这个 env var 自动切换路径
+
 ### 13.3 后处理 / aggregate 脚本
 
 | 脚本 | 输入 | 输出 | 用途 |
 |---|---|---|---|
-| `analysis/f4_aggregate.py` | `M4_F4_multi_seed/t15_*/summary.json` (×30) | `aggregate_ci.{csv,json}` + `errorbar.png` | 三城 × 4 指标 95% CI 表 + 误差棒图 |
-| `analysis/f7_n_curve.py` | `M4_F7_N_scan/t15_*/summary.json` (×15) | `n_curve.{csv,png}` | cascade 指标 vs N log-x 曲线 |
-| `analysis/f2_compare_r.py` | `M4_F2_home_dist/t15_*/graph_on/edge_observations.csv` (×6) | `r_compare.{csv,json}` + `_corr/<...>/correlation.json` | poi vs uniform 的 Pearson r 对照 |
-| `analysis/f5_phase_transition.py` | `M4_F5_theta_flee/t15_*/summary.json` (×24) | `theta_curve.{csv,png}` | cascade 指标 vs θ_flee phase transition |
-| `analysis/betweenness_vs_sim.py` | `<output-base>/.../edge_observations.csv` + `road_graph_cache/<城>_<区>.graphml` | `correlation.{png,json}` | T16: BC vs 仿真累计 occupancy 的 Pearson/Spearman |
+| `analysis/f4_aggregate.py` | `M4_F4_multi_seed/t15_*/summary.json` (×30) | `aggregate_ci.{csv,json}` + `errorbar.png` | 三城 × 4 指标 95% CI 表 + 误差棒图; §5.1 主图 source |
+| `analysis/f7_n_curve.py` | `M4_F7_N_scan/t15_*/summary.json` (×15) | `n_curve.{csv,png}` | cascade 指标 vs N log-x 曲线; §5.2.1 主图 source |
+| `analysis/f5_phase_transition.py` | `M4_F5_theta_flee/t15_*/summary.json` (×24) | `theta_curve.{csv,png}` | cascade 指标 vs θ_flee phase transition; §5.2.2 sigmoid 主图 source |
+| `analysis/f2_compare_r.py` | `M4_F2_home_dist/t15_*/graph_on/edge_observations.csv` (×6) | `r_compare.{csv,json}` + `_corr/<...>/correlation.json` | poi vs uniform 的 Pearson r 对照; §5.3 主图 source; 内部调 `betweenness_vs_sim.py` 6 次 |
+| `analysis/betweenness_vs_sim.py` | `<output-base>/.../edge_observations.csv` + `road_graph_cache/<城>_<区>.graphml` | `correlation.{png,json}` | T16: 单城市标准 node BC vs 仿真累计 occupancy 的 Pearson/Spearman |
+| `analysis/shelter_aware_bc.py` | 同上 + `应急.csv` shelter 点 | shelter-aware BC vs sim 散点 | T17: "BC 失败是因为是 home→shelter 有向流" 假说验证; 论文 §6 Discussion "demand-aware centrality" 实证依据 |
+| `analysis/compare_cities.py` | `road_graph_cache/{城}_{区}/metrics.json` (3 城) | 三城拓扑指标对比表 | M2/M3 时代早期工作; §4 数据描述段 source (polygon area, Gini, top-1% share, density) |
 
 所有 analysis 脚本通过 wrapper 启动:
 
 ```powershell
 .\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py
+
+# MML 数据出表: 同样的脚本通过 env var 切到 M4_MML_* 路径
+$env:BLACKOUT_USE_MML="1"
+.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
+.\tools\run_in_crowds_env.ps1 analysis\f7_n_curve.py          # → M4_MML_F7_N_scan/
+.\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py        # → M4_MML_F2_home_dist/
 ```
 
 ### 13.4 实测数据落盘
@@ -429,7 +464,9 @@ $p = Start-Process -FilePath "powershell" -ArgumentList @(
 ```
 trace_output/
 ├── M3_baseline/                     # 早期实验留存
-├── M4_F1_cross_city/                # F1 三城跨城市验证 (6-22)
+│
+│  ─── sigmoid baseline (1990s 风格 soft-blend) ───
+├── M4_F1_cross_city/                # F1 三城 baseline (6-22)
 ├── M4_T16_cross_city/               # T16 BC vs sim 相关性三城外推 (6-22)
 ├── M4_F4_multi_seed/                # F4 三城 × 10 seed (6-26)
 │   ├── aggregate_ci.{csv,json}
@@ -438,11 +475,26 @@ trace_output/
 ├── M4_F7_N_scan/                    # F7 三城 × 5 N (6-26)
 │   ├── n_curve.{csv,png}
 │   └── t15_<城>_<区>_N{200..3000}/  (×15)
-└── M4_F2_home_dist/                 # F2 三城 × {poi, uniform} (6-26)
-    ├── r_compare.{csv,json}
-    ├── _corr/<城>_<区>_<hd>/correlation.json  (×6)
-    └── t15_<城>_<区>_{poi,uniform}/  (×6)
+├── M4_F5_theta_flee/                # F5 三城 × 8 θ_flee (6-27)
+│   ├── theta_curve.{csv,png}
+│   └── t15_<城>_<区>_theta{0.4..0.8}/  (×24)
+├── M4_F2_home_dist/                 # F2 三城 × {poi, uniform} (6-26)
+│   ├── r_compare.{csv,json}
+│   ├── _corr/<城>_<区>_<hd>/correlation.json  (×6)
+│   └── t15_<城>_<区>_{poi,uniform}/  (×6)
+│
+│  ─── MML 双形式 (McFadden conditional logit, 6-27 晚) ───
+├── M4_MML_F1_cross_city/            # F1-MML 三城 baseline (3 sub-run)
+├── M4_MML_F4_multi_seed/            # F4-MML 三城 × 10 seed (×30)
+│   ├── aggregate_ci.{csv,json}
+│   └── errorbar.png
+├── M4_MML_F7_N_scan/                # F7-MML 三城 × 5 N (×15)
+│   └── n_curve.{csv,png}
+└── M4_MML_F2_home_dist/             # F2-MML 三城 × {poi, uniform} (×6)
+    └── r_compare.{csv,json}
 ```
+
+**两套数据并列原则**: sigmoid baseline 在 `M4_*/`, MML 在 `M4_MML_*/`, 完全平行。论文 §5 表格双形式并列报告 (展示主结论 formulation-invariant)。
 
 ---
 
@@ -452,7 +504,7 @@ trace_output/
 Evacuation-simulation-of-panic-crowds-in-the-city/
 ├── core/
 │   ├── agents.py              # 5类Agent (~3100行) +graph state字段
-│   ├── behavior_switching.py  # ⭐ I1/I2/I3 + P1.A/P1.B/P2/P3 + 拥堵反馈 + flee 行为
+│   ├── behavior_switching.py  # ⭐ I1/I2/I3 + P1.A/P1.B/P2/P3 + 拥堵反馈 + flee 行为 + 【F13】MML 离散选择 (McFadden 1973)
 │   ├── social_force.py        # 社会力 + path-based driving + Greenshields 速度衰减
 │   ├── unified_stress_model.py # Lazarus统一压力模型
 │   ├── region_manager.py      # GeoJSON区域管理 + distribute_residents_{by_poi, uniform}
@@ -476,16 +528,22 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 │   ├── dashboard.py           # +avg_edge_congestion/pct_on_path/max_edge_occupancy 字段
 │   ├── small_area_viewer.py / trace_plotter.py
 ├── scripts/                   # ⭐【M4】实验 runner 族
-│   ├── run_ablation.py            # 单跑 harness (graph-on vs graph-off, 支持 --home-distribution)
-│   ├── run_f4_multi_seed.py       # F4 batch: 三城 × seed 42-51
-│   ├── run_f7_n_scan.py           # F7 batch: 三城 × N ∈ {200, 500, 800, 1500, 3000}
-│   └── run_f2_home_dist.py        # F2 batch: 三城 × {poi, uniform}
-├── analysis/                  # ⭐【M4】后处理 / 画图
-│   ├── betweenness_vs_sim.py      # T16: BC vs cum_occupancy, summary-first + 手算 Pearson 绕过 BLAS
-│   ├── f4_aggregate.py            # F4: 95% CI 表 + errorbar.png
-│   ├── f7_n_curve.py              # F7: log-x N 曲线
-│   ├── f2_compare_r.py            # F2: poi vs uniform 的 Pearson r 对比
-│   └── f5_phase_transition.py     # F5: cascade vs θ_flee phase transition (M4)
+│   ├── run_ablation.py            # 单跑 harness (--seed/--n-residents/--home-distribution/--flee-threshold/--use-mml)
+│   ├── run_f4_multi_seed.py       # F4 batch: 三城 × seed 42-51 (30 sub-run)
+│   ├── run_f7_n_scan.py           # F7 batch: 三城 × N ∈ {200, 500, 800, 1500, 3000} (15 sub-run)
+│   ├── run_f5_theta_flee.py       # F5 batch: 三城 × θ ∈ {0.40..0.80} 8 点加密 (24 sub-run)
+│   ├── run_f2_home_dist.py        # F2 batch: 三城 × {poi, uniform} (6 sub-run)
+│   └── run_mml_all.py             # ⭐ F13: MML 双形式 master launcher (F1+F4+F7+F2 = 54 sub-run, 受 BLACKOUT_USE_MML=1 触发)
+├── analysis/                  # ⭐【M4】后处理 / 画图 (全部支持 BLACKOUT_USE_MML=1 切到 M4_MML_* 路径)
+│   ├── betweenness_vs_sim.py      # T16: 单城市标准 node BC vs cum_occupancy Pearson/Spearman
+│   ├── shelter_aware_bc.py        # T17: shelter-aware BC vs sim (验证"BC 失败因为是 home→shelter 有向流"假说; §6 Discussion source)
+│   ├── compare_cities.py          # 三城拓扑指标对比 (polygon area / Gini / top-1% share / density)
+│   ├── f4_aggregate.py            # F4 → 95% CI 表 + errorbar.png (§5.1 主图 source)
+│   ├── f7_n_curve.py              # F7 → log-x N 曲线 (§5.2.1 主图 source)
+│   ├── f5_phase_transition.py     # F5 → θ_flee phase transition 曲线 (§5.2.2 sigmoid 主图)
+│   └── f2_compare_r.py            # F2 → poi vs uniform 的 Pearson r 对比 (§5.3 主图 source)
+├── tools/
+│   └── run_in_crowds_env.ps1      # ⭐ Crowds_sim env wrapper (走 cmd /c "call activate.bat" 解 DLL 路径)
 ├── road_graph_cache/          # 【M2】OSM graphml + metrics.json + plots (gitignored)
 │   ├── 厦门市_思明区.graphml / 沈阳市_沈河区.graphml / 北京市_东城区.graphml
 │   └── {城市}_{区}/{metrics.json, orientation_rose.png, betweenness_heatmap.png}
@@ -530,6 +588,14 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 .\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py
 .\tools\run_in_crowds_env.ps1 analysis\f5_phase_transition.py
 .\tools\run_in_crowds_env.ps1 analysis\betweenness_vs_sim.py
+
+# 9. F13 MML 双形式 re-run (~40 min, 输出到 M4_MML_*/) + analysis
+$env:BLACKOUT_USE_MML="1"
+.\tools\run_in_crowds_env.ps1 scripts\run_mml_all.py
+.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
+.\tools\run_in_crowds_env.ps1 analysis\f7_n_curve.py
+.\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py
+Remove-Item Env:\BLACKOUT_USE_MML                              # 切回 sigmoid baseline 模式
 ```
 
 ### 长任务的 detach 模式 (避免 Bash/PowerShell tool 10 min timeout)
