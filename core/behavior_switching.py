@@ -122,6 +122,38 @@ class SwitchParams:
     inquire_radius:    float = 0.01   # 默认信息搜寻半径 (~1 km)
     enable_inquire:    bool = False   # 默认关闭，避免破坏既有 baseline
 
+    # ---------------------------------------------------------------
+    # F13 — Mixed Multinomial Logit (MML) discrete-choice formulation
+    # ---------------------------------------------------------------
+    # Switches sigmoid soft-blend (Eqs. 10-12) to random-utility
+    # logit P_k = exp(scale·U_k) / Σ exp(scale·U_j) following
+    # McFadden (1973) [REF26], Lovreglio et al. (2014, 2016) [REF27, REF29],
+    # Haghani & Sarvi (2016) [REF28]. Four actions = {home, hoard, herd, flee}.
+    # Each U_k is linear-in-attributes with an alternative-specific constant (ASC).
+    use_mml:             bool  = False   # 默认 False, 保持 sigmoid baseline 兼容
+    mml_scale:           float = 1.5     # softmax 反温度 β (大→趋确定; 小→均匀)
+
+    # alternative-specific constants (baseline preference, when σ=0 & no covariates)
+    mml_asc_home:        float = 3.0
+    mml_asc_hoard:       float = -1.0
+    mml_asc_herd:        float = -2.0
+    mml_asc_flee:        float = -5.0
+
+    # stress-slope coefficients (β on σ for each action)
+    mml_b_sigma_home:    float = 6.0     # negative effect (subtracted)
+    mml_b_sigma_hoard:   float = 1.5
+    mml_b_sigma_herd:    float = 4.0
+    mml_b_sigma_flee:    float = 9.0     # steepest, gated by VIS
+
+    # cross-utility coefficients
+    mml_b_supply:        float = 2.0     # H=1 (supply deficit) → +2 on hoard
+    mml_b_pts:           float = 2.0     # Z=1 (PTS) → +2 on herd
+    mml_b_vis:           float = 2.0     # VIS=1 (shelter reachable) → +2 on flee
+    mml_b_dist_shop:     float = 80.0    # × Euclidean lat/lon distance
+    mml_b_dist_leader:   float = 40.0
+    mml_b_dist_shelter:  float = 80.0
+    mml_b_occ:           float = 1.0     # perceived occupancy ∈ [0, 1]
+
     eps: float = 1e-9
 
 
@@ -395,8 +427,131 @@ def _hysteresis_active(prev_active, sigma, on, off, enabled):
     return sigma >= on
 
 
+def _softmax(scores):
+    """numerically-stable softmax over a small list."""
+    m = max(scores)
+    exps = [math.exp(s - m) for s in scores]
+    Z = sum(exps)
+    return [e / Z for e in exps]
+
+
+def compute_goal_direction_mml(agent, stores, neighbors, p):
+    """F13: Mixed Multinomial Logit discrete-choice formulation.
+
+    Four actions {home, hoard, herd, flee} each have a linear-in-attributes
+    utility V_k; choice probabilities follow softmax(scale · V_k) (McFadden
+    conditional logit). Returns the expected direction Σ P_k · d_k for
+    backward-compat with the social-force layer that consumes (dx, dy).
+    Side effects (mirrors sigmoid path):
+      - agent._goal_shares = (P_home, P_hoard, P_herd, P_flee)
+      - agent._dom_action  = argmax_k P_k
+      - agent.target_node  = node for dom_action
+      - agent._target_store, _hoard_active, _herd_active (P1.A hysteresis kept)
+    """
+    E = float(getattr(agent, 'stress_level', 0.0))
+    Z = 1.0 if getattr(agent, 'pts_status', False) else 0.0
+    supply = float(getattr(agent, 'personal_supply', 1.0))
+    H = 1.0 if supply < p.supply_threshold else 0.0
+
+    # --- candidate directions + nodes ---
+    home_xy = getattr(agent, 'home_position', (agent.x, agent.y))
+    home_node = getattr(agent, 'home_node', None)
+    d_home = _unit(home_xy[0] - agent.x, home_xy[1] - agent.y)
+    dist_home = math.hypot(home_xy[0] - agent.x, home_xy[1] - agent.y)
+
+    s_star = choose_store(agent, stores, p) if (stores and H > 0.0) else None
+    agent._target_store = s_star
+    if s_star is not None:
+        d_hoard = _unit(s_star['x'] - agent.x, s_star['y'] - agent.y)
+        dist_shop = math.hypot(s_star['x'] - agent.x, s_star['y'] - agent.y)
+        perc_occ = float(agent.perceived_occupancy.get(s_star['id'], 0.0)) \
+                   if hasattr(agent, 'perceived_occupancy') else 0.0
+        hoard_node = s_star.get('node_id')
+        has_hoard = True
+    else:
+        d_hoard = (0.0, 0.0); dist_shop = 0.0; perc_occ = 0.0
+        hoard_node = None; has_hoard = False
+
+    leader = update_leader(agent, neighbors, p)
+    if leader is not None:
+        d_herd = _unit(leader.x - agent.x, leader.y - agent.y)
+        dist_leader = math.hypot(leader.x - agent.x, leader.y - agent.y)
+        herd_node = getattr(leader, 'current_node', None)
+        has_herd = True
+    else:
+        d_herd = (0.0, 0.0); dist_leader = 0.0; herd_node = None
+        has_herd = False
+
+    shelter_node = getattr(agent, 'nearest_shelter_node', None)
+    shelter_xy = getattr(agent, 'nearest_shelter_xy', None)
+    # VIS=1 iff shelter is in the choice set (graph-on attaches shelter_node;
+    # graph-off does not snap shelters so node is None → VIS=0 → U_flee=-∞)
+    VIS = 1.0 if (p.enable_flee_behavior and shelter_node is not None
+                  and shelter_xy is not None) else 0.0
+    if VIS > 0.5:
+        d_flee = _unit(shelter_xy[0] - agent.x, shelter_xy[1] - agent.y)
+        dist_shelter = math.hypot(shelter_xy[0] - agent.x, shelter_xy[1] - agent.y)
+    else:
+        d_flee = (0.0, 0.0); dist_shelter = 0.0
+
+    # --- utility functions V_k (linear-in-attributes, ASC + slopes) ---
+    U_home  = p.mml_asc_home  - p.mml_b_sigma_home  * E
+    U_hoard = (p.mml_asc_hoard + p.mml_b_sigma_hoard * E + p.mml_b_supply * H
+               - p.mml_b_dist_shop * dist_shop - p.mml_b_occ * perc_occ
+               if has_hoard else -1e6)
+    U_herd  = (p.mml_asc_herd + p.mml_b_sigma_herd * E + p.mml_b_pts * Z
+               - p.mml_b_dist_leader * dist_leader
+               if has_herd else -1e6)
+    U_flee  = (p.mml_asc_flee + p.mml_b_sigma_flee * E + p.mml_b_vis
+               - p.mml_b_dist_shelter * dist_shelter
+               if VIS > 0.5 else -1e6)
+
+    # --- softmax (Eqs. 4-5 of McFadden 1973 conditional logit, with β = mml_scale) ---
+    scores = [p.mml_scale * u for u in (U_home, U_hoard, U_herd, U_flee)]
+    P = _softmax(scores)
+    P_home, P_hoard, P_herd, P_flee = P
+    agent._goal_shares = (P_home, P_hoard, P_herd, P_flee)
+
+    # --- P1.A hysteresis kept as a state record (no longer hard-multiplier
+    # since utilities already encode soft commitment via ASC sign).
+    # Records help downstream metrics that read _hoard_active / _herd_active. ---
+    agent._hoard_active = bool(P_hoard > 0.30)
+    agent._herd_active  = bool(P_herd  > 0.30)
+    agent._inquire_active = False  # MML path does not model inquire (P3 disabled by default upstream)
+
+    # --- dominant action → target_node ---
+    actions = [
+        ('home',  P_home,  home_node),
+        ('hoard', P_hoard, hoard_node),
+        ('herd',  P_herd,  herd_node),
+        ('flee',  P_flee,  shelter_node),
+    ]
+    valid = [(act, prob, node) for act, prob, node in actions if node is not None]
+    if valid:
+        dom_act, _dom_p, dom_n = max(valid, key=lambda x: x[1])
+        agent.target_node = dom_n
+        agent._dom_action = dom_act
+    else:
+        agent.target_node = getattr(agent, 'current_node', None)
+        agent._dom_action = 'stay'
+
+    # --- expected direction = Σ P_k · d_k ---
+    dx = (P_home  * d_home[0] + P_hoard * d_hoard[0]
+        + P_herd  * d_herd[0] + P_flee  * d_flee[0])
+    dy = (P_home  * d_home[1] + P_hoard * d_hoard[1]
+        + P_herd  * d_herd[1] + P_flee  * d_flee[1])
+    return _unit(dx, dy)
+
+
 def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
-    """Eqs. (10)-(12): sigmoid-weighted blend of home / hoard / herd directions.
+    """Sigmoid soft-blend OR MML logit (dispatched on p.use_mml).
+
+    Sigmoid path (default, use_mml=False): Eqs. (10)-(12) sigmoid-weighted
+    blend of home / hoard / herd directions + flee hard override (M3+ shelter).
+
+    MML path (use_mml=True): McFadden conditional logit over 4 actions
+    {home, hoard, herd, flee} with linear-in-attributes utilities; see
+    compute_goal_direction_mml() for the V_k specification.
 
     Extended (2026-06-13):
       - P1.A 迟滞带：用 agent._hoard_active / _herd_active 记忆状态。
@@ -404,6 +559,8 @@ def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
                      unified_stress_model 写入的有效阈值；缺省退回 SwitchParams。
       - P3 信息搜寻：σ∈[θ_mild, θ₁) 且 SEIR∈{S,E} 时启用 w_inquire。
     """
+    if p.use_mml:
+        return compute_goal_direction_mml(agent, stores, neighbors, p)
     E = float(getattr(agent, 'stress_level', 0.0))
     Z = 1.0 if getattr(agent, 'pts_status', False) else 0.0
     H = 1.0 if float(getattr(agent, 'personal_supply', 1.0)) < p.supply_threshold else 0.0

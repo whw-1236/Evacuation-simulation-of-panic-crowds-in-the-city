@@ -32,7 +32,9 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
 
 
-F7_DIR = os.path.join(ROOT, 'trace_output', 'M4_F7_N_scan')
+_USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+F7_DIR = os.path.join(ROOT, 'trace_output',
+                      'M4_MML_F7_N_scan' if _USE_MML else 'M4_F7_N_scan')
 
 # 关注: cascade 强度 = (on - off) / off, 看 N 大时差距怎么放大
 METRICS = [

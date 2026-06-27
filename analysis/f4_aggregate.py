@@ -34,7 +34,9 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
 
 
-F4_DIR = os.path.join(ROOT, 'trace_output', 'M4_F4_multi_seed')
+_USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+F4_DIR = os.path.join(ROOT, 'trace_output',
+                      'M4_MML_F4_multi_seed' if _USE_MML else 'M4_F4_multi_seed')
 
 # 关注的指标: 论文里要进 §5.1 cascade 主表的
 METRICS = [

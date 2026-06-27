@@ -46,7 +46,8 @@ CITIES = [
 N_VALUES = [200, 500, 800, 1500, 3000]
 SEED = 42  # 固定 seed, 与 F1 baseline 一致
 
-OUTPUT_BASE = 'M4_F7_N_scan'
+USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+OUTPUT_BASE = 'M4_MML_F7_N_scan' if USE_MML else 'M4_F7_N_scan'
 TRACE_ROOT = os.path.join(ROOT, 'trace_output')
 PYTHON_EXE = sys.executable
 
@@ -79,6 +80,8 @@ def main():
                 '--n-residents', str(N),
                 '--output-base', OUTPUT_BASE,
             ]
+            if USE_MML:
+                cmd.append('--use-mml')
             print(f'\n{"#"*70}', flush=True)
             print(f'[{done}/{total}] {city}/{district} {tag} (N={N})', flush=True)
             print(f'{"#"*70}', flush=True)
