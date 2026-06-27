@@ -34,7 +34,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
 
 
-_USE_MML = os.environ.get('BLACKOUT_USE_MML', '0') == '1'
+_USE_MML = os.environ.get('BLACKOUT_USE_MML', '1') != '0'   # MML default since 2026-06-28; set '0' for sigmoid legacy supplementary
 F4_DIR = os.path.join(ROOT, 'trace_output',
                       'M4_MML_F4_multi_seed' if _USE_MML else 'M4_F4_multi_seed')
 

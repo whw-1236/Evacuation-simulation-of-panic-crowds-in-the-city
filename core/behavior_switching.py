@@ -130,7 +130,7 @@ class SwitchParams:
     # McFadden (1973) [REF26], Lovreglio et al. (2014, 2016) [REF27, REF29],
     # Haghani & Sarvi (2016) [REF28]. Four actions = {home, hoard, herd, flee}.
     # Each U_k is linear-in-attributes with an alternative-specific constant (ASC).
-    use_mml:             bool  = False   # 默认 False, 保持 sigmoid baseline 兼容
+    use_mml:             bool  = True    # 默认 True (MML 主形式); False 为 legacy sigmoid fallback (论文 §5 supplementary)
     mml_scale:           float = 1.5     # softmax 反温度 β (大→趋确定; 小→均匀)
 
     # alternative-specific constants (baseline preference, when σ=0 & no covariates)

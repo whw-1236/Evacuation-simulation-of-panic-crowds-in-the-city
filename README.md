@@ -72,15 +72,37 @@ dσ/dt = α·T·(1-σ) - β·C·σ + γ·(σ̄-σ) + Σ(事件影响)
 
 由 `core/behavior_switching.py` 实现，对应论文 Eq.(10)-(16)。
 
-### 3.1 I1 — 应力驱动的 sigmoid 软切换
+### 3.1 I1 — 应力驱动的战术行为选择 (MML 主形式 + sigmoid legacy fallback)
 
-三个候选目标方向按其 sigmoid 权重加权合成：
+> **默认开关**: 自 2026-06-28 起 `SwitchParams.use_mml = True` 为默认。论文 §5 主结论用 MML 形式得出。`use_mml=False` 留作 sigmoid legacy fallback (supplementary materials 用)。
 
-- **回家** w_home：σ < θ₁ 时主导
-- **囤积** w_hoard：θ₁ ≤ σ < θ₂ 且物资低于阈值时主导
-- **从众** w_herd：σ ≥ θ₂ 或 PTS 时主导
+#### 3.1.1 MML 主形式 (Mixed Multinomial Logit, McFadden 1973)
 
-权重使用 logistic 函数平滑过渡（软切换），避免硬阈值的行为抖动。陡度参数 k₁~k₄ 控制切换锐度（消融：k→∞ 退化为硬切换）。
+`compute_goal_direction_mml()` 在 4 个 action `{home, hoard, herd, flee}` 上做 softmax 离散选择:
+
+```
+P_k = exp(β · V_k) / Σ exp(β · V_j),   β = mml_scale = 1.5
+```
+
+每个 V_k 是 alternative-specific constant (ASC) + linear-in-attributes 项 (论文 §3.3.2 Eq. 12):
+
+- **home** V_home = α_home − β_σ · σ (σ↑ → V_home↓)
+- **hoard** V_hoard = α_hoard + β_σ · σ + β_supply · H − β_dist · dist_shop − β_occ · occ
+- **herd** V_herd = α_herd + β_σ · σ + β_pts · Z − β_dist · dist_leader
+- **flee** V_flee = (α_flee + β_σ · σ + β_vis − β_dist · dist_shelter) · VIS_i + (1−VIS_i) · (−∞)
+
+其中 VIS_i = 1 iff graph-on 且 shelter_node 已 snap。**VIS gate** 是论文 §5.1 的"graph-off ↔ graph-on 切换"在 RUM 框架下的严格理论解释 (visibility-conditioned choice set, 引 Haghani & Sarvi 2016 [REF28])。
+
+返回 expected direction `Σ P_k · d_k` 给 social_force 用; 同时记 `agent._dom_action = argmax_k P_k` 给 path_planner 用。
+
+#### 3.1.2 Sigmoid soft-blend (legacy, `use_mml=False` fallback)
+
+三个候选目标方向 (home / hoard / herd) 按 sigmoid 权重加权合成, 加 hard flee override (σ > flee_threshold = 0.6 时强制冲向最近避难所):
+
+- w_home, w_hoard, w_herd: σ 跨 θ₁=0.4 / θ₂=0.6 时 logistic 平滑过渡 (陡度 k₁~k₄ = 10)
+- flee override: σ > 0.6 时 `target_node = nearest_shelter_node`, 覆盖 home/hoard/herd 决策
+
+历史地位: 这是早期 M3 / 早期 M4 drafts 的形式, 已被 MML 取代。两者主结论 (flee 通道激活, BC 失败, N-invariance) 都 robust; 但 §5.1 的 IIA herd substitution 是 MML 特有 (sigmoid 加性 blend 没法把 herd 概率挪给 flee), 详见论文 §5 supplementary note。
 
 ### 3.2 I2 — 熟人网络商店选择
 
@@ -376,8 +398,8 @@ graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
     --n-residents 800 --seed 42 `
     --tag baseline --output-base M4_F1_cross_city `
     --home-distribution poi          # 'poi' 默认 / 'uniform' 见 §F2 (POI 控制实验)
-    # --flee-threshold 0.6          # 可选: 覆盖 σ 触发 flee 的阈值 (F5 扫描用)
-    # --use-mml                     # 可选: 用 MML 离散选择替代 sigmoid soft-blend (F13)
+    # --flee-threshold 0.6          # 可选: 仅 sigmoid fallback 时生效; MML 下 flee 由 V_flee 自动控制
+    # --no-mml                      # 可选: 切回 sigmoid legacy fallback; 默认走 MML
 ```
 
 **CLI 参数清单** (定义在 `_parse_args()`):
@@ -391,8 +413,8 @@ graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
 | `--tag` | '' | 输出目录后缀 (e.g. `seed42`, `N500`) |
 | `--output-base` | `trace_output/` | 输出根目录 (M4 子组传 `M4_F4_multi_seed` 等) |
 | `--home-distribution` | `poi` | 居民 home 分布: `poi` (按 POI 圆) / `uniform` (polygon 面积均匀) |
-| `--flee-threshold` | None (=0.6) | **F5**: SwitchParams.flee_threshold 覆盖, 扫描 phase transition 用 |
-| `--use-mml` | False | **F13**: 启用 Mixed Multinomial Logit (McFadden 1973), 替代 sigmoid soft-blend |
+| `--flee-threshold` | None (=0.6) | **legacy F5**: 只在 sigmoid fallback 下生效 (MML 由 V_flee 自动控制); supplementary 用 |
+| `--use-mml` | True (默认) | **F13**: Mixed Multinomial Logit (McFadden 1973), 论文 §5 主形式 |
 
 每次跑会跑 graph-off + graph-on 各 120 步, 输出:
 - `trace_output/<output-base>/t15_<城>_<区>_<tag>/graph_off/global_metrics.csv`
@@ -405,18 +427,17 @@ graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
 | 脚本 | 任务编号 | 跑多少次 | 用途 |
 |---|---|---|---|
 | `scripts/run_f4_multi_seed.py` | F4 | 30 (三城 × seed 42-51) | 多 seed 95% CI; §5.1 主表 |
-| `scripts/run_f7_n_scan.py` | F7 | 15 (三城 × N ∈ {200, 500, 800, 1500, 3000}) | cascade vs N 临界曲线; §5.2.1 N-invariance |
-| `scripts/run_f5_theta_flee.py` | F5 | 24 (三城 × θ ∈ {0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.80}) | flee 阈值 phase transition; §5.2.2 (sigmoid 专属) |
+| `scripts/run_f7_n_scan.py` | F7 | 15 (三城 × N ∈ {200, 500, 800, 1500, 3000}) | cascade vs N N-invariance; §5.2 主图 |
+| `scripts/run_f5_theta_flee.py` | legacy F5 | 24 (三城 × θ ∈ {0.40..0.80}) | sigmoid 时代 θ_flee 扫描; 论文 supplementary 用 |
 | `scripts/run_f2_home_dist.py` | F2 | 6 (三城 × {poi, uniform}) | 去 POI bias 控制实验; §5.3 |
-| `scripts/run_mml_all.py` ⭐ | F13 | 54 (F1+F4+F7+F2 全套, 受 BLACKOUT_USE_MML=1 触发) | MML 双形式 re-run master launcher |
+| `scripts/run_mml_all.py` | F13 master | 54 (F1+F4+F7+F2) | 一键串联 4 个 F-runner 跑完整 §5 数据集 (默认 MML, 输出 `M4_MML_*`); 历史保留 |
 
 所有 batch runner subprocess 模式 + fail-fast 检查 networkx/osmnx。启动方式 (推荐通过 wrapper, 自动处理 conda env 激活):
 
 ```powershell
 .\tools\run_in_crowds_env.ps1 scripts\run_<f4|f5|f7|f2>_<name>.py
 
-# F13 MML 全套 re-run (输出到 M4_MML_* 平行目录, 不覆盖 sigmoid baseline)
-$env:BLACKOUT_USE_MML="1"
+# 一键跑完整 §5 数据集 (默认 MML, 输出 M4_MML_*)
 .\tools\run_in_crowds_env.ps1 scripts\run_mml_all.py
 ```
 
@@ -430,10 +451,10 @@ $p = Start-Process -FilePath "powershell" -ArgumentList @(
   -NoNewWindow -PassThru
 ```
 
-**MML 双形式开关**: 4 个 F-runner (run_f4 / run_f7 / run_f2 / run_mml_all) 都读环境变量 `BLACKOUT_USE_MML`:
-- `BLACKOUT_USE_MML=1` → 输出到 `trace_output/M4_MML_*/`, 内部 subprocess 自动加 `--use-mml`
-- 不设 (或 `=0`) → 输出到 `trace_output/M4_*/` (sigmoid baseline)
-- 两套数据**并列存放, 互不覆盖**, 后处理 analysis 脚本同样读这个 env var 自动切换路径
+**`BLACKOUT_USE_MML` 环境变量** (2026-06-28 起语义反转): 4 个 F-runner + 3 个 analysis 脚本都读这个 env var:
+- 默认 (不设 或 `=1`) → MML 模式, 输出到 `trace_output/M4_MML_*/` (论文 §5 主形式)
+- `=0` → sigmoid legacy fallback, 输出到 `trace_output/M4_*/` (§5 supplementary Tables S1–S3 来源), 内部 subprocess 自动加 `--no-mml`
+- 两套数据**并列存放, 互不覆盖**
 
 ### 13.3 后处理 / aggregate 脚本
 
@@ -465,36 +486,29 @@ $env:BLACKOUT_USE_MML="1"
 trace_output/
 ├── M3_baseline/                     # 早期实验留存
 │
-│  ─── sigmoid baseline (1990s 风格 soft-blend) ───
-├── M4_F1_cross_city/                # F1 三城 baseline (6-22)
-├── M4_T16_cross_city/               # T16 BC vs sim 相关性三城外推 (6-22)
-├── M4_F4_multi_seed/                # F4 三城 × 10 seed (6-26)
-│   ├── aggregate_ci.{csv,json}
-│   ├── errorbar.png
-│   └── t15_<城>_<区>_seed{42..51}/  (×30)
-├── M4_F7_N_scan/                    # F7 三城 × 5 N (6-26)
-│   ├── n_curve.{csv,png}
-│   └── t15_<城>_<区>_N{200..3000}/  (×15)
-├── M4_F5_theta_flee/                # F5 三城 × 8 θ_flee (6-27)
-│   ├── theta_curve.{csv,png}
-│   └── t15_<城>_<区>_theta{0.4..0.8}/  (×24)
-├── M4_F2_home_dist/                 # F2 三城 × {poi, uniform} (6-26)
-│   ├── r_compare.{csv,json}
-│   ├── _corr/<城>_<区>_<hd>/correlation.json  (×6)
-│   └── t15_<城>_<区>_{poi,uniform}/  (×6)
-│
-│  ─── MML 双形式 (McFadden conditional logit, 6-27 晚) ───
+│  ─── MML 主形式 (McFadden conditional logit, 论文 §5 主表数据源) ───
 ├── M4_MML_F1_cross_city/            # F1-MML 三城 baseline (3 sub-run)
-├── M4_MML_F4_multi_seed/            # F4-MML 三城 × 10 seed (×30)
+├── M4_MML_F4_multi_seed/            # F4-MML 三城 × 10 seed (×30) — §5.1 主表
 │   ├── aggregate_ci.{csv,json}
 │   └── errorbar.png
-├── M4_MML_F7_N_scan/                # F7-MML 三城 × 5 N (×15)
+├── M4_MML_F7_N_scan/                # F7-MML 三城 × 5 N (×15) — §5.2 主表
 │   └── n_curve.{csv,png}
-└── M4_MML_F2_home_dist/             # F2-MML 三城 × {poi, uniform} (×6)
-    └── r_compare.{csv,json}
+├── M4_MML_F2_home_dist/             # F2-MML 三城 × {poi, uniform} (×6) — §5.3 主表
+│   ├── r_compare.{csv,json}
+│   └── _corr/<城>_<区>_<hd>/correlation.png  (×6) — §5.3 散点图
+│
+│  ─── sigmoid legacy (早期 1990s 风格 soft-blend, 论文 §5 supplementary Tables S1-S3) ───
+├── M4_F1_cross_city/                # F1 三城 baseline (6-22)
+├── M4_T16_cross_city/               # T16 BC vs sim 相关性三城外推 (6-22)
+├── M4_F4_multi_seed/                # F4 三城 × 10 seed (6-26) — supplementary Table S1
+├── M4_F7_N_scan/                    # F7 三城 × 5 N (6-26) — supplementary Table S2
+├── M4_F5_theta_flee/                # F5 三城 × 8 θ_flee (6-27) — supplementary Fig S2 (sigmoid-only artefact)
+│   ├── theta_curve.{csv,png}
+│   └── t15_<城>_<区>_theta{0.4..0.8}/  (×24)
+└── M4_F2_home_dist/                 # F2 三城 × {poi, uniform} (6-26) — supplementary Table S3
 ```
 
-**两套数据并列原则**: sigmoid baseline 在 `M4_*/`, MML 在 `M4_MML_*/`, 完全平行。论文 §5 表格双形式并列报告 (展示主结论 formulation-invariant)。
+**两套数据并列**: MML 主形式在 `M4_MML_*/`, sigmoid legacy 在 `M4_*/`, 完全平行。论文 §5 主表用 MML; supplementary Tables S1–S3 用 sigmoid 数据展示主结论 (BC failure, N-invariance) 是 formulation-invariant, IIA herd substitution 是 MML 特有。
 
 ---
 
@@ -589,13 +603,17 @@ Evacuation-simulation-of-panic-crowds-in-the-city/
 .\.venv\run_in_crowds_env.ps1 analysis\f5_phase_transition.py
 .\.venv\run_in_crowds_env.ps1 analysis\betweenness_vs_sim.py
 
-# 9. F13 MML 双形式 re-run (~40 min, 输出到 M4_MML_*/) + analysis
-$env:BLACKOUT_USE_MML="1"
+# 9. 一键跑完整 §5 数据集 (默认 MML, ~40 min, 输出到 M4_MML_*/) + analysis
 .\.venv\run_in_crowds_env.ps1 scripts\run_mml_all.py
 .\.venv\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
 .\.venv\run_in_crowds_env.ps1 analysis\f7_n_curve.py
 .\.venv\run_in_crowds_env.ps1 analysis\f2_compare_r.py
-Remove-Item Env:\BLACKOUT_USE_MML                              # 切回 sigmoid baseline 模式
+
+# 10. 跑 sigmoid legacy supplementary (重现论文 §5 Tables S1-S3, 输出 M4_*/)
+$env:BLACKOUT_USE_MML="0"
+.\.venv\run_in_crowds_env.ps1 scripts\run_f4_multi_seed.py
+.\.venv\run_in_crowds_env.ps1 analysis\f4_aggregate.py
+Remove-Item Env:\BLACKOUT_USE_MML
 ```
 
 ### 长任务的 detach 模式 (避免 Bash/PowerShell tool 10 min timeout)
