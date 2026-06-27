@@ -39,43 +39,27 @@ matplotlib.use('Agg')
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
 matplotlib.rcParams['axes.unicode_minus'] = False
 import matplotlib.pyplot as plt
-# 不再用 scipy.stats: Crowds_sim env 的 scipy 1.18 + numpy 2.2 在长 array (>5000)
-# 上调 pearsonr 会触发 0xC00000FF kernel-level crash。改用 numpy 手写。
+from scipy.stats import pearsonr as _scipy_pearsonr, spearmanr as _scipy_spearmanr
 
 
 def _pearson_r_p(x, y):
-    """Pearson r 手算 (避免 np.corrcoef / scipy.stats —— 它们在 Crowds_sim
-    numpy 2.2 + scipy 1.18 上对 >5000 长 array 触发 0xC00000FF kernel crash)。
-    用最朴素的求和公式: r = Σ((x-μx)(y-μy)) / (n σx σy)。p 用 t 分布近似。"""
-    import math
-    n = len(x)
-    if n < 3:
-        return float('nan'), float('nan')
+    """Pearson r + 2-tail p。n<3 或 σ=0 返回 (nan, nan)。"""
     x_arr = np.asarray(x, dtype=np.float64)
     y_arr = np.asarray(y, dtype=np.float64)
-    mx = float(x_arr.mean())
-    my = float(y_arr.mean())
-    dx = x_arr - mx
-    dy = y_arr - my
-    sxx = float((dx * dx).sum())
-    syy = float((dy * dy).sum())
-    sxy = float((dx * dy).sum())
-    if sxx <= 1e-20 or syy <= 1e-20:
+    if len(x_arr) < 3 or x_arr.std() <= 1e-12 or y_arr.std() <= 1e-12:
         return float('nan'), float('nan')
-    r = sxy / math.sqrt(sxx * syy)
-    r = max(-1.0, min(1.0, r))
-    if abs(r) >= 1.0 - 1e-12:
-        return r, 0.0
-    t = r * math.sqrt(n - 2) / math.sqrt(1 - r * r)
-    p = math.erfc(abs(t) / math.sqrt(2))
-    return r, p
+    r, p = _scipy_pearsonr(x_arr, y_arr)
+    return float(r), float(p)
 
 
 def _spearman_rho_p(x, y):
-    """numpy 实现 Spearman ρ: 排名后 Pearson。"""
-    rx = np.argsort(np.argsort(x))
-    ry = np.argsort(np.argsort(y))
-    return _pearson_r_p(rx, ry)
+    """Spearman ρ + 2-tail p。"""
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64)
+    if len(x_arr) < 3 or x_arr.std() <= 1e-12 or y_arr.std() <= 1e-12:
+        return float('nan'), float('nan')
+    rho, p = _scipy_spearmanr(x_arr, y_arr)
+    return float(rho), float(p)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -158,9 +142,7 @@ def main():
     if s_load < 1e-12 or s_bc < 1e-12:
         r_all, p_all = float('nan'), float('nan')
     else:
-        print(f'  [4.3c] calling _pearson_r_p', flush=True)
         r_all, p_all = _pearson_r_p(bc_arr, load_arr)
-        print(f'  [4.3d] pearson OK', flush=True)
     print(f'  Pearson r (all nodes)         = {r_all:.4f}  (p={p_all:.2e})', flush=True)
 
     # 仅看有非零 load 的 (噪声节点会掩盖信号)

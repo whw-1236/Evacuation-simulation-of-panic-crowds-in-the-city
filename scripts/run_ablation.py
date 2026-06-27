@@ -146,6 +146,23 @@ def run_one(label, use_road_graph, args, run_dir):
     sim = BlackoutSimulation(config=cfg, city_config=city_config)
     print(f'[init] {time.time()-t0:.1f}s, use_road_graph={sim.use_road_graph}')
 
+    # F5 控制实验: flee_threshold 覆盖 (默认 0.6, 扫描 {0.4..0.8} 验证 phase transition)
+    flee_th = getattr(args, 'flee_threshold', None)
+    if flee_th is not None:
+        fc = getattr(sim, 'force_calculator', None)
+        if fc is not None:
+            if hasattr(fc, 'sw'):
+                fc.sw.flee_threshold = float(flee_th)
+            sfm = getattr(fc, 'social_force_model', None)
+            if sfm is not None and hasattr(sfm, 'sw'):
+                sfm.sw.flee_threshold = float(flee_th)
+        n_overridden = 0
+        for r in sim.residents:
+            if getattr(r, 'sw', None) is not None:
+                r.sw.flee_threshold = float(flee_th)
+                n_overridden += 1
+        print(f'[F5] flee_threshold → {flee_th} (force_calculator + {n_overridden} agents)')
+
     history = []
     triggered = False
     t_start = time.time()
@@ -215,6 +232,7 @@ def plot_compare(h_off, h_on, args, run_dir):
             'seed':          args.seed,
             'tag':           args.tag,
             'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
+            'flee_threshold':    getattr(args, 'flee_threshold', None),
         },
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
@@ -299,6 +317,8 @@ def _parse_args():
     p.add_argument('--home-distribution', default=None, dest='home_distribution',
                    choices=['poi', 'uniform'],
                    help='F2: 居民 home 分布策略 (poi 默认 / uniform 去 POI bias)')
+    p.add_argument('--flee-threshold', type=float, default=None, dest='flee_threshold',
+                   help='F5: SwitchParams.flee_threshold 覆盖值 (默认 0.6, 扫 {0.4..0.8} 验证 phase transition)')
     return p.parse_args()
 
 
