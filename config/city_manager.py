@@ -347,7 +347,6 @@ class CityManager:
                 'hospital': max(2, n_districts),
                 'school': max(3, n_districts * 2),
                 'emergency': max(1, n_districts // 2),
-                'community': max(2, n_districts),
                 'industry': max(2, n_districts),
             }
 
