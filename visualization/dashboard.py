@@ -63,12 +63,11 @@ FACILITY_COLORS = {
     'industry':   '#FF9800',
     'emergency':  '#673AB7',
     'government': '#1565C0',
-    'community':  '#00BCD4',
 }
 FACILITY_OUTAGE_COLOR = '#757575'
 FACILITY_LABELS_CN = {
     'hospital': '医院', 'school': '学校', 'industry': '工业',
-    'emergency': '应急', 'government': '政府', 'community': '社区',
+    'emergency': '应急', 'government': '政府',
 }
 
 # 状态栏使用 monospace 字体（Windows 下 Consolas），不含 CJK 字形；
@@ -708,7 +707,7 @@ class SimulationDashboard:
         infras = getattr(self.sim, 'critical_infras', None) or []
         groups = defaultdict(list)
         for f in infras:
-            ftype = getattr(f, 'infra_type', None) or getattr(f, 'category', 'community')
+            ftype = getattr(f, 'infra_type', None) or getattr(f, 'category', 'other')
             groups[ftype].append(f)
         for ftype, items in groups.items():
             xs = [getattr(it, 'x', None) for it in items]
@@ -952,7 +951,7 @@ class SimulationDashboard:
         infras = getattr(self.sim, 'critical_infras', None) or []
         cache = {}
         for f in infras:
-            ftype = getattr(f, 'infra_type', None) or getattr(f, 'category', 'community')
+            ftype = getattr(f, 'infra_type', None) or getattr(f, 'category', 'other')
             entry = cache.setdefault(ftype, {'items': [], 'zids': [],
                                             'powered_color': FACILITY_COLORS.get(ftype, '#9E9E9E')})
             entry['items'].append(f)
