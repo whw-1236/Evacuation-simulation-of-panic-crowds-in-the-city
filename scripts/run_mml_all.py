@@ -40,6 +40,7 @@ CITIES = [
 PYTHON_EXE = sys.executable
 TRACE_ROOT = os.path.join(ROOT, 'trace_output')
 
+# 注: 2026-06-28 起 batch runner 默认就是 MML 模式 (env var 默认 != '0'), 此处显式 = '1' 仅为前向兼容
 env_mml = os.environ.copy()
 env_mml['BLACKOUT_USE_MML'] = '1'
 

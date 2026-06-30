@@ -22,7 +22,7 @@
 
 - **居民主体** (ResidentAgent)：**核心建模对象**。具有 OCEAN 五因素人格、统一心理压力状态 σ(t)、情绪 E(t)、恐慌 P(t) 和 PTS 状态，以及由应力驱动的三阶段行为切换（回家→囤积→从众）。
 
-- **关键基础设施主体** (CriticalInfraAgent)：包括医院、学校、应急机构、政府机构、社区卫生院、工业企业六类，具有优先级和备用电源属性，发出公共影响信号。
+- **关键基础设施主体** (CriticalInfraAgent)：包括医院、学校、应急机构、政府机构、工业企业五类，具有优先级和备用电源属性，发出公共影响信号。
 
 ---
 
@@ -212,7 +212,7 @@ Leader 评分 = α_s·(1-E_j) + α_f·f_ij + α_v·可见性
 - 加载 GeoJSON 城市行政区划边界数据
 - 自动将居民和企业分布到各区域
 - 管理区域级停电状态和故障严重程度
-- 加载 CSV 节点数据（医院/学校/工业/应急/政府/社区卫生院六类设施）
+- 加载 CSV 节点数据（医院/学校/工业/应急/政府五类设施）
 - 支持多城市切换（config/city_manager.py）
 - 支持行政区独立停电模式（指定区域选择性停电）
 
@@ -340,6 +340,50 @@ agent 转为 herd, 聚集到同 edge
     ↓
 edge occupancy↑ → cong↑ (循环)
 ```
+
+**关键: 这个 loop 靠 dynamic re-routing 才能闭合** (详见 §12.3.1)。如果只在出发时算一次路径不重路由, 这个 loop 半开 (只有新出发的 agent 响应拥堵), cascade 信号会明显弱化。
+
+### 12.3.1 Dynamic re-routing — 关上 cascade loop
+
+`core/path_planner.py` 给每个 agent 持续刷新路径, **不是出发时算一次就锁死**。类比 Google Maps / Waze 实时导航。
+
+**congestion-aware 权重** (公式跟论文 §3.5.7 Eq.24 一致):
+```
+w(edge) = length(edge) × (1 + α · cong)
+cong = min(1.0, occupancy(edge) / capacity_per_step(edge))
+α = CONGESTION_WEIGHT_ALPHA = 2.0
+```
+
+**重路由触发条件** (4 选 1 命中即触发, [path_planner.py:16-20](core/path_planner.py#L16)):
+
+| 触发 | 时机 | 通常对应 |
+|---|---|---|
+| **`target_node` 变了** | I1 重算 dom_action 选了新目标节点 | herd → flee 切换 (§5.1 IIA), leader 换人, hoard → herd |
+| **≥ `REPLAN_EVERY_STEPS` (默认 25) 步** | 周期刷拥堵 | "实时导航式" 路径调整, 6.25h 一次 |
+| **`current_path` 空** | 出发时 / 走完了 | 新 spawn 或 path 用完 |
+| **`force=True`** | 外部强制 | 现在没用上 |
+
+**console log**: 当单步重路由 agent 数 ≥ `max(20, N/20)` 时打印 `[path_plan] step N: replanned X/N agents`。这不是 bug, 是模型在工作的证据。两种 pattern:
+- 大批量 (300+) 每 25 步规整出现 → 周期刷新触发
+- 小批量 (40-60) 散落出现 → target_node 变化触发 (典型: σ 在 0.55-0.65 边界的 herd/flee 摇摆人群)
+
+**4 个关键好处**:
+
+1. **关上 panic cascade loop** — 见 §12.3 上面流程图. 没 replan, loop 只能影响新出发的 agent, 大部分 cascade 信号被吃掉
+2. **拥堵空间再分配** — 避免所有 flee agent 挤同一条街形成单点死锁. 重路由让拥堵在多条 funnel street 间动态分流, 这是论文 §5.3 BC failure 的力学根源之一 (load 不在最短路上, 而在"绕道终点"窄街)
+3. **跟真实人类导航行为对齐** — 真实疏散里人会避堵车, 25 步 ≈ 6h 间隔模拟 "看到/听说交通信息后调整路径" 的节奏
+4. **MML IIA substitution 真正可见** — 论文 §5.1 herd→flee 替代需要 herd agent 在路上切换 target 到 shelter, 这次切换由 path_planner 在下一步生效, 没 replan 就只是 dom_action 标记变了但人还在原路上
+
+**调参 `REPLAN_EVERY_STEPS`** (默认 25):
+
+| 值 | 真实意义 | 计算成本 |
+|---|---|---|
+| 5 (1.25h) | 接近实时导航 (Waze 级) | 5× |
+| **25 (6.25h)** ⭐ | 论文 §5 用这个, "first-leg commitment + destination-aware adjustment" | 基线 |
+| 100 (25h) | "黑天事件无导航信息" 假设 | 1/4× |
+| `∞` (不刷) | sanity baseline, agent 锁路, 退化为 static shortest-path routing | 最低 |
+
+代码位置: [path_planner.py:30](core/path_planner.py#L30)
 
 ### 12.4 Flee 行为（M3+ 新增）
 

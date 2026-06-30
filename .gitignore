@@ -219,6 +219,9 @@ __marimo__/
 
 output/
 trace_output/
+output_png/
+output_gif/
+trace_output_ui/
 
 # Project-specific generated data
 road_graph_cache/
