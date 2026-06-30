@@ -6,7 +6,7 @@
 
 > **PTS 定义修订**：`pts_status` 由 **σ 迟滞带** 控制：进入 σ ≥ 0.8 × 性格系数（封顶 0.95）、退出 σ < 0.5 × 性格系数（迟滞带 0.3）；非永久锁存。基准取 EXTREME（0.8），PTS 为少数极端态。依据文献（SIR 含 Recovered 态、P-SIS 情绪可逆、伊比利亚大停电情绪随恢复消退）：PTS 不永久锁存但需迟滞。
 
-> **运行环境**：必须用 conda env `Crowds_sim` 跑 sim (含 networkx / osmnx 路网依赖)；推荐通过 `tools/run_in_crowds_env.ps1` wrapper 启动 (内部走 `cmd /c "call activate.bat ..."`，确保 `Library\bin\` 的 freetype/libpng/zlib DLL 进 PATH，否则 matplotlib/scipy 的 C 扩展会抛 `0xC00000FF / 0xc06d007f` STATUS_INVALID_IMAGE_FORMAT，详见 §14)。
+> **运行环境**：必须用 conda env `Crowds_sim` 跑 sim (含 networkx / osmnx 路网依赖)；推荐通过 `.venv/run_in_crowds_env.ps1` wrapper 启动 (内部走 `cmd /c "call activate.bat ..."`，确保 `Library\bin\` 的 freetype/libpng/zlib DLL 进 PATH，否则 matplotlib/scipy 的 C 扩展会抛 `0xC00000FF / 0xc06d007f` STATUS_INVALID_IMAGE_FORMAT，详见 §14)。
 
 ---
 
@@ -437,7 +437,7 @@ cong = min(1.0, occupancy(edge) / capacity_per_step(edge))
 graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
 
 ```powershell
-.\tools\run_in_crowds_env.ps1 scripts\run_ablation.py `
+.\.venv\run_in_crowds_env.ps1 scripts\run_ablation.py `
     --city 厦门市 --district 思明区 `
     --n-residents 800 --seed 42 `
     --tag baseline --output-base M4_F1_cross_city `
@@ -479,17 +479,17 @@ graph-on vs graph-off 对照实验, 默认跑厦门思明 N=800 seed=42:
 所有 batch runner subprocess 模式 + fail-fast 检查 networkx/osmnx。启动方式 (推荐通过 wrapper, 自动处理 conda env 激活):
 
 ```powershell
-.\tools\run_in_crowds_env.ps1 scripts\run_<f4|f5|f7|f2>_<name>.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_<f4|f5|f7|f2>_<name>.py
 
 # 一键跑完整 §5 数据集 (默认 MML, 输出 M4_MML_*)
-.\tools\run_in_crowds_env.ps1 scripts\run_mml_all.py
+.\.venv\run_in_crowds_env.ps1 scripts\run_mml_all.py
 ```
 
 长任务建议 detach 模式 (避免 Bash 工具 10 min timeout):
 
 ```powershell
 $p = Start-Process -FilePath "powershell" -ArgumentList @(
-    "-NoProfile", "-File", ".\tools\run_in_crowds_env.ps1", "scripts\run_f4_multi_seed.py"
+    "-NoProfile", "-File", ".\.venv\run_in_crowds_env.ps1", "scripts\run_f4_multi_seed.py"
 ) -RedirectStandardOutput "trace_output\F4.log" `
   -RedirectStandardError  "trace_output\F4.err" `
   -NoNewWindow -PassThru
@@ -515,13 +515,13 @@ $p = Start-Process -FilePath "powershell" -ArgumentList @(
 所有 analysis 脚本通过 wrapper 启动:
 
 ```powershell
-.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py
+.\.venv\run_in_crowds_env.ps1 analysis\f4_aggregate.py
 
 # MML 数据出表: 同样的脚本通过 env var 切到 M4_MML_* 路径
 $env:BLACKOUT_USE_MML="1"
-.\tools\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
-.\tools\run_in_crowds_env.ps1 analysis\f7_n_curve.py          # → M4_MML_F7_N_scan/
-.\tools\run_in_crowds_env.ps1 analysis\f2_compare_r.py        # → M4_MML_F2_home_dist/
+.\.venv\run_in_crowds_env.ps1 analysis\f4_aggregate.py        # → M4_MML_F4_multi_seed/
+.\.venv\run_in_crowds_env.ps1 analysis\f7_n_curve.py          # → M4_MML_F7_N_scan/
+.\.venv\run_in_crowds_env.ps1 analysis\f2_compare_r.py        # → M4_MML_F2_home_dist/
 ```
 
 ### 13.4 实测数据落盘
