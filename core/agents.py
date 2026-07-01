@@ -498,6 +498,10 @@ class GovernmentAgent:
         # ============ 行为参数（外部可调）============
         self.initiative = initiative  # 积极性
         self.response = response  # 响应效率
+        # Decision-layer compatibility metrics used by decision.utility/rule_based.
+        # These defaults prevent AttributeError without changing gov behavior.
+        self.PC = 1.0
+        self.ECR = float(response)
 
         # 行为配置
         if behavior_config:

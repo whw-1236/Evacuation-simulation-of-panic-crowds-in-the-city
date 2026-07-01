@@ -113,6 +113,54 @@ def _collect_step_metrics(sim):
     }
 
 
+SWITCH_ABLATION_OVERRIDES = {
+    'none': {},
+    'hard_switch': {'use_mml': False, 'k1': 50.0, 'k2': 50.0, 'k3': 50.0, 'k4': 50.0},
+    'soft_switch': {'use_mml': False, 'k1': 1.0, 'k2': 1.0, 'k3': 1.0, 'k4': 1.0},
+    'no_info_network': {'lambda_c': 0.0, 'gamma': 0.0},
+    'distance_only_store': {'lambda_f': 0.0, 'lambda_c': 0.0, 'gamma': 0.0},
+    'no_inertia': {'mu': 1.0},
+    'no_hysteresis': {'enable_hysteresis': False},
+    'no_outcome_feedback': {'enable_outcome_feedback': False},
+    'no_behavior_demo': {'enable_behavior_demo': False},
+    'i1_minimal': {
+        'enable_hysteresis': False,
+        'enable_outcome_feedback': False,
+        'enable_behavior_demo': False,
+        'enable_inquire': False,
+    },
+    'no_flee': {'enable_flee_behavior': False},
+}
+
+
+def _switch_param_targets(sim):
+    targets = []
+    fc = getattr(sim, 'force_calculator', None)
+    if fc is not None:
+        if hasattr(fc, 'sw'):
+            targets.append(fc.sw)
+        sfm = getattr(fc, 'social_force_model', None)
+        if sfm is not None and hasattr(sfm, 'sw'):
+            targets.append(sfm.sw)
+    for r in getattr(sim, 'residents', []):
+        if getattr(r, 'sw', None) is not None:
+            targets.append(r.sw)
+    return targets
+
+
+def _apply_switch_overrides(sim, overrides, label):
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    if not overrides:
+        return 0
+    targets = _switch_param_targets(sim)
+    for sw in targets:
+        for name, value in overrides.items():
+            if hasattr(sw, name):
+                setattr(sw, name, value)
+    print(f'[{label}] SwitchParams overrides -> {overrides} ({len(targets)} holders)')
+    return len(targets)
+
+
 # =============================================================================
 # 跑一组实验
 # =============================================================================
@@ -149,39 +197,39 @@ def run_one(label, use_road_graph, args, run_dir):
     # F5 控制实验: flee_threshold 覆盖 (默认 0.6, 扫描 {0.4..0.8} 验证 phase transition)
     flee_th = getattr(args, 'flee_threshold', None)
     if flee_th is not None:
-        fc = getattr(sim, 'force_calculator', None)
-        if fc is not None:
-            if hasattr(fc, 'sw'):
-                fc.sw.flee_threshold = float(flee_th)
-            sfm = getattr(fc, 'social_force_model', None)
-            if sfm is not None and hasattr(sfm, 'sw'):
-                sfm.sw.flee_threshold = float(flee_th)
-        n_overridden = 0
-        for r in sim.residents:
-            if getattr(r, 'sw', None) is not None:
-                r.sw.flee_threshold = float(flee_th)
-                n_overridden += 1
-        print(f'[F5] flee_threshold → {flee_th} (force_calculator + {n_overridden} agents)')
+        _apply_switch_overrides(sim, {'flee_threshold': float(flee_th)}, 'F5')
 
     # F13: MML 默认开 (SwitchParams.use_mml=True 自 2026-06-28 起为默认).
     # --no-mml 显式切回 sigmoid legacy fallback; --use-mml 显式确认 (no-op)
     effective_use_mml = not bool(getattr(args, 'no_mml', False))
     if not effective_use_mml:
-        fc = getattr(sim, 'force_calculator', None)
-        if fc is not None:
-            if hasattr(fc, 'sw'):
-                fc.sw.use_mml = False
-            sfm = getattr(fc, 'social_force_model', None)
-            if sfm is not None and hasattr(sfm, 'sw'):
-                sfm.sw.use_mml = False
-        n_overridden = 0
-        for r in sim.residents:
-            if getattr(r, 'sw', None) is not None:
-                r.sw.use_mml = False
-                n_overridden += 1
-        print(f'[F13] use_mml = False (sigmoid legacy fallback, {n_overridden} agents)')
+        _apply_switch_overrides(sim, {'use_mml': False}, 'F13')
     else:
         print(f'[F13] use_mml = True (MML default since 2026-06-28)')
+
+    switch_ablation = getattr(args, 'switch_ablation', 'none') or 'none'
+    if switch_ablation != 'none':
+        _apply_switch_overrides(
+            sim,
+            SWITCH_ABLATION_OVERRIDES.get(switch_ablation, {}),
+            f'E2:{switch_ablation}',
+        )
+
+    # F13 sensitivity hooks: allow one-knob MML coefficient sweeps without
+    # editing SwitchParams defaults in core/behavior_switching.py.
+    mml_overrides = {
+        'mml_scale': getattr(args, 'mml_scale', None),
+        'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
+        'mml_b_sigma_flee': getattr(args, 'mml_b_sigma_flee', None),
+        'mml_b_vis': getattr(args, 'mml_b_vis', None),
+    }
+    mml_overrides = {k: v for k, v in mml_overrides.items() if v is not None}
+    if mml_overrides:
+        _apply_switch_overrides(
+            sim,
+            {name: float(value) for name, value in mml_overrides.items()},
+            'F13',
+        )
 
     history = []
     triggered = False
@@ -254,6 +302,13 @@ def plot_compare(h_off, h_on, args, run_dir):
             'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
             'flee_threshold':    getattr(args, 'flee_threshold', None),
             'use_mml':           not bool(getattr(args, 'no_mml', False)),
+            'switch_ablation':    getattr(args, 'switch_ablation', 'none') or 'none',
+            'mml_overrides': {
+                'mml_scale': getattr(args, 'mml_scale', None),
+                'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
+                'mml_b_sigma_flee': getattr(args, 'mml_b_sigma_flee', None),
+                'mml_b_vis': getattr(args, 'mml_b_vis', None),
+            },
         },
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
@@ -344,6 +399,17 @@ def _parse_args():
                    help='F13: 显式确认 MML (2026-06-28 起 SwitchParams 默认就开, 此 flag 现为 no-op, 留作向后兼容)')
     p.add_argument('--no-mml',  action='store_true', dest='no_mml',
                    help='supplementary: 强制 sigmoid legacy fallback (use_mml=False), 用于复现 §5 supplementary Tables S1-S3')
+    p.add_argument('--switch-ablation', default='none', dest='switch_ablation',
+                   choices=sorted(SWITCH_ABLATION_OVERRIDES.keys()),
+                   help='E2: SwitchParams 消融预设 (none/no_info_network/no_inertia/no_hysteresis/...)')
+    p.add_argument('--mml-scale', type=float, default=None, dest='mml_scale',
+                   help='F13 sensitivity: override SwitchParams.mml_scale for this run')
+    p.add_argument('--mml-asc-flee', type=float, default=None, dest='mml_asc_flee',
+                   help='F13 sensitivity: override SwitchParams.mml_asc_flee for this run')
+    p.add_argument('--mml-b-sigma-flee', type=float, default=None, dest='mml_b_sigma_flee',
+                   help='F13 sensitivity: override SwitchParams.mml_b_sigma_flee for this run')
+    p.add_argument('--mml-b-vis', type=float, default=None, dest='mml_b_vis',
+                   help='F13 sensitivity: override SwitchParams.mml_b_vis for this run')
     return p.parse_args()
 
 
