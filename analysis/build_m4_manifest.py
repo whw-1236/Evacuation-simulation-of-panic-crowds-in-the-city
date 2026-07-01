@@ -65,9 +65,9 @@ ARTIFACTS = [
     },
     {
         "id": "table_5_3",
-        "role": "MML F2 centrality-vs-load comparison",
+        "role": "MML F2 centrality-vs-load comparison; poi rows feed E6.4, uniform rows feed E6.5",
         "path": "trace_output/M4_MML_F2_home_dist/r_compare.csv",
-        "used_by": ["Table 5.3", "Result 5.3"],
+        "used_by": ["Table 5.3 top / E6.4", "Table 5.3 bottom / E6.5", "Result 5.3"],
     },
     {
         "id": "figure_5_3",
