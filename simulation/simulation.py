@@ -132,6 +132,7 @@ class BlackoutSimulation:
 
         # ==================== 初始化区域状态 ====================
         self._init_zone_status()
+        self._just_restored_zones = []
 
         # ==================== 初始化历史记录 ====================
         self._init_history()
@@ -1853,6 +1854,11 @@ class BlackoutSimulation:
 
         修复完成后，所有社区同时恢复供电
         """
+        restored_zones = [
+            zone_id for zone_id, powered in self.zone_status.items()
+            if (not powered) or self._has_partial_outage(zone_id)
+        ]
+
         print(f"\n{'=' * 60}")
         print(f"   [OK] {self.district_name} 大电网修复完成，恢复供电！")
         print(f"{'=' * 60}\n")
@@ -1898,6 +1904,8 @@ class BlackoutSimulation:
         for e in self.enterprises:
             e.powered = True
             e._is_load_shed = False
+
+        self._just_restored_zones = restored_zones
 
     def _has_partial_outage(self, zone_id):
         """检查区域是否有部分停电"""
@@ -1950,6 +1958,8 @@ class BlackoutSimulation:
         7. 更新所有Agent
         8. 记录历史数据
         """
+        self._just_restored_zones = []
+
         # 0. 【新增】更新仿真时间（昼夜差异）
         self._update_time()
 
