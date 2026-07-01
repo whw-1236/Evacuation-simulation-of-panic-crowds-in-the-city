@@ -126,6 +126,14 @@ class SocialForceModel:
             if n_node > 1e-12:
                 e_i0 = np.array([dx_n / n_node, dy_n / n_node], dtype=float)
 
+        safe_target = getattr(agent, '_safe_zone_target', None)
+        if safe_target is not None:
+            dx_s = safe_target[0] - agent.x
+            dy_s = safe_target[1] - agent.y
+            n_safe = math.hypot(dx_s, dy_s)
+            if n_safe > 1e-12:
+                e_i0 = np.array([dx_s / n_safe, dy_s / n_safe], dtype=float)
+
         # 兜底：平静+物资足+无Leader 时方向为0 → 朝家（否则原地微动）
         if not np.any(e_i0):
             home = getattr(agent, 'home_position', (agent.x, agent.y))
@@ -199,73 +207,6 @@ class SocialForceModel:
             go_home = 0.3 + progress * 0.5  # 0.3 -> 0.8
 
         return activity, speed, go_home
-
-    def _get_mobility_factors(self, agent):
-        """
-        获取个人属性对移动能力的影响
-
-        返回: (移动能力系数, 是否行动受限)
-        """
-        # 获取个人属性
-        age = getattr(agent, 'age', 35)
-        health_status = getattr(agent, 'health_status', '健康')
-
-        mobility = 1.0
-        is_limited = False
-
-        # 年龄影响
-        if age >= 75:
-            mobility *= 0.3  # 高龄老人移动能力很低
-            is_limited = True
-        elif age >= 65:
-            mobility *= 0.5  # 老年人移动能力降低
-            is_limited = True
-        elif age >= 55:
-            mobility *= 0.7  # 中老年人略有下降
-        elif age < 12:
-            mobility *= 0.6  # 儿童移动范围受限
-            is_limited = True
-
-        # 健康状态影响
-        if health_status == '残疾':
-            mobility *= 0.2
-            is_limited = True
-        elif health_status == '严重疾病':
-            mobility *= 0.3
-            is_limited = True
-        elif health_status == '轻微疾病':
-            mobility *= 0.7
-        elif health_status == '亚健康':
-            mobility *= 0.85
-
-        return mobility, is_limited
-
-        # 期望方向向量
-        direction = np.array([target[0] - agent.x, target[1] - agent.y])
-        distance = np.linalg.norm(direction)
-
-        if distance > 0.00005:  # 离目标有一定距离
-            e_i0 = direction / distance
-            # 应用状态速度倍数（增大）
-            desired_speed *= speed_mult * 2.0  # 额外加倍
-            # 恐慌状态下速度进一步增加
-            if getattr(agent, 'pts_status', False):
-                desired_speed *= (1.0 + getattr(agent, 'panic_value', 0) * 0.8)
-        else:
-            # 到达目标，重置游走目标以获取新目标
-            agent._wander_timer = 0
-            # 给一个随机方向的微小速度，保持移动
-            angle = random.random() * 2 * math.pi
-            e_i0 = np.array([math.cos(angle), math.sin(angle)])
-            desired_speed *= 0.5
-
-        # 期望速度向量
-        desired_velocity = desired_speed * e_i0
-
-        # 驱动力（增大系数）
-        driving_force = mass * (desired_velocity - current_velocity) / self.tau * 5.0
-
-        return driving_force
 
     def calculate_social_force(self, agent_i, agent_j):
         """
@@ -450,135 +391,6 @@ class SocialForceModel:
 
         return total_force
 
-    def _calculate_cluster_force(self, agent, neighbors):
-        """
-        计算集群吸引力（增强版 + 时间限制）
-
-        恐慌/停电时，居民倾向于向其他居民聚集（寻求安全感）
-        平静时，保持一定距离（个人空间）
-
-        【时间规律】
-        - 深夜(22:00-6:00)：聚集解散，回家休息
-        - 白天/傍晚：正常聚集行为
-        - 聚集有持续时间限制（不能一直聚集）
-        """
-        emotion = getattr(agent, 'emotion', 0)
-        panic_value = getattr(agent, 'panic_value', 0)
-        powered = getattr(agent, 'powered', True)
-        is_gathering = getattr(agent, 'is_gathering', False)
-
-        # ============ 时间因素 ============
-        current_hour = getattr(agent, '_current_hour', 12.0)
-
-        # 深夜(22:00-6:00) - 聚集应该解散
-        is_night = (current_hour >= 22 or current_hour < 6)
-
-        # 深夜时聚集力大幅降低，产生"回家力"
-        if is_night:
-            # 结束聚集状态
-            agent.is_gathering = False
-
-            # 只有极端恐慌(>0.7)才会深夜聚集
-            if panic_value < 0.7 and emotion < 0.7:
-                return np.array([0.0, 0.0])
-            # 即使恐慌，深夜聚集力也大幅降低
-            night_factor = 0.2
-        else:
-            night_factor = 1.0
-
-        # ============ 聚集持续时间限制 ============
-        # 聚集时间计数（防止一直聚集）
-        gathering_duration = getattr(agent, '_gathering_duration', 0)
-        max_gathering_duration = 20  # 最多聚集20步（约5小时）
-
-        if is_gathering:
-            gathering_duration += 1
-            agent._gathering_duration = gathering_duration
-
-            # 聚集太久了，疲劳，想散去
-            if gathering_duration > max_gathering_duration:
-                agent.is_gathering = False
-                agent._gathering_duration = 0
-                # 聚集疲劳，暂时不想再聚集
-                agent._gathering_cooldown = 10  # 10步冷却时间
-                return np.array([0.0, 0.0])
-        else:
-            agent._gathering_duration = 0
-
-        # 聚集冷却期
-        cooldown = getattr(agent, '_gathering_cooldown', 0)
-        if cooldown > 0:
-            agent._gathering_cooldown = cooldown - 1
-            return np.array([0.0, 0.0])
-
-        # ============ 基础条件检查 ============
-        # 只有在恐慌或停电或已经在聚集时才有聚集倾向
-        if emotion < 0.2 and panic_value < 0.2 and powered and not is_gathering:
-            agent.is_gathering = False
-            return np.array([0.0, 0.0])
-
-        # 计算邻居的质心（扩大范围到500米）
-        nearby = []
-        nearby_gathering = 0  # 附近正在聚集的人数
-        for other in neighbors:
-            if other is agent:
-                continue
-            dist = math.sqrt((agent.x - other.x) ** 2 + (agent.y - other.y) ** 2)
-            if dist < 0.005:  # 500米内的邻居
-                nearby.append(other)
-                if getattr(other, 'is_gathering', False):
-                    nearby_gathering += 1
-
-        if not nearby:
-            agent.is_gathering = False
-            return np.array([0.0, 0.0])
-
-        # 【传染性】如果附近有很多人在聚集，更容易加入
-        gathering_contagion = nearby_gathering / len(nearby) if nearby else 0
-
-        # 计算质心
-        cx = np.mean([n.x for n in nearby])
-        cy = np.mean([n.y for n in nearby])
-
-        # 指向质心的方向
-        direction = np.array([cx - agent.x, cy - agent.y])
-        dist_to_center = np.linalg.norm(direction)
-
-        if dist_to_center < 0.0002:  # 已经在中心附近
-            agent.is_gathering = True
-            return np.array([0.0, 0.0])
-
-        direction = direction / dist_to_center
-
-        # ============ 集群力强度计算 ============
-        base_strength = 0.5
-
-        # 恐慌/情绪加成
-        emotional_factor = 1.0 + emotion + panic_value  # 1.0 ~ 3.0
-
-        # 停电加成
-        power_factor = 2.0 if not powered else 1.0
-
-        # 传染性加成
-        contagion_factor = 1.0 + gathering_contagion * 2.0
-
-        # 人数加成
-        crowd_factor = min(2.0, 1.0 + len(nearby) / 10.0)
-
-        # 距离因素
-        distance_factor = min(2.0, dist_to_center / 0.001)
-
-        # 应用时间因素
-        cluster_strength = (base_strength * emotional_factor * power_factor *
-                            contagion_factor * crowd_factor * distance_factor *
-                            night_factor)  # 深夜降低
-
-        # 标记为正在聚集
-        if cluster_strength > 0.3:
-            agent.is_gathering = True
-
-        return direction * cluster_strength
-
     def update_agent_position(self, agent, force, dt, region_geometry=None,
                               all_region_geometries=None):
         """
@@ -611,17 +423,6 @@ class SocialForceModel:
         if speed > max_speed:
             new_velocity = new_velocity / speed * max_speed
 
-        # 如果速度太小，添加最小移动保证可见
-        if speed < 0.0001:
-            # 向游走目标方向添加最小速度
-            target = getattr(agent, '_wander_target', None)
-            if target:
-                direction = np.array([target[0] - agent.x, target[1] - agent.y])
-                dist = np.linalg.norm(direction)
-                if dist > 0.0001:
-                    direction = direction / dist
-                    new_velocity = direction * 0.0005  # 最小速度
-
         # 更新位置（直接使用速度，不再乘以dt，因为速度已经是每步的位移）
         new_x = agent.x + new_velocity[0]
         new_y = agent.y + new_velocity[1]
@@ -644,8 +445,6 @@ class SocialForceModel:
                 new_y = agent.y
                 new_velocity = new_velocity * (-0.3)  # 反向减速
 
-                # 重置游走目标，选择新方向
-                agent._wander_timer = 0
 
         # 边界约束（POI绑定方案B：以POI为锚, 极端状态允许走出一些）
         # 与 ResidentDistributor.distribute_residents_by_poi 的 poi_radius=0.002 协调:
@@ -1040,7 +839,7 @@ class PanicModel:
 
         return probabilities
 
-    def update_panic_states(self, agents, dt=1.0):
+    def legacy_update_panic_states(self, agents, dt=1.0):
         """
         更新所有agent的恐慌状态
 
@@ -1128,7 +927,7 @@ class IntegratedForceCalculator:
             self.panic_model.set_hazards(hazard_positions)
 
         # 更新恐慌状态
-        # self.panic_model.update_panic_states(agents, dt)
+        # self.panic_model.legacy_update_panic_states(agents, dt)
         # 停用：panic_value 现由 ResidentAgent.step 的 P=σ^0.8 统一给出（§3.2.4）
         #       否则会覆盖 stress 派生的 panic_value
 
@@ -1145,25 +944,31 @@ class IntegratedForceCalculator:
             if self.stores:
                 update_perceived_occupancy(agent, self.stores, self.sw)
             if not getattr(agent, 'powered', True) and safe_zones:
-                # 找最近的有电区域
                 min_dist = float('inf')
                 nearest_safe = None
                 for sx, sy, sz in safe_zones:
                     dist = math.sqrt((agent.x - sx) ** 2 + (agent.y - sy) ** 2)
                     if dist < min_dist:
                         min_dist = dist
-                        nearest_safe = (sx, sy)
+                        nearest_safe = (sx, sy, sz)
 
-                # 设置安全区域目标（稍微偏移以避免集中在一点）
-                if nearest_safe and min_dist < 0.01:  # 只考虑1km内的安全区域
-                    offset_x = (random.random() - 0.5) * 0.002
-                    offset_y = (random.random() - 0.5) * 0.002
-                    agent._safe_zone_target = (nearest_safe[0] + offset_x,
-                                               nearest_safe[1] + offset_y)
+                if nearest_safe and min_dist < 0.01:
+                    current_safe_id = getattr(agent, '_safe_zone_id', None)
+                    if current_safe_id != nearest_safe[2] or getattr(agent, '_safe_zone_target', None) is None:
+                        offset_x = (random.random() - 0.5) * 0.002
+                        offset_y = (random.random() - 0.5) * 0.002
+                        agent._safe_zone_target = (nearest_safe[0] + offset_x,
+                                                   nearest_safe[1] + offset_y)
+                        agent._safe_zone_id = nearest_safe[2]
+                    agent._moving_to_safety = True
                 else:
                     agent._safe_zone_target = None
+                    agent._safe_zone_id = None
+                    agent._moving_to_safety = False
             else:
                 agent._safe_zone_target = None
+                agent._safe_zone_id = None
+                agent._moving_to_safety = False
 
         # ============ 计算并应用力，更新位置 ============
         for agent in agents:
