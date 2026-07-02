@@ -31,6 +31,7 @@ import json
 import time
 import argparse
 import random
+from collections import Counter, defaultdict
 import numpy as np
 
 try:
@@ -132,33 +133,108 @@ SWITCH_ABLATION_OVERRIDES = {
     'no_flee': {'enable_flee_behavior': False},
 }
 
+SWITCH_AUDIT_FIELDS = sorted({
+    name
+    for overrides in SWITCH_ABLATION_OVERRIDES.values()
+    for name in overrides.keys()
+} | {
+    'lambda_d',
+    'lambda_f',
+    'eta_demo_hoard',
+    'eta_demo_herd',
+    'enable_congestion_feedback',
+})
 
-def _switch_param_targets(sim):
-    targets = []
+
+def _switch_param_target_records(sim):
+    records = []
     fc = getattr(sim, 'force_calculator', None)
     if fc is not None:
         if hasattr(fc, 'sw'):
-            targets.append(fc.sw)
+            records.append(('force_calculator.sw', fc.sw))
         sfm = getattr(fc, 'social_force_model', None)
         if sfm is not None and hasattr(sfm, 'sw'):
-            targets.append(sfm.sw)
-    for r in getattr(sim, 'residents', []):
+            records.append(('force_calculator.social_force_model.sw', sfm.sw))
+    for idx, r in enumerate(getattr(sim, 'residents', [])):
         if getattr(r, 'sw', None) is not None:
-            targets.append(r.sw)
-    return targets
+            records.append((f'resident[{idx}].sw', r.sw))
+    return records
+
+
+def _switch_param_targets(sim):
+    return [sw for _owner, sw in _switch_param_target_records(sim)]
+
+
+def _jsonable(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _collect_switch_audit(sim):
+    records = _switch_param_target_records(sim)
+    target_types = Counter(owner.split('[', 1)[0] for owner, _sw in records)
+    read_counts = Counter()
+    values = defaultdict(Counter)
+    for _owner, sw in records:
+        for key, count in getattr(sw, '_audit_reads', {}).items():
+            read_counts[key] += int(count)
+        for field in SWITCH_AUDIT_FIELDS:
+            if hasattr(sw, field):
+                values[field][repr(getattr(sw, field))] += 1
+    return {
+        'holders': len(records),
+        'target_types': dict(target_types),
+        'read_counts': dict(sorted(read_counts.items())),
+        'field_values': {
+            field: dict(counter)
+            for field, counter in sorted(values.items())
+        },
+    }
+
+
+def _write_switch_audit(sim, out_dir, override_audits):
+    audit = _collect_switch_audit(sim)
+    audit['override_audits'] = override_audits
+    path = os.path.join(out_dir, 'switch_audit.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(audit, f, ensure_ascii=False, indent=2)
+    print(f'[audit] saved {path}')
+    return audit
 
 
 def _apply_switch_overrides(sim, overrides, label):
     overrides = {k: v for k, v in overrides.items() if v is not None}
+    audit = {
+        'label': label,
+        'requested_overrides': {k: _jsonable(v) for k, v in overrides.items()},
+        'holders': 0,
+        'applied_counts': {},
+        'missing_counts': {},
+        'changed_counts': {},
+    }
     if not overrides:
-        return 0
-    targets = _switch_param_targets(sim)
-    for sw in targets:
+        return audit
+    records = _switch_param_target_records(sim)
+    audit['holders'] = len(records)
+    applied = Counter()
+    missing = Counter()
+    changed = Counter()
+    for _owner, sw in records:
         for name, value in overrides.items():
             if hasattr(sw, name):
+                old = getattr(sw, name)
                 setattr(sw, name, value)
-    print(f'[{label}] SwitchParams overrides -> {overrides} ({len(targets)} holders)')
-    return len(targets)
+                applied[name] += 1
+                if old != value:
+                    changed[name] += 1
+            else:
+                missing[name] += 1
+    audit['applied_counts'] = dict(applied)
+    audit['missing_counts'] = dict(missing)
+    audit['changed_counts'] = dict(changed)
+    print(f'[{label}] SwitchParams overrides -> {overrides} ({len(records)} holders)')
+    return audit
 
 
 # =============================================================================
@@ -193,26 +269,33 @@ def run_one(label, use_road_graph, args, run_dir):
     t0 = time.time()
     sim = BlackoutSimulation(config=cfg, city_config=city_config)
     print(f'[init] {time.time()-t0:.1f}s, use_road_graph={sim.use_road_graph}')
+    override_audits = []
 
     # F5 控制实验: flee_threshold 覆盖 (默认 0.6, 扫描 {0.4..0.8} 验证 phase transition)
     flee_th = getattr(args, 'flee_threshold', None)
     if flee_th is not None:
-        _apply_switch_overrides(sim, {'flee_threshold': float(flee_th)}, 'F5')
+        override_audits.append(
+            _apply_switch_overrides(sim, {'flee_threshold': float(flee_th)}, 'F5')
+        )
 
     # F13: MML 默认开 (SwitchParams.use_mml=True 自 2026-06-28 起为默认).
     # --no-mml 显式切回 sigmoid legacy fallback; --use-mml 显式确认 (no-op)
     effective_use_mml = not bool(getattr(args, 'no_mml', False))
     if not effective_use_mml:
-        _apply_switch_overrides(sim, {'use_mml': False}, 'F13')
+        override_audits.append(
+            _apply_switch_overrides(sim, {'use_mml': False}, 'F13')
+        )
     else:
         print(f'[F13] use_mml = True (MML default since 2026-06-28)')
 
     switch_ablation = getattr(args, 'switch_ablation', 'none') or 'none'
     if switch_ablation != 'none':
-        _apply_switch_overrides(
-            sim,
-            SWITCH_ABLATION_OVERRIDES.get(switch_ablation, {}),
-            f'E2:{switch_ablation}',
+        override_audits.append(
+            _apply_switch_overrides(
+                sim,
+                SWITCH_ABLATION_OVERRIDES.get(switch_ablation, {}),
+                f'E2:{switch_ablation}',
+            )
         )
 
     # F13 sensitivity hooks: allow one-knob MML coefficient sweeps without
@@ -225,10 +308,12 @@ def run_one(label, use_road_graph, args, run_dir):
     }
     mml_overrides = {k: v for k, v in mml_overrides.items() if v is not None}
     if mml_overrides:
-        _apply_switch_overrides(
-            sim,
-            {name: float(value) for name, value in mml_overrides.items()},
-            'F13',
+        override_audits.append(
+            _apply_switch_overrides(
+                sim,
+                {name: float(value) for name, value in mml_overrides.items()},
+                'F13',
+            )
         )
 
     history = []
@@ -265,6 +350,7 @@ def run_one(label, use_road_graph, args, run_dir):
         for rec in history:
             w.writerow({k: rec.get(k, 0) for k in fields})
     print(f'[trace] saved {csv_path}')
+    sim._switch_audit = _write_switch_audit(sim, out_dir, override_audits)
 
     if sim.use_road_graph:
         edge_path = os.path.join(out_dir, 'edge_observations.csv')
@@ -277,7 +363,7 @@ def run_one(label, use_road_graph, args, run_dir):
 # =============================================================================
 # 对比 + 画图
 # =============================================================================
-def plot_compare(h_off, h_on, args, run_dir):
+def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
     """先写 summary.json (机器可读, 关键路径), 再画图 (易碎, 兜底)。"""
     metrics_to_plot = [
         ('avg_stress', '平均 σ (stress)'),
@@ -321,6 +407,10 @@ def plot_compare(h_off, h_on, args, run_dir):
         'peak_herd_ratio': {
             'off': max(r['herd_ratio'] for r in h_off),
             'on':  max(r['herd_ratio'] for r in h_on),
+        },
+        'switch_audit': {
+            'off': getattr(sim_off, '_switch_audit', None),
+            'on': getattr(sim_on, '_switch_audit', None),
         },
     }
     out_json = os.path.join(run_dir, 'summary.json')
@@ -429,7 +519,10 @@ def main():
 
     h_off, sim_off = run_one('off', use_road_graph=False, args=args, run_dir=run_dir)
     h_on,  sim_on  = run_one('on',  use_road_graph=True,  args=args, run_dir=run_dir)
-    summary = plot_compare(h_off, h_on, args=args, run_dir=run_dir)
+    summary = plot_compare(
+        h_off, h_on, args=args, run_dir=run_dir,
+        sim_off=sim_off, sim_on=sim_on,
+    )
 
     print('\n' + '=' * 70)
     print(f'  T15 对照实验摘要: {args.city}/{args.district}'

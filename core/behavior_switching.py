@@ -175,6 +175,25 @@ def _dist(ax, ay, bx, by):
     return math.hypot(ax - bx, ay - by)
 
 
+def _audit_read(p, field_name, context):
+    """Record SwitchParams field reads for E2 mechanism-coverage diagnostics.
+
+    This is intentionally passive: it only increments an in-memory counter on
+    the SwitchParams instance and never changes model behaviour.
+    """
+    if p is None:
+        return
+    try:
+        reads = getattr(p, '_audit_reads', None)
+        if reads is None:
+            reads = {}
+            setattr(p, '_audit_reads', reads)
+        key = f'{context}.{field_name}'
+        reads[key] = reads.get(key, 0) + 1
+    except Exception:
+        return
+
+
 # =============================================================================
 # I2 — acquaintance-network store selection
 # =============================================================================
@@ -203,6 +222,9 @@ def _real_occupancy_norm(s):
 
 def store_utility(agent, s, p):
     """Eq. (13): U_i(s) = -lambda_d * d_norm + lambda_f * f - lambda_c * o_hat."""
+    _audit_read(p, 'lambda_d', 'store_utility')
+    _audit_read(p, 'lambda_f', 'store_utility')
+    _audit_read(p, 'lambda_c', 'store_utility')
     d_norm = _dist(agent.x, agent.y, s['x'], s['y']) / max(p.dist_scale, 1e-9)
     f = agent.familiarity.get(s['id'], 0.0)
     o_hat = agent.perceived_occupancy.get(s['id'], 0.0)
@@ -218,6 +240,7 @@ def choose_store(agent, stores, p):
 
 def update_perceived_occupancy(agent, stores, p):
     """Eq. (14): gossip over familiar neighbours who are currently AT a store."""
+    _audit_read(p, 'gamma', 'update_perceived_occupancy')
     neighbors = getattr(agent, 'neighbors', [])
     for s in stores:
         observers = [n for n in neighbors
@@ -264,6 +287,7 @@ def leader_score(agent, j, p, in_cone=True):
 
 def update_leader(agent, neighbors, p):
     """Eq. (16): keep current leader unless a challenger beats it by margin mu."""
+    _audit_read(p, 'mu', 'update_leader')
     candidates = [j for j in neighbors if j is not agent]
     if not candidates:
         return getattr(agent, 'current_leader', None)
@@ -306,6 +330,7 @@ def adjust_effective_thresholds(agent, theta1_base, theta2_base, p):
     Returns:
         (theta1_eff, theta2_eff): 修正后阈值
     """
+    _audit_read(p, 'enable_behavior_demo', 'adjust_effective_thresholds')
     if not p.enable_behavior_demo:
         agent._theta1_eff = theta1_base
         agent._theta2_eff = theta2_base
@@ -323,6 +348,8 @@ def adjust_effective_thresholds(agent, theta1_base, theta2_base, p):
     ratio_h = n_hoard / n_total
     ratio_g = n_herd / n_total
     eta = _agreeableness_factor(agent)
+    _audit_read(p, 'eta_demo_hoard', 'adjust_effective_thresholds')
+    _audit_read(p, 'eta_demo_herd', 'adjust_effective_thresholds')
     t1 = max(0.05, theta1_base - eta * p.eta_demo_hoard * ratio_h)
     t2 = max(t1 + 0.05, theta2_base - eta * p.eta_demo_herd * ratio_g)
     agent._theta1_eff = t1
@@ -374,6 +401,7 @@ def apply_outcome_feedback(agent, p):
     调用约定：放在 ResidentAgent.step 末尾、stress_level 已被 unified 模型更新之后；
     本函数对最终 σ 做加法修正并返回总脉冲 δ。
     """
+    _audit_read(p, 'enable_outcome_feedback', 'apply_outcome_feedback')
     if not p.enable_outcome_feedback:
         return 0.0
     delta = 0.0
@@ -403,6 +431,7 @@ def apply_outcome_feedback(agent, p):
 
     # --- 【M2】拥堵 → σ 反馈 (panic cascade loop) ---
     # agent._edge_congestion 由 simulation._path_planning_hook 维护
+    _audit_read(p, 'enable_congestion_feedback', 'apply_outcome_feedback')
     if p.enable_congestion_feedback:
         cong = float(getattr(agent, '_edge_congestion', 0.0))
         if cong > 0:
@@ -486,6 +515,7 @@ def compute_goal_direction_mml(agent, stores, neighbors, p):
     shelter_xy = getattr(agent, 'nearest_shelter_xy', None)
     # VIS=1 iff shelter is in the choice set (graph-on attaches shelter_node;
     # graph-off does not snap shelters so node is None → VIS=0 → U_flee=-∞)
+    _audit_read(p, 'enable_flee_behavior', 'compute_goal_direction_mml')
     VIS = 1.0 if (p.enable_flee_behavior and shelter_node is not None
                   and shelter_xy is not None) else 0.0
     if VIS > 0.5:
@@ -559,6 +589,7 @@ def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
                      unified_stress_model 写入的有效阈值；缺省退回 SwitchParams。
       - P3 信息搜寻：σ∈[θ_mild, θ₁) 且 SEIR∈{S,E} 时启用 w_inquire。
     """
+    _audit_read(p, 'use_mml', 'compute_goal_direction')
     if p.use_mml:
         return compute_goal_direction_mml(agent, stores, neighbors, p)
     E = float(getattr(agent, 'stress_level', 0.0))
@@ -595,6 +626,7 @@ def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
         on=theta2, off=theta2 - p.delta_herd,
         enabled=p.enable_hysteresis,
     )
+    _audit_read(p, 'enable_hysteresis', 'compute_goal_direction')
     agent._hoard_active = hoard_active
     agent._herd_active = herd_active
 
@@ -652,6 +684,7 @@ def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
     # ----- M3+ Shelter flee override (优先级最高) -----
     # σ 超过阈值 + 有最近避难所 → 强制冲向避难所, 让 path 跨网络
     shelter_node = getattr(agent, 'nearest_shelter_node', None)
+    _audit_read(p, 'enable_flee_behavior', 'compute_goal_direction')
     if (p.enable_flee_behavior
         and shelter_node is not None
         and E > p.flee_threshold):
