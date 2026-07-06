@@ -963,7 +963,10 @@ class BlackoutSimulation:
 
         # 设置故障检测时间（行政区级别）
         self.district_fault_detection_time = cause_config.get('detection_delay', 0.5)
-        self.district_fault_ready = False
+        # 【修复】detection_delay=0 (如 planned_outage) 时, zone_recover 的
+        # 检测块只在 >0 时递减并置 ready → ready 永为 False, 修复永不启动;
+        # 延迟为 0 应视为"立即发现"
+        self.district_fault_ready = self.district_fault_detection_time <= 0
 
     def _trigger_district_full_outage(self, cause='equipment_failure'):
         """
@@ -998,6 +1001,10 @@ class BlackoutSimulation:
                 base_damage * grid_repair_config.DAMAGE_WORK_MULTIPLIER +
                 repair_difficulty * grid_repair_config.DIFFICULTY_WORK_MULTIPLIER
         )
+        # 记录原因参数: zone_recover 的事件8同步块用 getattr 读这两个属性,
+        # 原先从未设置 → 事件数据恒为默认 damage=50 / difficulty=1.0
+        self.district_damage_level = base_damage
+        self.district_repair_difficulty = repair_difficulty
         self.district_repair_progress = 0.0
 
         print(f"   大电网损坏程度: {base_damage}%, 修复难度: {repair_difficulty}")
@@ -1100,6 +1107,8 @@ class BlackoutSimulation:
                                            base_damage * grid_repair_config.DAMAGE_WORK_MULTIPLIER +
                                            repair_difficulty * grid_repair_config.DIFFICULTY_WORK_MULTIPLIER
                                    ) * partial_factor
+        self.district_damage_level = base_damage
+        self.district_repair_difficulty = repair_difficulty
         self.district_repair_progress = 0.0
 
         # ============ 5. 输出统计信息 ============
@@ -1803,11 +1812,17 @@ class BlackoutSimulation:
         # 计算修复能力
         grid_config = self.config.grid_repair
 
-        # 资源效率 = 0.3 + 0.7 × R/(R+50)
+        # 【R 语义修正】decide_recovery() 返回的是 GridAgent 内部公式算出的
+        # "修复能力"(BASE=10, ≈17.6 units/h), 不是资源量; 原代码把它塞进
+        # R/(R+HALF) 当资源用, 使实际能力被压到 ≈1.39 units/h, 远低于
+        # OUTAGE_CAUSES 注释假设的 ≈2.5, 所有原因的修复时长被统一拉长约
+        # 1.4-1.8 倍。资源效率应使用电网当前资源池 current_resource_level
+        # (初始 50, 政府支援可升至 100 → 能力 1.94-2.40 units/h)。
+        R_resource = getattr(self.grid, 'current_resource_level', R)
         resource_efficiency = (
                 grid_config.RESOURCE_EFFICIENCY_BASE +
                 (grid_config.RESOURCE_EFFICIENCY_MAX - grid_config.RESOURCE_EFFICIENCY_BASE) *
-                R / (R + grid_config.RESOURCE_HALF_POINT)
+                R_resource / (R_resource + grid_config.RESOURCE_HALF_POINT)
         )
 
         # 积极程度系数 = 0.5 + initiative × 2.0
@@ -1832,6 +1847,11 @@ class BlackoutSimulation:
 
         # 更新修复进度
         total_work = getattr(self, 'district_total_work', 100)
+        if total_work <= 0:
+            # planned_outage: base_damage=0 且 repair_difficulty=0 → 总工作量 0,
+            # 原代码在下一行除零崩溃; 语义上"无需修复", 立即恢复供电
+            self._restore_district_power()
+            return
         repair_amount = repair_capacity * self.dt
         self.district_repair_progress += repair_amount / total_work
 

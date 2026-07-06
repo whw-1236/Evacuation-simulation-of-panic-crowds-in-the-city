@@ -324,9 +324,30 @@ def run_one(label, use_road_graph, args, run_dir):
         sim.step_count = step + 1
         if step == args.outage_step and not triggered:
             try:
-                sim.trigger_outage(mode='full', cause='equipment_failure')
-                print(f'[outage] triggered at step {step}')
+                sim.trigger_district_outage(mode='full',
+                                            cause=args.outage_cause,
+                                            damage_level=args.damage_level)
+                print(f'[outage] triggered at step {step} '
+                      f'(cause={args.outage_cause})')
                 triggered = True
+                # 【护栏】预估复电点是否落在仿真窗口内。基线前提是"断电贯穿
+                # 全程": equipment_failure 在满动员能力 2.40 units/h 下复电点
+                # t≈31.6h, 距 30h 窗口仅 ~1.6h。任何调大修复能力 / 调小工作量
+                # 的改动都可能悄悄破坏前提 — 让第一个 run 就把它喊出来。
+                try:
+                    _est_h, _ = sim._estimate_repair_time()
+                    _t_out = args.outage_step * float(sim.dt)
+                    _t_win = args.total_steps * float(sim.dt)
+                    _det = float(getattr(sim, 'district_fault_detection_time', 0.0) or 0.0)
+                    _t_restore = _t_out + _det + _est_h
+                    sim._restores_in_window = bool(_t_restore <= _t_win)
+                    _flag = ('WARN: 复电点在窗口内, "断电贯穿全程"前提被破坏!'
+                             if sim._restores_in_window else '断电贯穿全程 OK')
+                    print(f'[outage] 预估复电点 t≈{_t_restore:.1f}h / '
+                          f'窗口 {_t_win:.0f}h — {_flag}')
+                except Exception as _ex:
+                    sim._restores_in_window = None
+                    print(f'[outage] restore-estimate WARN: {_ex}')
             except Exception as ex:
                 print(f'[outage] WARN: {ex}')
         rec = _collect_step_metrics(sim)
@@ -383,6 +404,8 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
             'n_enterprises': args.n_enterprises,
             'total_steps':   args.total_steps,
             'outage_step':   args.outage_step,
+            'outage_cause':  getattr(args, 'outage_cause', 'equipment_failure'),
+            'restores_in_window': getattr(sim_on, '_restores_in_window', None),
             'seed':          args.seed,
             'tag':           args.tag,
             'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
@@ -473,6 +496,18 @@ def _parse_args():
     p.add_argument('--outage-step',   type=int, default=DEFAULT_OUTAGE_STEP,
                    dest='outage_step',
                    help=f'停电触发步 (默认: {DEFAULT_OUTAGE_STEP})')
+    p.add_argument('--outage-cause',  default='equipment_failure',
+                   dest='outage_cause',
+                   choices=['equipment_failure', 'overload', 'external_damage',
+                            'natural_disaster', 'typhoon', 'missile_attack',
+                            'war_damage', 'planned_outage'],
+                   help='停电原因: 决定 base_damage/repair_difficulty/'
+                        'detection_delay, 从而决定修复时长 '
+                        '(config.LoadPriorityConfig.OUTAGE_CAUSES; '
+                        '默认: equipment_failure = 原硬编码行为)')
+    p.add_argument('--damage-level',  type=float, default=None,
+                   dest='damage_level',
+                   help='自定义损坏程度 0-100, 覆盖 cause 的 base_damage (可选)')
     p.add_argument('--seed',          type=int, default=DEFAULT_SEED,
                    help=f'随机种子 (默认: {DEFAULT_SEED})')
     p.add_argument('--tag',           default='',
