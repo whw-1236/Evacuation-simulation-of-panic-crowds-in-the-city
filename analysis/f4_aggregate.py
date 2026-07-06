@@ -42,9 +42,27 @@ F4_DIR = os.path.join(ROOT, 'trace_output',
 METRICS = [
     ('herd_ratio',       'herd ratio'),
     ('flee_ratio',       'flee ratio'),
-    ('pct_stress_gt_06', '高压人群比例 (σ>0.6)'),
-    ('avg_stress',       '平均 σ'),
+    ('pct_stress_gt_06', 'high-stress share (sigma>0.6)'),
+    ('avg_stress',       'mean stress'),
 ]
+
+CITY_LABELS = {
+    '北京市': 'Beijing',
+    '厦门市': 'Xiamen',
+    '沈阳市': 'Shenyang',
+}
+
+DISTRICT_LABELS = {
+    '东城区': 'Dongcheng',
+    '思明区': 'Siming',
+    '沈河区': 'Shenhe',
+}
+
+
+def place_label(city, district, n_seeds):
+    city_label = CITY_LABELS.get(city, city)
+    district_label = DISTRICT_LABELS.get(district, district)
+    return f"{city_label}\n{district_label}\n(n={n_seeds})"
 
 
 def load_summaries(f4_dir):
@@ -109,6 +127,8 @@ def aggregate(records):
             on_mean  = row[f'{k}_on_mean']
             if abs(off_mean) > 1e-9:
                 row[f'{k}_delta_pct'] = (on_mean - off_mean) / off_mean * 100
+            elif abs(on_mean) > 1e-9:
+                row[f'{k}_delta_pct'] = None
             else:
                 row[f'{k}_delta_pct'] = 0.0
         table.append(row)
@@ -129,10 +149,11 @@ def print_table(table):
             on_m  = row[f'{k}_on_mean']
             on_lo, on_hi   = row[f'{k}_on_lo95'], row[f'{k}_on_hi95']
             dp = row[f'{k}_delta_pct']
+            dp_text = 'n/a' if dp is None else f'{dp:+.1f}%'
             print(f"  {lab:<22} "
                   f"{off_m:>8.4f}±({off_lo:.4f},{off_hi:.4f}) "
                   f"{on_m:>8.4f}±({on_lo:.4f},{on_hi:.4f}) "
-                  f"{dp:>+7.1f}%")
+                  f"{dp_text:>7}")
 
 
 def save_csv(table, out_path):
@@ -156,7 +177,7 @@ def save_json(table, out_path):
 def plot_errorbar(table, out_path):
     """每个 metric 一个子图, x 轴三城, error-bar 标 95% CI, off vs on 对比."""
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-    cities = [f"{r['city']}\n{r['district']}\n(n={r['n_seeds']})" for r in table]
+    cities = [place_label(r['city'], r['district'], r['n_seeds']) for r in table]
     x = np.arange(len(cities))
     width = 0.35
 
@@ -171,20 +192,42 @@ def plot_errorbar(table, out_path):
                color='#888', capsize=4, error_kw={'lw': 1, 'capthick': 1})
         ax.bar(x + width/2, on_m,  width, yerr=on_err,  label='graph-on',
                color='#d62728', capsize=4, error_kw={'lw': 1, 'capthick': 1})
+
+        zero_y = max(np.max(off_m), np.max(on_m), 1e-6) * 0.025
+        for xpos, value in zip(x - width/2, off_m):
+            if np.isclose(value, 0.0):
+                ax.scatter([xpos], [0], marker='_', s=240, color='#666666',
+                           linewidths=2.0, clip_on=False, zorder=5)
+                ax.text(xpos, zero_y, '0', ha='center', va='bottom',
+                        fontsize=8, color='#666666')
+        for xpos, value in zip(x + width/2, on_m):
+            if np.isclose(value, 0.0):
+                ax.scatter([xpos], [0], marker='_', s=240, color='#d62728',
+                           linewidths=2.0, clip_on=False, zorder=5)
+                ax.text(xpos, zero_y, '0', ha='center', va='bottom',
+                        fontsize=8, color='#d62728')
         for i, r in enumerate(table):
             dp = r[f'{k}_delta_pct']
+            if abs(off_m[i]) <= 1e-9 and on_m[i] > 1e-9:
+                label = f'0->{on_m[i]:.2f}'
+                label_color = '#1f77b4'
+            else:
+                label = f'{dp:+.1f}%'
+                label_color = '#d62728' if dp > 0 else '#1f77b4'
             ax.text(x[i], max(off_m[i], on_m[i]) * 1.05,
-                    f'{dp:+.1f}%', ha='center', fontsize=9,
-                    color='#d62728' if dp > 0 else '#1f77b4')
+                    label, ha='center', fontsize=9, color=label_color)
         ax.set_xticks(x)
         ax.set_xticklabels(cities, fontsize=9)
         ax.set_title(lab, fontsize=11)
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
 
-    fig.suptitle('F4: 三城 × 多 seed 95% CI (graph-off vs graph-on)', fontsize=13)
+    fig.suptitle('Three-city multi-seed 95% CI (graph-off vs graph-on)', fontsize=13)
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor='white')
+    fig.savefig(out_path, dpi=300, bbox_inches='tight', facecolor='white')
+    base, _ = os.path.splitext(out_path)
+    for ext in ('.pdf', '.svg'):
+        fig.savefig(base + ext, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     print(f'[plot] saved {out_path}')
 
