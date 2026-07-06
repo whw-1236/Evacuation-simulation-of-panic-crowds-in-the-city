@@ -123,14 +123,17 @@ class SwitchParams:
     enable_inquire:    bool = False   # 默认关闭，避免破坏既有 baseline
 
     # ---------------------------------------------------------------
-    # F13 — Mixed Multinomial Logit (MML) discrete-choice formulation
+    # F13 — Multinomial logit (MNL) discrete-choice formulation
+    # NOTE: the `mml_*` field prefix and `use_mml` flag are LEGACY names.
+    # The model evaluated is a fixed-coefficient (conditional) multinomial
+    # logit, NOT a mixed logit — see paper §3.3.2 and reviewer comment C4.
     # ---------------------------------------------------------------
     # Switches sigmoid soft-blend (Eqs. 10-12) to random-utility
     # logit P_k = exp(scale·U_k) / Σ exp(scale·U_j) following
     # McFadden (1973) [REF26], Lovreglio et al. (2014, 2016) [REF27, REF29],
     # Haghani & Sarvi (2016) [REF28]. Four actions = {home, hoard, herd, flee}.
     # Each U_k is linear-in-attributes with an alternative-specific constant (ASC).
-    use_mml:             bool  = True    # 默认 True (MML 主形式); False 为 legacy sigmoid fallback (论文 §5 supplementary)
+    use_mml:             bool  = True    # 默认 True (MNL 主路径; 字段名 `mml` 为历史遗留); False 为 legacy sigmoid fallback (论文 §5 supplementary)
     mml_scale:           float = 1.5     # softmax 反温度 β (大→趋确定; 小→均匀)
 
     # alternative-specific constants (baseline preference, when σ=0 & no covariates)
@@ -465,7 +468,11 @@ def _softmax(scores):
 
 
 def compute_goal_direction_mml(agent, stores, neighbors, p):
-    """F13: Mixed Multinomial Logit discrete-choice formulation.
+    """F13: Multinomial logit (MNL) discrete-choice formulation.
+
+    NOTE: the `mml` prefix in field/function names is legacy; the model
+    evaluated here is a fixed-coefficient (conditional) multinomial logit,
+    not a mixed logit (paper §3.3.2).
 
     Four actions {home, hoard, herd, flee} each have a linear-in-attributes
     utility V_k; choice probabilities follow softmax(scale · V_k) (McFadden
@@ -574,7 +581,7 @@ def compute_goal_direction_mml(agent, stores, neighbors, p):
 
 
 def compute_goal_direction(agent, stores, neighbors, p, info_nodes=None):
-    """Sigmoid soft-blend OR MML logit (dispatched on p.use_mml).
+    """Sigmoid soft-blend OR MNL logit (dispatched on p.use_mml; `mml` name is legacy).
 
     Sigmoid path (default, use_mml=False): Eqs. (10)-(12) sigmoid-weighted
     blend of home / hoard / herd directions + flee hard override (M3+ shelter).
