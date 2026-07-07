@@ -248,3 +248,8 @@ paper_figures/
 zotero_export_refs.bib
 zotero_selected_entries.txt
 zip/
+analysis/
+Reference/
+scripts/
+tests/
+requirements.txt
