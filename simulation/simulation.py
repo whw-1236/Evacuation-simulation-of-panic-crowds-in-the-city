@@ -83,6 +83,7 @@ class BlackoutSimulation:
         # 【M2 新增】路网图开关 & 引用 (默认 False, 由 city_config 显式打开)
         self.use_road_graph = bool(city_config and city_config.get('use_road_graph'))
         self.road_graph = None
+        self.opinion_mode = 'auto'
 
         # ==================== 基础参数 ====================
         self.T = config.simulation.TOTAL_STEPS
@@ -145,6 +146,57 @@ class BlackoutSimulation:
 
         print(f"[OK] 仿真初始化完成: {len(self.residents)}居民, "
               f"{len(self.enterprises)}企业, {len(self.region_manager.regions)}区域")
+
+    @staticmethod
+    def _normalize_opinion_mode(mode):
+        mode = (mode or 'auto').lower()
+        if mode not in {'auto', 'on', 'off'}:
+            raise ValueError(f"Unsupported opinion_mode={mode!r}; expected auto/on/off")
+        return mode
+
+    def set_opinion_mode(self, mode):
+        """Control event-5 public-opinion management without manual-event mode."""
+        self.opinion_mode = self._normalize_opinion_mode(mode)
+
+    def _apply_opinion_mode_override(self):
+        mode = BlackoutSimulation._normalize_opinion_mode(
+            getattr(self, 'opinion_mode', 'auto')
+        )
+        if mode == 'auto':
+            self._update_opinion_audit_state()
+            return
+        active = (mode == 'on')
+        for gov in self.gov_agents.values():
+            gov.public_opinion_active = active
+        self._update_opinion_audit_state()
+
+    def _update_opinion_audit_state(self):
+        govs = list(getattr(self, 'gov_agents', {}).values())
+        active_count = sum(
+            1 for gov in govs
+            if bool(getattr(gov, 'public_opinion_active', False))
+        )
+        self.event5_active_district_count = active_count
+        self.event5_active_district_ratio = active_count / len(govs) if govs else 0.0
+        self.event5_max_opinion_pressure = max(
+            (float(getattr(gov, 'last_opinion_pressure', 0.0)) for gov in govs),
+            default=0.0,
+        )
+        self.event5_max_threshold_margin = max(
+            (float(getattr(gov, 'last_opinion_threshold_margin', 0.0)) for gov in govs),
+            default=0.0,
+        )
+
+    def _update_opinion_resident_audit_state(self):
+        residents = list(getattr(self, 'residents', []))
+        active_count = sum(
+            1 for r in residents
+            if bool(getattr(r, '_opinion_management_active', False))
+        )
+        self.event5_active_resident_count = active_count
+        self.event5_active_resident_ratio = (
+            active_count / len(residents) if residents else 0.0
+        )
 
     def _init_agents(self):
         """初始化所有Agent"""
@@ -2108,9 +2160,18 @@ class BlackoutSimulation:
             d_panic = {z: region_panic_levels.get(z, 0) for z in d_zones}
             d_C = C_total / n_districts if n_districts > 0 else 0
 
+            opinion_emotion_impact = max(0, (d_avg_emo - 0.3) * 2)
+            opinion_max_panic = max(d_panic.values()) if d_panic else 0
+            opinion_pressure = opinion_emotion_impact * 0.5 + opinion_max_panic * 0.5
+            gov.last_opinion_pressure = float(opinion_pressure)
+            gov.last_opinion_threshold_margin = float(
+                opinion_pressure - getattr(gov, 'opinion_threshold', 0.0)
+            )
+
             inf = gov.decide(d_loss, d_avg_emo, d_Q, d_C, d_panic, d_outage_ratio)
             district_gov_influence[district] = inf
             total_gov_influence += inf
+        self._apply_opinion_mode_override()
 
         # 电网决策（电网仍是全局共享资源）
         R = self.grid.decide_recovery(total_gov_influence, outage_ratio, P, region_panic_levels)
@@ -2228,6 +2289,8 @@ class BlackoutSimulation:
             # 这里只更新情绪、SEIR状态等
             r.step(self.dt, None, gov_resource_for_resident, region_panic, hazard_positions)
 
+        self._update_opinion_resident_audit_state()
+
         # Agent调整 —— 各区政府独立调整
         for district, gov in self.gov_agents.items():
             d_zones = self.district_to_zones.get(district, [])
@@ -2276,6 +2339,8 @@ class BlackoutSimulation:
         # 10. 计算并应用事件影响
         event_effects = self.event_influence.calculate_all_effects(self, self.dt)
         self.event_influence.apply_effects(self, event_effects, self.dt)
+        self.last_event_effects = event_effects
+        self.last_event_summary = event_effects.get('summary', {})
 
         # 保存事件影响统计（可选，用于分析）
         if not hasattr(self, 'event_effects_hist'):
