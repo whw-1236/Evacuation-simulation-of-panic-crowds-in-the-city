@@ -226,8 +226,7 @@ trace_output_ui/
 # Project-specific generated data
 road_graph_cache/
 cache/
-simulation map data/沈阳市/
-simulation map data/北京市/
+simulation map data/
 
 # 临时调试输出 (2026-06-26 加: aggregate 重定向 / matplotlib smoke test 残留)
 # 注: 项目代码 `_compare_cities.py` / `_t*_*.py` 是 .py, 不会被以下 .txt/.png/.err 模式误伤
@@ -253,3 +252,5 @@ Reference/
 scripts/
 tests/
 requirements.txt
+ui/
+test/
