@@ -18,6 +18,7 @@ import os
 import sys
 import csv
 import io
+import random
 import traceback
 from collections import defaultdict
 from datetime import datetime
@@ -59,11 +60,21 @@ from simulation.simulation import BlackoutSimulation
 OUT_PNG_DIR = os.path.join(_PROJECT_DIR, 'output_png')
 OUT_GIF_DIR = os.path.join(_PROJECT_DIR, 'output_gif')
 OUT_TRACE_DIR = os.path.join(_PROJECT_DIR, 'trace_output_ui')
+ALL_GOV_DISTRICTS = '__all__'
+ALL_CITY_DISTRICTS = '__city_all__'
 
 
 def _ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _load_outage_causes():
+    """Read outage causes for UI dropdowns; keep a small fallback for startup robustness."""
+    try:
+        return Config().load_priority.OUTAGE_CAUSES
+    except Exception:
+        return {'equipment_failure': {'name': '设备故障'}}
 
 
 # ============================================================
@@ -293,6 +304,39 @@ class SimulationWorker(QThread):
 
     def _collect_metrics(self):
         s = self.sim
+        govs = list(getattr(s, 'gov_agents', {}).values())
+        gov_events = {
+            'warning': sum(1 for g in govs if getattr(g, 'emergency_warning_issued', False)),
+            'resource_grid': sum(1 for g in govs if getattr(g, 'resource_to_grid', False)),
+            'resource_enterprise': sum(1 for g in govs if getattr(g, 'resource_to_enterprise', False)),
+            'resource_resident': sum(1 for g in govs if getattr(g, 'resource_to_resident', False)),
+            'opinion': sum(1 for g in govs if getattr(g, 'public_opinion_active', False)),
+            'district_total': len(govs),
+        }
+        try:
+            raw_event_stats = s.get_event_statistics()
+        except Exception:
+            raw_event_stats = {}
+        event_stats = {
+            'total': int(raw_event_stats.get('total_events', 0) or 0),
+            'active': int(raw_event_stats.get('active_events', 0) or 0),
+            'completed': int(raw_event_stats.get('completed_events', 0) or 0),
+        }
+        cause_values = list((getattr(s, 'zone_outage_cause', {}) or {}).values())
+        dominant_cause = ''
+        if cause_values:
+            dominant_cause = max(set(cause_values), key=cause_values.count)
+        outage_command = getattr(s, 'last_ui_outage_command', {}) or {}
+        outage_mode = (
+            outage_command.get('mode') or
+            getattr(s, 'district_outage_mode', '') or
+            ''
+        )
+        outage_cause = (
+            outage_command.get('cause') or
+            getattr(s, 'district_outage_cause', '') or
+            dominant_cause
+        )
         return {
             'step': s.step_count,
             't_hour': getattr(s, 'current_hour', 0.0),
@@ -309,6 +353,15 @@ class SimulationWorker(QThread):
             'R': self.R_hist[-1],
             'seir': {st: self.seir_hist[st][-1] for st in 'SEIR'},
             'history_len': len(self.opinion_hist),
+            'outage_mode': outage_mode,
+            'outage_cause': outage_cause,
+            'outage_severity': float(outage_command.get('severity_ratio', 0.0) or 0.0),
+            'outage_scope': outage_command.get('scope', ''),
+            'gov_events': gov_events,
+            'event_stats': event_stats,
+            'event5_district_ratio': float(getattr(s, 'event5_active_district_ratio', 0.0)),
+            'event5_resident_ratio': float(getattr(s, 'event5_active_resident_ratio', 0.0)),
+            'last_event_summary': getattr(s, 'last_event_summary', {}) or {},
         }
 
     def stop(self):
@@ -671,6 +724,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel('未启动 — 选好城市/区/MML/graph 后按 ▶ 启动')
         self.status_bar.addWidget(self.status_label)
+        self.event_status_label = QLabel('事件: 未启动')
+        self.status_bar.addPermanentWidget(self.event_status_label)
 
         self.worker = None
         self.sim_ref = None
@@ -745,9 +800,13 @@ class MainWindow(QMainWindow):
         self.btn_record_data.setCheckable(True)
         self.btn_record_data.setToolTip('点击开始录制每步数据, 再点结束保存 CSV 到 trace_output_ui/')
         self.btn_record_data.clicked.connect(self.act_toggle_record_data)
+        self.btn_save_events = QPushButton('🧾 导出事件')
+        self.btn_save_events.setToolTip('导出当前事件序列到 trace_output_ui/events_*.csv，不关闭进行中事件')
+        self.btn_save_events.clicked.connect(self.act_export_events)
         bar.addWidget(self.btn_save_charts)
         bar.addWidget(self.btn_record_gif)
         bar.addWidget(self.btn_record_data)
+        bar.addWidget(self.btn_save_events)
         return bar
 
     # ============== 决策栏 ==============
@@ -779,9 +838,29 @@ class MainWindow(QMainWindow):
             container.setLayout(row)
             return container, lbl, sl
 
+        self._gov_city_districts = self._scan_map_city_districts()
+        self._district_to_city = {
+            district: city
+            for city, districts in self._gov_city_districts.items()
+            for district in districts
+        }
+
         # 政府 Agent
-        gb_gov = QGroupBox('政府 Agent (按区独立)')
+        gb_gov = QGroupBox('政府 Agent (按区独立/可选范围)')
         gov_layout = QVBoxLayout(gb_gov)
+
+        gov_scope_row = QHBoxLayout()
+        gov_scope_row.addWidget(QLabel('控制城市:'))
+        self.combo_gov_city = QComboBox()
+        self.combo_gov_city.setToolTip('选择政府干预作用城市；全部区县表示当前仿真已加载的全部区县')
+        self.combo_gov_city.currentIndexChanged.connect(self._on_gov_city_changed)
+        gov_scope_row.addWidget(self.combo_gov_city)
+        gov_scope_row.addWidget(QLabel('区县:'))
+        self.combo_gov_district = QComboBox()
+        self.combo_gov_district.setToolTip('选择政府干预作用区县；城市全部区县表示该城市当前已加载的区县')
+        self.combo_gov_district.currentIndexChanged.connect(self._refresh_gov_controls_from_selection)
+        gov_scope_row.addWidget(self.combo_gov_district)
+        gov_layout.addLayout(gov_scope_row)
 
         cont, self.lbl_resource, self.slider_resource = mkslider(
             '政府资源倍数', 0, 200, 1.00, 100,
@@ -806,6 +885,52 @@ class MainWindow(QMainWindow):
             gov_btn_row.addWidget(b)
         gov_layout.addLayout(gov_btn_row)
         bar.addWidget(gb_gov, stretch=3)
+
+        # 区县停电控制
+        gb_district_outage = QGroupBox('区县停电控制')
+        district_outage_layout = QVBoxLayout(gb_district_outage)
+
+        outage_scope_row = QHBoxLayout()
+        outage_scope_row.addWidget(QLabel('控制城市:'))
+        self.combo_outage_city = QComboBox()
+        self.combo_outage_city.setToolTip('选择停电影响城市；全部区县表示当前仿真已加载的全部区县')
+        self.combo_outage_city.currentIndexChanged.connect(self._on_outage_city_changed)
+        outage_scope_row.addWidget(self.combo_outage_city)
+        outage_scope_row.addWidget(QLabel('区县:'))
+        self.combo_outage_district = QComboBox()
+        self.combo_outage_district.setToolTip('选择停电影响区县；城市全部区县表示该城市当前已加载的区县')
+        outage_scope_row.addWidget(self.combo_outage_district)
+        district_outage_layout.addLayout(outage_scope_row)
+
+        district_mode_row = QHBoxLayout()
+        district_mode_row.addWidget(QLabel('停电模式:'))
+        self.combo_district_outage_mode = QComboBox()
+        self.combo_district_outage_mode.addItem('全停', 'full')
+        self.combo_district_outage_mode.addItem('部分停电', 'partial')
+        self.combo_district_outage_mode.currentIndexChanged.connect(self._on_district_outage_mode_changed)
+        district_mode_row.addWidget(self.combo_district_outage_mode)
+        district_mode_row.addWidget(QLabel('原因:'))
+        self.combo_district_outage_cause = QComboBox()
+        self._add_outage_causes(self.combo_district_outage_cause)
+        district_mode_row.addWidget(self.combo_district_outage_cause)
+        district_outage_layout.addLayout(district_mode_row)
+
+        cont, self.lbl_district_severity, self.slider_district_severity = mkslider(
+            '区县切负荷比例', 0, 100, 50, 1,
+            on_change=lambda v, lbl, fmt: lbl.setText('区县切负荷比例: ' + fmt.format(v) + '%'),
+            on_release=lambda: None,
+            fmt='{:.0f}',
+        )
+        self.slider_district_severity.setEnabled(False)
+        district_outage_layout.addWidget(cont)
+
+        self.btn_district_outage = mkbtn(
+            '⚡ 触发所选区县停电',
+            self.act_trigger_selected_outage,
+            tooltip='按所选城市/区县、模式、原因和严重度触发行政区停电情景'
+        )
+        district_outage_layout.addWidget(self.btn_district_outage)
+        bar.addWidget(gb_district_outage, stretch=3)
 
         # 电网 Agent
         gb_grid = QGroupBox('电网 Agent (全市1个)')
@@ -866,22 +991,40 @@ class MainWindow(QMainWindow):
         mode_row.addWidget(self.btn_mode_partial)
         glob_layout.addLayout(mode_row)
 
+        cause_row = QHBoxLayout()
+        cause_row.addWidget(QLabel('停电原因:'))
+        self.combo_outage_cause = QComboBox()
+        self.combo_outage_cause.setToolTip('全局压力测试触发停电时写入模型的 outage cause')
+        self._add_outage_causes(self.combo_outage_cause)
+        cause_row.addWidget(self.combo_outage_cause)
+        glob_layout.addLayout(cause_row)
+
+        cont, self.lbl_global_impact, self.slider_global_impact = mkslider(
+            '影响区域比例', 1, 100, 50, 1,
+            on_change=lambda v, lbl, fmt: lbl.setText('影响区域比例: ' + fmt.format(v) + '%'),
+            on_release=lambda: None,
+            fmt='{:.0f}',
+        )
+        glob_layout.addWidget(cont)
+
         cont, self.lbl_severity, self.slider_severity = mkslider(
             '切负荷比例', 0, 100, 50, 1,
             on_change=lambda v, lbl, fmt: lbl.setText('切负荷比例: ' + fmt.format(v) + '%'),
             on_release=lambda: None,
             fmt='{:.0f}',
         )
+        self.slider_severity.setEnabled(False)
         glob_layout.addWidget(cont)
 
-        self.btn_outage = mkbtn('⚡ 触发停电 (一半区域)', self.act_trigger_outage,
-                                tooltip='按上方模式+切负荷比例, 让一半行政区停电')
+        self.btn_outage = mkbtn('⚡ 触发全局停电', self.act_trigger_outage,
+                                tooltip='按原因、影响区域比例、模式和切负荷比例触发快速压力测试')
         self.btn_restore = mkbtn('💡 全城恢复供电', self.act_restore_power,
                                  tooltip='强制所有区域恢复供电')
         glob_layout.addWidget(self.btn_outage)
         glob_layout.addWidget(self.btn_restore)
         glob_layout.addStretch()
         bar.addWidget(gb_global, stretch=1)
+        self._populate_scope_controls()
         return bar
 
     def _set_outage_mode(self, mode):
@@ -889,6 +1032,145 @@ class MainWindow(QMainWindow):
         self.btn_mode_full.setChecked(mode == 'full')
         self.btn_mode_partial.setChecked(mode == 'partial')
         self.slider_severity.setEnabled(mode == 'partial')
+
+    def _on_district_outage_mode_changed(self, *_):
+        mode = self.combo_district_outage_mode.currentData() or 'full'
+        self.slider_district_severity.setEnabled(mode == 'partial')
+
+    def _add_outage_causes(self, combo):
+        combo.clear()
+        for cause_key, cause_cfg in _load_outage_causes().items():
+            combo.addItem(cause_cfg.get('name', cause_key), cause_key)
+
+    def _scan_map_city_districts(self):
+        cm = CityManager(map_data_dir=_resolve_map_dir())
+        city_map = {}
+        for city in cm.get_available_cities():
+            districts = cm.get_districts(city)
+            if districts:
+                city_map[city] = districts
+        return city_map
+
+    def _populate_scope_controls(self):
+        current_gov_city = self.combo_gov_city.currentData()
+        current_gov_district = self.combo_gov_district.currentData()
+        current_outage_city = self.combo_outage_city.currentData()
+        current_outage_district = self.combo_outage_district.currentData()
+
+        self._gov_city_districts = self._scan_map_city_districts()
+        self._district_to_city = {
+            district: city
+            for city, districts in self._gov_city_districts.items()
+            for district in districts
+        }
+
+        self._populate_city_combo(self.combo_gov_city, current_gov_city)
+        self._populate_district_combo_for_city(
+            self.combo_gov_city, self.combo_gov_district, current_gov_district)
+        self._populate_city_combo(self.combo_outage_city, current_outage_city)
+        self._populate_district_combo_for_city(
+            self.combo_outage_city, self.combo_outage_district, current_outage_district)
+        self._refresh_gov_controls_from_selection()
+
+    def _populate_city_combo(self, combo, preferred=None):
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem('全部区县', ALL_GOV_DISTRICTS)
+        for city in self._gov_city_districts.keys():
+            combo.addItem(city, city)
+        idx = combo.findData(preferred)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    def _populate_district_combo_for_city(self, city_combo, district_combo, preferred=None):
+        city = city_combo.currentData() if city_combo is not None else ALL_GOV_DISTRICTS
+        district_combo.blockSignals(True)
+        district_combo.clear()
+        if city in (None, ALL_GOV_DISTRICTS):
+            district_combo.addItem('全部区县', ALL_GOV_DISTRICTS)
+            district_combo.setEnabled(False)
+        else:
+            district_combo.addItem(f'{city}全部区县', ALL_CITY_DISTRICTS)
+            for district in self._gov_city_districts.get(city, []):
+                district_combo.addItem(district, district)
+            district_combo.setEnabled(True)
+        idx = district_combo.findData(preferred)
+        district_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        district_combo.blockSignals(False)
+
+    def _on_gov_city_changed(self, *_):
+        self._populate_district_combo_for_city(self.combo_gov_city, self.combo_gov_district)
+        self._refresh_gov_controls_from_selection()
+
+    def _on_outage_city_changed(self, *_):
+        self._populate_district_combo_for_city(self.combo_outage_city, self.combo_outage_district)
+
+    def _selected_targets_for_scope(self, sim, city_combo, district_combo):
+        if sim is None or not hasattr(sim, 'gov_agents'):
+            return []
+        city = city_combo.currentData() if city_combo is not None else ALL_GOV_DISTRICTS
+        district = district_combo.currentData() if district_combo is not None else ALL_GOV_DISTRICTS
+        if city in (None, ALL_GOV_DISTRICTS):
+            return list(sim.gov_agents.keys())
+        if district in (None, ALL_CITY_DISTRICTS):
+            city_districts = set(self._gov_city_districts.get(city, []))
+            return [d for d in sim.gov_agents.keys() if d in city_districts]
+        return [district] if district in sim.gov_agents else []
+
+    def _selected_gov_targets(self, sim=None):
+        return self._selected_targets_for_scope(
+            sim or getattr(self, 'sim_ref', None), self.combo_gov_city, self.combo_gov_district)
+
+    def _selected_outage_targets(self, sim=None):
+        return self._selected_targets_for_scope(
+            sim or getattr(self, 'sim_ref', None), self.combo_outage_city, self.combo_outage_district)
+
+    def _selected_scope_text(self, city_combo, district_combo):
+        city_text = city_combo.currentText() if city_combo is not None else '全部区县'
+        if district_combo is None or not district_combo.isEnabled():
+            return city_text
+        district_text = district_combo.currentText()
+        if district_combo.currentData() == ALL_CITY_DISTRICTS:
+            return district_text
+        return f'{city_text}-{district_text}'
+
+    def _selected_gov_scope_text(self):
+        return self._selected_scope_text(self.combo_gov_city, self.combo_gov_district)
+
+    def _selected_outage_scope_text(self):
+        return self._selected_scope_text(self.combo_outage_city, self.combo_outage_district)
+
+    def _refresh_gov_controls_from_selection(self, *_):
+        sim = getattr(self, 'sim_ref', None)
+        if sim is None or not hasattr(sim, 'gov_agents'):
+            return
+        targets = self._selected_gov_targets(sim)
+        govs = [sim.gov_agents[d] for d in targets if d in sim.gov_agents]
+        if not govs:
+            return
+
+        for attr, btn in [
+            ('manual_emergency_warning', self.btn_warning),
+            ('manual_resource_to_grid', self.btn_res_grid),
+            ('manual_resource_to_enterprise', self.btn_res_enterprise),
+            ('manual_resource_to_resident', self.btn_res_resident),
+            ('manual_public_opinion', self.btn_info),
+        ]:
+            btn.setChecked(all(bool(getattr(g, attr, False)) for g in govs))
+
+        mults = []
+        for district in targets:
+            gov = sim.gov_agents.get(district)
+            base = getattr(self, '_gov_base', {}).get(district, {})
+            base_cap = float(base.get('base_resource_capacity', 100.0) or 100.0)
+            if gov is not None and base_cap > 0:
+                mults.append(float(getattr(gov, 'base_resource_capacity', base_cap)) / base_cap)
+        if mults:
+            mult = max(0.0, min(2.0, sum(mults) / len(mults)))
+            self.slider_resource.blockSignals(True)
+            self.slider_resource.setValue(int(round(mult * 100)))
+            self.slider_resource.blockSignals(False)
+            self.lbl_resource.setText(f'政府资源倍数: {mult:.2f}x')
 
     # ============== 仿真控制 ==============
     def start_sim(self):
@@ -932,7 +1214,11 @@ class MainWindow(QMainWindow):
     def on_init_done(self, sim):
         self.sim_ref = sim
         self._gov_base = {
-            d: {'initiative': g.initiative, 'response': g.response}
+            d: {
+                'initiative': g.initiative,
+                'response': g.response,
+                'base_resource_capacity': getattr(g, 'base_resource_capacity', 100.0),
+            }
             for d, g in sim.gov_agents.items()
         }
         self._grid_base = {
@@ -941,6 +1227,7 @@ class MainWindow(QMainWindow):
             'lambda_prop': getattr(sim.grid, 'lambda_prop', 0.1),
             'base_resource_capacity': getattr(sim.grid, 'base_resource_capacity', 50.0),
         }
+        self._populate_scope_controls()
         self.map_panel.init_map(sim)
         self.status_label.setText('运行中')
 
@@ -987,6 +1274,21 @@ class MainWindow(QMainWindow):
             f"舆情={m['P']:.2f} | σ={m['stress']:.2f} | 恐慌={m['panic']:.2f} | "
             f"flee={m['flee_ratio']:.2f} | herd={m['herd_ratio']:.2f} | "
             f"zone停电={m['blackout']:.0%}{district_str} | {seir_str}{rec_str}"
+        )
+        gov = m.get('gov_events', {})
+        ev = m.get('event_stats', {})
+        summary = m.get('last_event_summary', {}) or {}
+        denom = max(1, int(gov.get('district_total', 0) or 0))
+        self.event_status_label.setText(
+            f"政府事件: 预警{gov.get('warning', 0)}/{denom} "
+            f"居民资源{gov.get('resource_resident', 0)}/{denom} "
+            f"舆情{gov.get('opinion', 0)}/{denom} | "
+            f"event5区={m.get('event5_district_ratio', 0.0):.0%} "
+            f"居民={m.get('event5_resident_ratio', 0.0):.0%} | "
+            f"事件 active/total={ev.get('active', 0)}/{ev.get('total', 0)} | "
+            f"summary ΔE={summary.get('total_emotion_change', 0.0):+.2f} "
+            f"Δpanic={summary.get('total_panic_change', 0.0):+.2f} "
+            f"repair+={summary.get('total_repair_boost', 0.0):.2f}"
         )
 
     # ============== 保存 / 录制 ==============
@@ -1083,11 +1385,21 @@ class MainWindow(QMainWindow):
                                 'stress', 'panic', 'flee_ratio', 'herd_ratio',
                                 'recovery_rate', 'blackout_ratio',
                                 'gov_R_deploy',
-                                'seir_S', 'seir_E', 'seir_I', 'seir_R'])
+                                'seir_S', 'seir_E', 'seir_I', 'seir_R',
+                                'outage_mode', 'outage_cause',
+                                'outage_severity', 'outage_scope',
+                                'gov_warning_active', 'gov_resource_grid_active',
+                                'gov_resource_enterprise_active',
+                                'gov_resource_resident_active',
+                                'gov_opinion_active',
+                                'event_total', 'event_active',
+                                'event5_district_ratio', 'event5_resident_ratio'])
                     for r in self._data_records:
                         seir = r.get('seir', {})
                         raw_e = r.get('emotion_raw', r.get('emotion', 0.0))
                         disp_e = r.get('emotion_display', r.get('emotion', 0.0))
+                        gov = r.get('gov_events', {})
+                        ev = r.get('event_stats', {})
                         w.writerow([
                             r['step'], f"{r['t_hour']:.2f}",
                             f"{r['P']:.4f}",
@@ -1098,6 +1410,19 @@ class MainWindow(QMainWindow):
                             f"{r['R']:.4f}",
                             f"{seir.get('S', 0):.4f}", f"{seir.get('E', 0):.4f}",
                             f"{seir.get('I', 0):.4f}", f"{seir.get('R', 0):.4f}",
+                            r.get('outage_mode', ''),
+                            r.get('outage_cause', ''),
+                            f"{r.get('outage_severity', 0.0):.4f}",
+                            r.get('outage_scope', ''),
+                            gov.get('warning', 0),
+                            gov.get('resource_grid', 0),
+                            gov.get('resource_enterprise', 0),
+                            gov.get('resource_resident', 0),
+                            gov.get('opinion', 0),
+                            ev.get('total', 0),
+                            ev.get('active', 0),
+                            f"{r.get('event5_district_ratio', 0.0):.4f}",
+                            f"{r.get('event5_resident_ratio', 0.0):.4f}",
                         ])
                 self.status_label.setText(f'数据已保存({len(self._data_records)}行) → {csv_path}')
                 print(f'[save_data] {csv_path} ({len(self._data_records)} 行)')
@@ -1106,29 +1431,129 @@ class MainWindow(QMainWindow):
                 traceback.print_exc()
             self._data_records = []
 
+    def act_export_events(self):
+        if self.sim_ref is None:
+            self.status_label.setText('未启动, 无事件可导出')
+            return
+        _ensure_dir(OUT_TRACE_DIR)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        step = getattr(self.sim_ref, 'step_count', 0)
+        csv_path = os.path.join(OUT_TRACE_DIR, f'events_step{step:05d}_{ts}.csv')
+        try:
+            count = self.sim_ref.export_events_to_csv_with_names(csv_path, finalize=False)
+            self.status_label.setText(f'事件已导出({count}条) → {csv_path}')
+            print(f'[save_events] {csv_path} ({count} 条)')
+        except Exception as e:
+            self.status_label.setText(f'事件导出失败: {e}')
+            traceback.print_exc()
+
     # ============== 决策动作 ==============
     def _mark(self, label=''):
         if self.worker is not None:
             self.chart_panel.mark_intervention(len(self.worker.opinion_hist), label)
 
+    def _record_outage_command(self, sim, scope, mode, cause, severity, **extra):
+        payload = {
+            'scope': scope,
+            'mode': mode,
+            'cause': cause,
+            'severity_ratio': float(severity),
+            'step': getattr(sim, 'step_count', 0),
+        }
+        payload.update(extra)
+        sim.last_ui_outage_command = payload
+
+    def _group_zones_by_district(self, sim, zones):
+        grouped = defaultdict(list)
+        fallback = next(iter(getattr(sim, 'gov_agents', {}).keys()), None)
+        for zone_id in zones:
+            district = getattr(sim, 'zone_to_district', {}).get(zone_id) or fallback
+            if district:
+                grouped[district].append(zone_id)
+        return grouped
+
+    def act_trigger_selected_outage(self):
+        if self.worker is None or self.sim_ref is None:
+            return
+        targets = self._selected_outage_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的区县')
+            return
+        mode = self.combo_district_outage_mode.currentData() or 'full'
+        cause = self.combo_district_outage_cause.currentData() or 'equipment_failure'
+        severity = self.slider_district_severity.value() / 100.0
+        scope = self._selected_outage_scope_text()
+        configs = {
+            district: {
+                'enabled': True,
+                'mode': mode,
+                'cause': cause,
+                'severity_ratio': severity,
+                'use_all_zones': True,
+            }
+            for district in targets
+        }
+
+        def _do(sim):
+            sim.trigger_independent_district_outages(configs)
+            self._record_outage_command(
+                sim, scope, mode, cause, severity,
+                command='district_outage', targets=','.join(targets))
+
+        self.worker.queue_action(_do)
+        cause_label = self.combo_district_outage_cause.currentText()
+        tag = f'{scope} 停电 {mode}/{cause_label}'
+        if mode == 'partial':
+            tag += f' {int(severity * 100)}%'
+        self._mark(tag)
+
     def act_trigger_outage(self):
         if self.worker is None:
             return
         mode = getattr(self, '_outage_mode', 'full')
+        cause = self.combo_outage_cause.currentData() or 'equipment_failure'
         severity = self.slider_severity.value() / 100.0
+        impact_ratio = self.slider_global_impact.value() / 100.0
 
         def _do(sim):
-            zones = list(sim.zone_status.keys())
-            if not zones:
+            partial_zones = set(getattr(sim, 'partial_outage_entities', {}).keys())
+            caused_zones = set((getattr(sim, 'zone_outage_cause', {}) or {}).keys())
+            available_zones = [
+                z for z, powered in sim.zone_status.items()
+                if powered and z not in partial_zones and z not in caused_zones
+            ]
+            if not available_zones:
+                self._record_outage_command(
+                    sim, 'global', mode, cause, severity,
+                    command='global_outage', impact_ratio=impact_ratio, target_count=0)
                 return
-            half = max(1, len(zones) // 2)
-            sim.trigger_outage(zones[:half], mode=mode,
-                               cause='equipment_failure',
-                               severity_ratio=severity)
+            target_count = max(1, int(np.ceil(len(available_zones) * impact_ratio)))
+            target_count = min(target_count, len(available_zones))
+            selected_zones = random.sample(available_zones, target_count)
+            grouped = self._group_zones_by_district(sim, selected_zones)
+            configs = {
+                district: {
+                    'enabled': True,
+                    'mode': mode,
+                    'cause': cause,
+                    'severity_ratio': severity,
+                    'use_all_zones': False,
+                    'selected_zones': zones,
+                }
+                for district, zones in grouped.items()
+            }
+            sim.trigger_independent_district_outages(configs)
+            self._record_outage_command(
+                sim, 'global', mode, cause, severity,
+                command='global_outage',
+                impact_ratio=impact_ratio,
+                target_count=target_count)
+
         self.worker.queue_action(_do)
-        tag = f'停电 {mode}'
+        cause_label = self.combo_outage_cause.currentText()
+        tag = f'全局停电 {mode}/{cause_label} 影响{int(impact_ratio * 100)}%'
         if mode == 'partial':
-            tag += f' {int(severity * 100)}%'
+            tag += f' 切负荷{int(severity * 100)}%'
         self._mark(tag)
 
     def act_restore_power(self):
@@ -1150,6 +1575,19 @@ class MainWindow(QMainWindow):
                 sim.district_repair_started = False
             if hasattr(sim, 'district_repair_progress'):
                 sim.district_repair_progress = 0.0
+            if hasattr(sim, 'partial_outage_entities'):
+                sim.partial_outage_entities.clear()
+            for r in getattr(sim, 'residents', []):
+                r.powered = True
+                r._is_load_shed = False
+            for e in getattr(sim, 'enterprises', []):
+                e.powered = True
+                e._is_load_shed = False
+            for node in getattr(sim, 'csv_nodes', []):
+                node['powered'] = True
+                node['outage_duration'] = 0
+            self._record_outage_command(
+                sim, 'restore', 'restore', '', 0.0, command='restore_power')
         self.worker.queue_action(_do)
         self._mark('恢复')
 
@@ -1158,62 +1596,69 @@ class MainWindow(QMainWindow):
             return
         mult = self.slider_resource.value() / 100.0
         gov_base = getattr(self, '_gov_base', {})
-
-        if mult > 1.05:
-            target = True
-        elif mult < 0.95:
-            target = False
-        else:
-            target = None
-        if target is not None:
-            for btn in [self.btn_warning, self.btn_res_grid, self.btn_res_enterprise,
-                        self.btn_res_resident, self.btn_info]:
-                btn.setChecked(target)
+        targets = self._selected_gov_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的政府 Agent')
+            return
 
         def _do(sim):
-            for d, gov in sim.gov_agents.items():
-                base = gov_base.get(d, {'initiative': 0.5, 'response': 1.0})
+            for d in targets:
+                gov = sim.gov_agents.get(d)
+                if gov is None:
+                    continue
+                base = gov_base.get(d, {
+                    'initiative': 0.5,
+                    'response': 1.0,
+                    'base_resource_capacity': 100.0,
+                })
                 gov.initiative = max(0.0, min(1.0, base['initiative'] * mult))
                 gov.response = max(0.0, min(2.0, base['response'] * mult))
-                if target is True:
-                    gov.manual_emergency_warning = True
-                    gov.manual_resource_to_grid = True
-                    gov.manual_resource_to_enterprise = True
-                    gov.manual_resource_to_resident = True
-                    gov.manual_public_opinion = True
-                elif target is False:
-                    gov.manual_emergency_warning = False
-                    gov.manual_resource_to_grid = False
-                    gov.manual_resource_to_enterprise = False
-                    gov.manual_resource_to_resident = False
-                    gov.manual_public_opinion = False
+                base_cap = float(base.get('base_resource_capacity', 100.0) or 100.0)
+                gov.base_resource_capacity = max(0.0, min(200.0, base_cap * mult))
+                gov.current_resource_level = gov.base_resource_capacity
                 gov.use_manual_events = self._any_gov_manual_on(gov)
         self.worker.queue_action(_do)
-        self._mark(f'资源 ×{mult:.2f}')
+        self._mark(f'{self._selected_gov_scope_text()} 资源×{mult:.2f}')
 
     def act_toggle_info(self):
         if self.worker is None:
             return
         on = self.btn_info.isChecked()
+        targets = self._selected_gov_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的政府 Agent')
+            return
 
         def _do(sim):
-            for gov in sim.gov_agents.values():
+            for d in targets:
+                gov = sim.gov_agents.get(d)
+                if gov is None:
+                    continue
                 gov.manual_public_opinion = on
                 gov.use_manual_events = self._any_gov_manual_on(gov)
         self.worker.queue_action(_do)
-        self._mark('舆情管理 ON' if on else '舆情管理 OFF')
+        scope = self._selected_gov_scope_text()
+        self._mark(f'{scope} 舆情管理 ON' if on else f'{scope} 舆情管理 OFF')
 
     def act_toggle_warning(self):
         if self.worker is None:
             return
         on = self.btn_warning.isChecked()
+        targets = self._selected_gov_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的政府 Agent')
+            return
 
         def _do(sim):
-            for gov in sim.gov_agents.values():
+            for d in targets:
+                gov = sim.gov_agents.get(d)
+                if gov is None:
+                    continue
                 gov.manual_emergency_warning = on
                 gov.use_manual_events = self._any_gov_manual_on(gov)
         self.worker.queue_action(_do)
-        self._mark('应急预警 ON' if on else '应急预警 OFF')
+        scope = self._selected_gov_scope_text()
+        self._mark(f'{scope} 应急预警 ON' if on else f'{scope} 应急预警 OFF')
 
     def _any_gov_manual_on(self, gov):
         return any([gov.manual_emergency_warning, gov.manual_resource_to_grid,
@@ -1224,37 +1669,61 @@ class MainWindow(QMainWindow):
         if self.worker is None:
             return
         on = self.btn_res_grid.isChecked()
+        targets = self._selected_gov_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的政府 Agent')
+            return
 
         def _do(sim):
-            for gov in sim.gov_agents.values():
+            for d in targets:
+                gov = sim.gov_agents.get(d)
+                if gov is None:
+                    continue
                 gov.manual_resource_to_grid = on
                 gov.use_manual_events = self._any_gov_manual_on(gov)
         self.worker.queue_action(_do)
-        self._mark('资源→电网 ON' if on else '资源→电网 OFF')
+        scope = self._selected_gov_scope_text()
+        self._mark(f'{scope} 资源→电网 ON' if on else f'{scope} 资源→电网 OFF')
 
     def act_toggle_resource_enterprise(self):
         if self.worker is None:
             return
         on = self.btn_res_enterprise.isChecked()
+        targets = self._selected_gov_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的政府 Agent')
+            return
 
         def _do(sim):
-            for gov in sim.gov_agents.values():
+            for d in targets:
+                gov = sim.gov_agents.get(d)
+                if gov is None:
+                    continue
                 gov.manual_resource_to_enterprise = on
                 gov.use_manual_events = self._any_gov_manual_on(gov)
         self.worker.queue_action(_do)
-        self._mark('资源→企业 ON' if on else '资源→企业 OFF')
+        scope = self._selected_gov_scope_text()
+        self._mark(f'{scope} 资源→企业 ON' if on else f'{scope} 资源→企业 OFF')
 
     def act_toggle_resource_resident(self):
         if self.worker is None:
             return
         on = self.btn_res_resident.isChecked()
+        targets = self._selected_gov_targets(self.sim_ref)
+        if not targets:
+            self.status_label.setText('未选中当前仿真已加载的政府 Agent')
+            return
 
         def _do(sim):
-            for gov in sim.gov_agents.values():
+            for d in targets:
+                gov = sim.gov_agents.get(d)
+                if gov is None:
+                    continue
                 gov.manual_resource_to_resident = on
                 gov.use_manual_events = self._any_gov_manual_on(gov)
         self.worker.queue_action(_do)
-        self._mark('资源→居民 ON' if on else '资源→居民 OFF')
+        scope = self._selected_gov_scope_text()
+        self._mark(f'{scope} 资源→居民 ON' if on else f'{scope} 资源→居民 OFF')
 
     def act_apply_grid_params(self):
         if self.worker is None or self.sim_ref is None:

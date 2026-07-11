@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
-"""T26 验证：flee 行为正确触发, target_node 覆盖为最近 shelter。"""
+"""T26 smoke checks: flee behavior and shelter target routing."""
+from pathlib import Path
 import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 try:
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
 from core.agents import ResidentAgent
-from core.behavior_switching import compute_goal_direction, SwitchParams, init_store_state
+from core.behavior_switching import SwitchParams, compute_goal_direction, init_store_state
 
 
 def _make(stress, has_shelter=True):
@@ -27,47 +33,52 @@ def _make(stress, has_shelter=True):
     return a
 
 
-p = SwitchParams()
-stores = [{'id': 's0', 'x': 118.11, 'y': 24.48,
-           'capacity': 2, 'occupancy': 0, 'node_id': 'STORE_0'}]
+def run_checks():
+    p = SwitchParams()
+    stores = [{"id": "s0", "x": 118.11, "y": 24.48,
+               "capacity": 2, "occupancy": 0, "node_id": "STORE_0"}]
 
-# ---- Scenario 1: 低压力 + 有 shelter -> home (flee 不触发) ----
-a = _make(stress=0.3)
-init_store_state(a, stores, p)
-d = compute_goal_direction(a, stores, a.neighbors, p)
-print(f"S1 stress=0.3 (低)        : dom={a._dom_action}  target={a.target_node}")
-assert a._dom_action == 'home', f'低压力应为 home, got {a._dom_action}'
+    # ---- Scenario 1: low stress + shelter -> home ----
+    a = _make(stress=0.3)
+    init_store_state(a, stores, p)
+    d = compute_goal_direction(a, stores, a.neighbors, p)
+    print(f"S1 stress=0.3 (low)        : dom={a._dom_action}  target={a.target_node}")
+    assert a._dom_action == "home", f"low stress should choose home, got {a._dom_action}"
 
-# ---- Scenario 2: 高压力 (= flee 阈值 0.6) -> 边界 ----
-a = _make(stress=0.6)
-init_store_state(a, stores, p)
-d = compute_goal_direction(a, stores, a.neighbors, p)
-print(f"S2 stress=0.60 (=阈值)    : dom={a._dom_action}  target={a.target_node}")
-# 0.60 不严格 > 0.6, 所以不触发 flee
+    # ---- Scenario 2: MNL boundary check, not a hard theta trigger ----
+    a = _make(stress=0.6)
+    init_store_state(a, stores, p)
+    d = compute_goal_direction(a, stores, a.neighbors, p)
+    print(f"S2 stress=0.60 (MNL)       : dom={a._dom_action}  target={a.target_node}")
+    assert a._dom_action == "flee", f"MNL dominant action should be flee, got {a._dom_action}"
+    assert a.target_node == "SHELTER_A", f"target should be SHELTER_A, got {a.target_node}"
 
-# ---- Scenario 3: 极高压力 + 有 shelter -> flee ----
-a = _make(stress=0.85)
-init_store_state(a, stores, p)
-d = compute_goal_direction(a, stores, a.neighbors, p)
-print(f"S3 stress=0.85 (高) + shelter : dom={a._dom_action}  target={a.target_node}  dir≈({d[0]:.2f},{d[1]:.2f})")
-assert a._dom_action == 'flee', f'高压力+shelter 应为 flee, got {a._dom_action}'
-assert a.target_node == 'SHELTER_A', f'target 应为 SHELTER_A, got {a.target_node}'
-# 方向应朝 shelter (从 118.10,24.48 → 118.12,24.49), dx>0 dy>0
-assert d[0] > 0 and d[1] > 0, f'方向应朝东北, got {d}'
+    # ---- Scenario 3: very high stress + shelter -> flee ----
+    a = _make(stress=0.85)
+    init_store_state(a, stores, p)
+    d = compute_goal_direction(a, stores, a.neighbors, p)
+    print(f"S3 stress=0.85 (high) + shelter : dom={a._dom_action}  target={a.target_node}  dir≈({d[0]:.2f},{d[1]:.2f})")
+    assert a._dom_action == "flee", f"high stress+shelter should choose flee, got {a._dom_action}"
+    assert a.target_node == "SHELTER_A", f"target should be SHELTER_A, got {a.target_node}"
+    assert d[0] > 0 and d[1] > 0, f"direction should point northeast, got {d}"
 
-# ---- Scenario 4: 极高压力但无 shelter -> herd (fallback) ----
-a = _make(stress=0.85, has_shelter=False)
-init_store_state(a, stores, p)
-d = compute_goal_direction(a, stores, a.neighbors, p)
-print(f"S4 stress=0.85, 无 shelter : dom={a._dom_action}  target={a.target_node}")
-assert a._dom_action != 'flee', '无 shelter 时不应 flee'
+    # ---- Scenario 4: very high stress but no shelter -> no flee ----
+    a = _make(stress=0.85, has_shelter=False)
+    init_store_state(a, stores, p)
+    d = compute_goal_direction(a, stores, a.neighbors, p)
+    print(f"S4 stress=0.85, no shelter : dom={a._dom_action}  target={a.target_node}")
+    assert a._dom_action != "flee", "without shelter, flee should be unavailable"
 
-# ---- Scenario 5: 关闭 flee 开关 -> 即使高压力也不 flee ----
-p_off = SwitchParams(enable_flee_behavior=False)
-a = _make(stress=0.85)
-init_store_state(a, stores, p_off)
-d = compute_goal_direction(a, stores, a.neighbors, p_off)
-print(f"S5 开关 OFF stress=0.85 : dom={a._dom_action}  target={a.target_node}")
-assert a._dom_action != 'flee', '开关关闭后不应 flee'
+    # ---- Scenario 5: flee switch off -> no flee even at high stress ----
+    p_off = SwitchParams(enable_flee_behavior=False)
+    a = _make(stress=0.85)
+    init_store_state(a, stores, p_off)
+    d = compute_goal_direction(a, stores, a.neighbors, p_off)
+    print(f"S5 switch OFF stress=0.85 : dom={a._dom_action}  target={a.target_node}")
+    assert a._dom_action != "flee", "when switch is off, flee should be unavailable"
 
-print('\n[OK] T26 flee 行为全部通过')
+    print("\n[OK] T26 flee behavior smoke checks passed")
+
+
+if __name__ == "__main__":
+    run_checks()

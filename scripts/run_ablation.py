@@ -31,7 +31,9 @@ import json
 import time
 import argparse
 import random
+import subprocess
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 import numpy as np
 
 try:
@@ -54,6 +56,7 @@ if ROOT not in sys.path:
 from config.city_manager import CityManager
 from config.config import Config
 from simulation.simulation import BlackoutSimulation
+from core.unified_stress_model import unified_stress_model
 
 
 TRACE_ROOT = os.path.join(ROOT, 'trace_output')
@@ -72,6 +75,21 @@ DEFAULT_TOTAL_STEPS = 120      # 120 步 × DT=0.25h = 30 仿真小时
 DEFAULT_OUTAGE_STEP = 16       # 早点触发, 留更多时间形成 cascade
 DEFAULT_SEED        = 42
 
+GLOBAL_METRIC_FIELDS = [
+    'step', 't_hour',
+    'avg_stress', 'max_stress', 'pct_stress_gt_06',
+    'avg_emotion', 'avg_panic',
+    'hoard_ratio', 'herd_ratio', 'flee_ratio', 'outage_ratio',
+    'avg_edge_congestion', 'pct_on_path',
+    'opinion_pressure', 'total_opinion_pressure', 'public_opinion_active',
+    'opinion_active_district_count', 'opinion_active_district_ratio',
+    'opinion_active_resident_count', 'opinion_active_resident_ratio',
+    'opinion_trigger_pressure', 'opinion_threshold_margin',
+    'opinion_effect_nonzero',
+    'seir_S', 'seir_E', 'seir_I', 'seir_R',
+    'seir_infection_reduction', 'rumor_suppress_rate',
+]
+
 
 # =============================================================================
 # 收集每步全局指标 (replicate dashboard._update_history 的关键部分)
@@ -79,6 +97,44 @@ DEFAULT_SEED        = 42
 def _collect_step_metrics(sim):
     residents = sim.residents
     n = max(1, len(residents))
+    event_effects = getattr(sim, 'last_event_effects', {}) or {}
+    event_summary = getattr(sim, 'last_event_summary', None)
+    if event_summary is None:
+        hist = getattr(sim, 'event_effects_hist', [])
+        event_summary = hist[-1] if hist else {}
+    opinion_effect = (
+        event_effects.get('government', {})
+        .get('opinion_manage', {})
+    )
+    gov_agents = list(getattr(sim, 'gov_agents', {}).values())
+    active_district_count = sum(
+        1 for gov in gov_agents
+        if bool(getattr(gov, 'public_opinion_active', False))
+    )
+    public_opinion_active = any(
+        bool(getattr(gov, 'public_opinion_active', False))
+        for gov in gov_agents
+    )
+    active_resident_count = sum(
+        1 for r in residents
+        if bool(getattr(r, '_opinion_management_active', False))
+    )
+    opinion_trigger_pressure = max(
+        (float(getattr(gov, 'last_opinion_pressure', 0.0)) for gov in gov_agents),
+        default=0.0,
+    )
+    opinion_threshold_margin = max(
+        (float(getattr(gov, 'last_opinion_threshold_margin', 0.0)) for gov in gov_agents),
+        default=0.0,
+    )
+    opinion_effect_values = [
+        float(opinion_effect.get('official_info_boost', 0.0)),
+        float(opinion_effect.get('rumor_suppress_rate', 0.0)),
+        float(opinion_effect.get('seir_infection_reduction', 0.0)),
+        float(opinion_effect.get('panic_spread_reduction', 0.0)),
+    ]
+    opinion_effect_nonzero = any(abs(v) > 1e-12 for v in opinion_effect_values)
+    seir_counts = Counter(getattr(r, 'state', 'S') for r in residents)
     stress_arr = np.fromiter(
         (float(getattr(r, 'stress_level', 0.0)) for r in residents), dtype=np.float64, count=n)
     emotion_arr = np.fromiter(
@@ -111,6 +167,22 @@ def _collect_step_metrics(sim):
         'outage_ratio':         outage_ratio,
         'avg_edge_congestion':  float(cong_arr.mean()),
         'pct_on_path':          float(on_path_arr.mean()),
+        'opinion_pressure':     float(getattr(getattr(sim, 'event_influence', None), 'opinion_pressure', 0.0)),
+        'total_opinion_pressure': float(event_summary.get('total_opinion_pressure', 0.0)),
+        'public_opinion_active': float(public_opinion_active),
+        'opinion_active_district_count': float(active_district_count),
+        'opinion_active_district_ratio': float(active_district_count / len(gov_agents)) if gov_agents else 0.0,
+        'opinion_active_resident_count': float(active_resident_count),
+        'opinion_active_resident_ratio': float(active_resident_count / n),
+        'opinion_trigger_pressure': float(opinion_trigger_pressure),
+        'opinion_threshold_margin': float(opinion_threshold_margin),
+        'opinion_effect_nonzero': float(opinion_effect_nonzero),
+        'seir_S':               float(seir_counts.get('S', 0) / n),
+        'seir_E':               float(seir_counts.get('E', 0) / n),
+        'seir_I':               float(seir_counts.get('I', 0) / n),
+        'seir_R':               float(seir_counts.get('R', 0) / n),
+        'seir_infection_reduction': float(opinion_effect.get('seir_infection_reduction', 0.0)),
+        'rumor_suppress_rate':  float(opinion_effect.get('rumor_suppress_rate', 0.0)),
     }
 
 
@@ -169,6 +241,194 @@ def _jsonable(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return repr(value)
+
+
+def _run_git(args):
+    try:
+        proc = subprocess.run(
+            ['git', '-C', ROOT] + list(args),
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        return proc.stdout.strip()
+    except Exception:
+        return None
+
+
+def _git_info():
+    status = _run_git(['status', '--short'])
+    return {
+        'commit': _run_git(['rev-parse', 'HEAD']),
+        'dirty': bool(status),
+        'status_short': status or '',
+    }
+
+
+def _write_manifest(args, out_dir, label, use_road_graph, sim):
+    manifest = {
+        'created_at_utc': datetime.now(timezone.utc).isoformat(),
+        'city': args.city,
+        'district': args.district,
+        'seed': args.seed,
+        'n_residents': args.n_residents,
+        'n_enterprises': args.n_enterprises,
+        'total_steps': args.total_steps,
+        'outage_step': args.outage_step,
+        'outage_cause': getattr(args, 'outage_cause', 'equipment_failure'),
+        'tag': getattr(args, 'tag', ''),
+        'graph_mode': label,
+        'use_road_graph': bool(use_road_graph),
+        'use_mml': not bool(getattr(args, 'no_mml', False)),
+        'switch_ablation': getattr(args, 'switch_ablation', 'none') or 'none',
+        'opinion_mode': getattr(args, 'opinion_mode', 'auto'),
+        'outage_stress_profile': getattr(args, 'outage_stress_profile', 'sqrt'),
+        'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
+        'output_dir': os.path.abspath(out_dir),
+        'restores_in_window': getattr(sim, '_restores_in_window', None),
+        'git': _git_info(),
+    }
+    path = os.path.join(out_dir, 'manifest.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    print(f'[manifest] saved {path}')
+    return manifest
+
+
+def _desired_run_config(args):
+    return {
+        'city': args.city,
+        'district': args.district,
+        'n_residents': args.n_residents,
+        'n_enterprises': args.n_enterprises,
+        'total_steps': args.total_steps,
+        'outage_step': args.outage_step,
+        'outage_cause': getattr(args, 'outage_cause', 'equipment_failure'),
+        'seed': args.seed,
+        'tag': args.tag,
+        'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
+        'flee_threshold': getattr(args, 'flee_threshold', None),
+        'use_mml': not bool(getattr(args, 'no_mml', False)),
+        'switch_ablation': getattr(args, 'switch_ablation', 'none') or 'none',
+        'opinion_mode': getattr(args, 'opinion_mode', 'auto'),
+        'outage_stress_profile': getattr(args, 'outage_stress_profile', 'sqrt'),
+        'mml_overrides': {
+            'mml_scale': getattr(args, 'mml_scale', None),
+            'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
+            'mml_b_sigma_flee': getattr(args, 'mml_b_sigma_flee', None),
+            'mml_b_vis': getattr(args, 'mml_b_vis', None),
+        },
+    }
+
+
+def _load_json(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _existing_run_config(run_dir):
+    summary = _load_json(os.path.join(run_dir, 'summary.json'))
+    if isinstance(summary, dict) and isinstance(summary.get('config'), dict):
+        return summary['config'], 'summary.json'
+
+    config_keys = set(_desired_run_config_for_manifest_keys())
+    for label in ('on', 'off'):
+        manifest = _load_json(os.path.join(run_dir, f'graph_{label}', 'manifest.json'))
+        if isinstance(manifest, dict):
+            return {
+                k: v for k, v in manifest.items()
+                if k in config_keys
+            }, f'graph_{label}/manifest.json'
+    return None, None
+
+
+def _desired_run_config_for_manifest_keys():
+    return (
+        'city',
+        'district',
+        'n_residents',
+        'n_enterprises',
+        'total_steps',
+        'outage_step',
+        'outage_cause',
+        'seed',
+        'tag',
+        'home_distribution',
+        'flee_threshold',
+        'use_mml',
+        'switch_ablation',
+        'opinion_mode',
+        'outage_stress_profile',
+        'mml_overrides',
+    )
+
+
+def _guard_run_dir(run_dir, args):
+    if not os.path.isdir(run_dir):
+        return
+    if getattr(args, 'allow_overwrite', False):
+        print(f'[output] WARN: --allow-overwrite enabled for existing directory: {run_dir}')
+        return
+
+    existing, source = _existing_run_config(run_dir)
+    if existing is None:
+        raise SystemExit(
+            '[output] ERROR: output directory already exists but has no readable '
+            f'summary/manifest metadata:\n  {run_dir}\n'
+            'Use a unique --tag, move the existing folder, or rerun with '
+            '--allow-overwrite if overwriting is intentional.'
+        )
+
+    desired = _desired_run_config(args)
+    mismatches = []
+    for key, desired_value in desired.items():
+        if key in existing and existing.get(key) != desired_value:
+            mismatches.append((key, existing.get(key), desired_value))
+
+    if mismatches:
+        detail = '\n'.join(
+            f'  - {key}: existing={old!r}, requested={new!r}'
+            for key, old, new in mismatches[:12]
+        )
+        if len(mismatches) > 12:
+            detail += f'\n  - ... {len(mismatches) - 12} more'
+        raise SystemExit(
+            '[output] ERROR: refusing to write into an existing run directory '
+            'with different parameters.\n'
+            f'  run_dir: {run_dir}\n'
+            f'  metadata: {source}\n'
+            f'{detail}\n'
+            'Use a unique --tag that includes mode/profile/seed, move the '
+            'existing folder, or pass --allow-overwrite intentionally.'
+        )
+    print(f'[output] existing run_dir matches requested config: {run_dir}')
+
+
+def _first_crossing(history, key, threshold):
+    for rec in history:
+        if rec.get(key, 0.0) >= threshold:
+            return {
+                'step': rec.get('step'),
+                't_hour': rec.get('t_hour'),
+            }
+    return None
+
+
+def _first_positive(history, key, eps=1e-12):
+    for rec in history:
+        if rec.get(key, 0.0) > eps:
+            return {
+                'step': rec.get('step'),
+                't_hour': rec.get('t_hour'),
+            }
+    return None
 
 
 def _collect_switch_audit(sim):
@@ -268,7 +528,13 @@ def run_one(label, use_road_graph, args, run_dir):
 
     t0 = time.time()
     sim = BlackoutSimulation(config=cfg, city_config=city_config)
+    sim.set_opinion_mode(getattr(args, 'opinion_mode', 'auto'))
+    unified_stress_model.set_outage_stress_profile(
+        getattr(args, 'outage_stress_profile', 'sqrt')
+    )
     print(f'[init] {time.time()-t0:.1f}s, use_road_graph={sim.use_road_graph}')
+    print(f'[validation] opinion_mode={sim.opinion_mode}, '
+          f'outage_stress_profile={unified_stress_model.OUTAGE_STRESS_PROFILE}')
     override_audits = []
 
     # F5 控制实验: flee_threshold 覆盖 (默认 0.6, 扫描 {0.4..0.8} 验证 phase transition)
@@ -286,7 +552,7 @@ def run_one(label, use_road_graph, args, run_dir):
             _apply_switch_overrides(sim, {'use_mml': False}, 'F13')
         )
     else:
-        print(f'[F13] use_mml = True (MML default since 2026-06-28)')
+        print(f'[F13] use_mml = True (MML default)')
 
     switch_ablation = getattr(args, 'switch_ablation', 'none') or 'none'
     if switch_ablation != 'none':
@@ -360,16 +626,13 @@ def run_one(label, use_road_graph, args, run_dir):
 
     out_dir = os.path.join(run_dir, f'graph_{label}')
     os.makedirs(out_dir, exist_ok=True)
+    sim._manifest = _write_manifest(args, out_dir, label, use_road_graph, sim)
     csv_path = os.path.join(out_dir, 'global_metrics.csv')
-    fields = ['step', 't_hour', 'avg_stress', 'max_stress', 'pct_stress_gt_06',
-              'avg_emotion', 'avg_panic',
-              'hoard_ratio', 'herd_ratio', 'flee_ratio', 'outage_ratio',
-              'avg_edge_congestion', 'pct_on_path']
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=GLOBAL_METRIC_FIELDS)
         w.writeheader()
         for rec in history:
-            w.writerow({k: rec.get(k, 0) for k in fields})
+            w.writerow({k: rec.get(k, 0) for k in GLOBAL_METRIC_FIELDS})
     print(f'[trace] saved {csv_path}')
     sim._switch_audit = _write_switch_audit(sim, out_dir, override_audits)
 
@@ -394,6 +657,17 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
         ('flee_ratio', 'flee ratio (向 shelter 逃)'),
         ('avg_edge_congestion', '平均 edge congestion'),
     ]
+    summary_metrics = [
+        k for k in GLOBAL_METRIC_FIELDS
+        if k not in {'step', 't_hour'}
+    ]
+    peak_metrics = [
+        'avg_stress', 'max_stress', 'avg_panic',
+        'herd_ratio', 'flee_ratio',
+        'opinion_pressure', 'opinion_trigger_pressure',
+        'opinion_threshold_margin', 'opinion_active_resident_ratio',
+        'seir_I',
+    ]
 
     # ---- 1) 关键路径: 先写 summary.json (matplotlib 不参与, 不会 crash) ----
     summary = {
@@ -412,6 +686,8 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
             'flee_threshold':    getattr(args, 'flee_threshold', None),
             'use_mml':           not bool(getattr(args, 'no_mml', False)),
             'switch_ablation':    getattr(args, 'switch_ablation', 'none') or 'none',
+            'opinion_mode':       getattr(args, 'opinion_mode', 'auto'),
+            'outage_stress_profile': getattr(args, 'outage_stress_profile', 'sqrt'),
             'mml_overrides': {
                 'mml_scale': getattr(args, 'mml_scale', None),
                 'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
@@ -421,7 +697,11 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
         },
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
-            for k, _ in metrics_to_plot
+            for k in summary_metrics
+        },
+        'peak': {
+            k: {'off': max(r[k] for r in h_off), 'on': max(r[k] for r in h_on)}
+            for k in peak_metrics
         },
         'peak_stress': {
             'off': max(r['avg_stress'] for r in h_off),
@@ -431,9 +711,62 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
             'off': max(r['herd_ratio'] for r in h_off),
             'on':  max(r['herd_ratio'] for r in h_on),
         },
+        'avg_stress_threshold_crossings': {
+            str(th): {
+                'off': _first_crossing(h_off, 'avg_stress', th),
+                'on': _first_crossing(h_on, 'avg_stress', th),
+            }
+            for th in (0.4, 0.6, 0.8)
+        },
+        'mechanism_checks': {
+            'public_opinion_active_any': {
+                'off': any(r.get('public_opinion_active', 0) >= 1 for r in h_off),
+                'on': any(r.get('public_opinion_active', 0) >= 1 for r in h_on),
+            },
+            'opinion_active_steps': {
+                'off': sum(1 for r in h_off if r.get('opinion_active_resident_ratio', 0.0) > 0),
+                'on': sum(1 for r in h_on if r.get('opinion_active_resident_ratio', 0.0) > 0),
+            },
+            'first_opinion_active_step': {
+                'off': _first_positive(h_off, 'opinion_active_resident_ratio'),
+                'on': _first_positive(h_on, 'opinion_active_resident_ratio'),
+            },
+            'max_opinion_active_district_count': {
+                'off': max(r.get('opinion_active_district_count', 0.0) for r in h_off),
+                'on': max(r.get('opinion_active_district_count', 0.0) for r in h_on),
+            },
+            'max_opinion_active_resident_ratio': {
+                'off': max(r.get('opinion_active_resident_ratio', 0.0) for r in h_off),
+                'on': max(r.get('opinion_active_resident_ratio', 0.0) for r in h_on),
+            },
+            'max_opinion_trigger_pressure': {
+                'off': max(r.get('opinion_trigger_pressure', 0.0) for r in h_off),
+                'on': max(r.get('opinion_trigger_pressure', 0.0) for r in h_on),
+            },
+            'max_opinion_threshold_margin': {
+                'off': max(r.get('opinion_threshold_margin', 0.0) for r in h_off),
+                'on': max(r.get('opinion_threshold_margin', 0.0) for r in h_on),
+            },
+            'nonzero_opinion_effect_any': {
+                'off': any(r.get('opinion_effect_nonzero', 0.0) > 0 for r in h_off),
+                'on': any(r.get('opinion_effect_nonzero', 0.0) > 0 for r in h_on),
+            },
+            'max_seir_infection_reduction': {
+                'off': max(r.get('seir_infection_reduction', 0.0) for r in h_off),
+                'on': max(r.get('seir_infection_reduction', 0.0) for r in h_on),
+            },
+            'max_rumor_suppress_rate': {
+                'off': max(r.get('rumor_suppress_rate', 0.0) for r in h_off),
+                'on': max(r.get('rumor_suppress_rate', 0.0) for r in h_on),
+            },
+        },
         'switch_audit': {
             'off': getattr(sim_off, '_switch_audit', None),
             'on': getattr(sim_on, '_switch_audit', None),
+        },
+        'manifest': {
+            'off': getattr(sim_off, '_manifest', None),
+            'on': getattr(sim_on, '_manifest', None),
         },
     }
     out_json = os.path.join(run_dir, 'summary.json')
@@ -515,6 +848,8 @@ def _parse_args():
     p.add_argument('--output-base',   default=None, dest='output_base',
                    help='输出根目录, 默认 trace_output/。可指定 M4 子组如 '
                         'M4_F4_multi_seed 让结果直接落子文件夹, 省去手动 mv')
+    p.add_argument('--allow-overwrite', action='store_true', dest='allow_overwrite',
+                   help='允许写入已有 run_dir；默认参数不一致时拒绝覆盖，防止验证数据被静默改写')
     p.add_argument('--home-distribution', default=None, dest='home_distribution',
                    choices=['poi', 'uniform'],
                    help='F2: 居民 home 分布策略 (poi 默认 / uniform 去 POI bias)')
@@ -527,6 +862,12 @@ def _parse_args():
     p.add_argument('--switch-ablation', default='none', dest='switch_ablation',
                    choices=sorted(SWITCH_ABLATION_OVERRIDES.keys()),
                    help='E2: SwitchParams 消融预设 (none/no_info_network/no_inertia/no_hysteresis/...)')
+    p.add_argument('--opinion-mode', default='auto', dest='opinion_mode',
+                   choices=['auto', 'on', 'off'],
+                   help='文献验证: 仅控制事件5舆情管理(auto/on/off), 不启用 GovernmentAgent manual events')
+    p.add_argument('--outage-stress-profile', default='sqrt', dest='outage_stress_profile',
+                   choices=['sqrt', 'log', 'linear'],
+                   help='文献验证: t_outage→internal stress 敏感性曲线, 默认 sqrt 保持基线')
     p.add_argument('--mml-scale', type=float, default=None, dest='mml_scale',
                    help='F13 sensitivity: override SwitchParams.mml_scale for this run')
     p.add_argument('--mml-asc-flee', type=float, default=None, dest='mml_asc_flee',
@@ -549,6 +890,7 @@ def main():
     else:
         base = TRACE_ROOT
     run_dir = os.path.join(base, f't15_{args.city}_{args.district}{suffix}')
+    _guard_run_dir(run_dir, args)
     os.makedirs(run_dir, exist_ok=True)
     print(f'[output] → {run_dir}')
 
@@ -562,6 +904,8 @@ def main():
     print('\n' + '=' * 70)
     print(f'  T15 对照实验摘要: {args.city}/{args.district}'
           + (f' [tag={args.tag}]' if args.tag else ''))
+    print(f'  opinion_mode={args.opinion_mode}, '
+          f'outage_stress_profile={args.outage_stress_profile}')
     print('=' * 70)
     print(f'  {"指标":<24} {"graph-off":>14} {"graph-on":>14}  Δ%')
     keys = [

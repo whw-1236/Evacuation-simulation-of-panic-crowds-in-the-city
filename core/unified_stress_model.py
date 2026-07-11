@@ -73,6 +73,8 @@ class UnifiedStressModel:
     GOV_EVENT_SOFTNESS = 0.3
     # 恢复供电后 outage_threat 的指数衰减时间常数 (h)；越小衰减越快。
     OUTAGE_THREAT_DECAY_TAU = 6.0
+    VALID_OUTAGE_STRESS_PROFILES = {'sqrt', 'log', 'linear'}
+    OUTAGE_STRESS_PROFILE = 'sqrt'
 
     def __init__(self):
         """初始化模型参数"""
@@ -93,6 +95,32 @@ class UnifiedStressModel:
             'information_access': 0.15,  # 信息获取
             'material_reserve': 0.10,  # 物资储备
         }
+
+    def set_outage_stress_profile(self, profile):
+        profile = (profile or 'sqrt').lower()
+        if profile not in self.VALID_OUTAGE_STRESS_PROFILES:
+            raise ValueError(
+                f"Unsupported OUTAGE_STRESS_PROFILE={profile!r}; "
+                "expected sqrt/log/linear"
+            )
+        self.OUTAGE_STRESS_PROFILE = profile
+
+    def _base_outage_internal_stress(self, t_outage, profile=None):
+        """Map outage duration to baseline internal stress for sensitivity runs."""
+        t = max(0.0, float(t_outage or 0.0))
+        profile = (profile or self.OUTAGE_STRESS_PROFILE or 'sqrt').lower()
+        if profile == 'sqrt':
+            base = 0.08 + 0.22 * np.sqrt(t / 2.0)
+        elif profile == 'log':
+            base = 0.08 + 0.22 * np.log1p(t / 2.0)
+        elif profile == 'linear':
+            base = 0.08 + 0.22 * (t / 2.0)
+        else:
+            raise ValueError(
+                f"Unsupported OUTAGE_STRESS_PROFILE={profile!r}; "
+                "expected sqrt/log/linear"
+            )
+        return min(1.0, max(0.0, float(base)))
 
     def calculate_threat_perception(self, resident, zone_data, dt):
         """
@@ -264,8 +292,8 @@ class UnifiedStressModel:
 
         if not is_powered and t_outage > 0:
             # 内部压力 = 基础压力 + 环境因素
-            # 使用平方根增长，初期快后期慢
-            base_internal = 0.08 + 0.22 * np.sqrt(t_outage / 2.0)  # 0h→0.08, 2h→0.24, 6h→0.46, 12h→0.62, 24h→0.84
+            # 默认使用平方根增长；可通过实验开关比较 log/linear 曲线。
+            base_internal = self._base_outage_internal_stress(t_outage)
 
             # 环境因素增加内部压力
             neighbors = getattr(resident, 'neighbors', [])

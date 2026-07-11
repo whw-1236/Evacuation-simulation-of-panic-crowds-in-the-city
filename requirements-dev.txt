@@ -1,0 +1,2 @@
+# Test runner used by `python -m pytest tests`.
+pytest>=7.0

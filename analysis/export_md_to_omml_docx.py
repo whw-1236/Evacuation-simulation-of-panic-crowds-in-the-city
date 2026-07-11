@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 import time
@@ -10,10 +11,10 @@ import pywintypes
 import win32com.client as win32
 
 
-PAPER_DIR = Path(r"F:\IJDRR write\论文初稿模块")
+PAPER_DIR = Path(r"F:\IJDRR write\论文初稿模块\main\7.6")
 TARGETS = [
-    PAPER_DIR / "IJDRR_main_manuscript_v2_refs_resolved.md",
-    PAPER_DIR / "IJDRR_full_paper_v2_refs_resolved.md",
+    PAPER_DIR / "IJDRR_main_manuscript_v3_refs_resolved.md",
+    PAPER_DIR / "IJDRR_full_paper_v3_refs_resolved.md",
 ]
 
 WD_FORMAT_DOCX = 16
@@ -24,11 +25,113 @@ WD_STORY = 6
 WD_AUTOFIT_WINDOW = 2
 WD_STYLE_NORMAL = -1
 WD_STYLE_HEADING = {1: -2, 2: -3, 3: -4}
+WD_STYLE_TABLE_GRID = -155
 
 
 INLINE_MATH_RE = re.compile(r"\\\((.+?)\\\)")
 IMAGE_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)")
 TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+
+
+GREEK_COMMANDS = {
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "Delta": "Δ",
+    "varepsilon": "ε",
+    "epsilon": "ε",
+    "eta": "η",
+    "theta": "θ",
+    "lambda": "λ",
+    "mu": "μ",
+    "kappa": "κ",
+    "Pi": "Π",
+    "rho": "ρ",
+    "sigma": "σ",
+    "tau": "τ",
+    "phi": "φ",
+    "psi": "ψ",
+    "omega": "ω",
+}
+
+SYMBOL_COMMANDS = {
+    "cdot": "·",
+    "times": "×",
+    "pm": "±",
+    "le": "≤",
+    "ge": "≥",
+    "neq": "≠",
+    "infty": "∞",
+    "partial": "∂",
+    "to": "→",
+}
+
+
+def read_braced_group(text: str, start: int) -> tuple[str, int] | None:
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    for idx in range(start, len(text)):
+        char = text[idx]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:idx], idx + 1
+    return None
+
+
+def replace_latex_fracs(text: str) -> str:
+    out: list[str] = []
+    idx = 0
+    commands = ("\\dfrac", "\\tfrac", "\\frac")
+    while idx < len(text):
+        command = next((cmd for cmd in commands if text.startswith(cmd, idx)), None)
+        if command is None:
+            out.append(text[idx])
+            idx += 1
+            continue
+        cursor = idx + len(command)
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        numerator = read_braced_group(text, cursor)
+        if numerator is None:
+            out.append(text[idx])
+            idx += 1
+            continue
+        cursor = numerator[1]
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        denominator = read_braced_group(text, cursor)
+        if denominator is None:
+            out.append(text[idx])
+            idx += 1
+            continue
+        num = replace_latex_fracs(numerator[0])
+        den = replace_latex_fracs(denominator[0])
+        out.append(f"(({num})/({den}))")
+        idx = denominator[1]
+    return "".join(out)
+
+
+def latex_to_word_linear(math: str) -> str:
+    math = replace_latex_fracs(math)
+    for _ in range(4):
+        updated = re.sub(
+            r"\\(?:mathbf|boldsymbol|mathrm|mathit|mathcal|text)\{([^{}]+)\}",
+            r"\1",
+            math,
+        )
+        if updated == math:
+            break
+        math = updated
+    math = re.sub(r"\\(?:left|right|big|Big|bigg|Bigg)", "", math)
+    math = re.sub(r"\\[!,;:]", "", math)
+    for command, symbol in {**GREEK_COMMANDS, **SYMBOL_COMMANDS}.items():
+        math = re.sub(rf"\\{command}(?![A-Za-z])", symbol, math)
+    return math
 
 
 def com_retry(func, attempts: int = 30, delay: float = 0.15):
@@ -42,8 +145,10 @@ def com_retry(func, attempts: int = 30, delay: float = 0.15):
     raise last_exc
 
 
-def clean_text(text: str) -> str:
+def clean_text(text: str, *, convert_inline_math: bool = False) -> str:
     text = text.replace("\u00a0", " ")
+    if convert_inline_math:
+        text = INLINE_MATH_RE.sub(lambda match: latex_to_word_linear(match.group(1)), text)
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(r"`([^`]+)`", r"\1", text)
@@ -63,7 +168,10 @@ def split_table_row(line: str) -> list[str]:
         line = line[1:]
     if line.endswith("|"):
         line = line[:-1]
-    return [clean_text(cell.strip()) for cell in line.split("|")]
+    return [
+        latex_to_word_linear(clean_text(cell.strip(), convert_inline_math=True))
+        for cell in line.split("|")
+    ]
 
 
 def resolve_image(md_path: Path, raw_path: str) -> Path:
@@ -71,7 +179,13 @@ def resolve_image(md_path: Path, raw_path: str) -> Path:
     candidate = Path(raw_path)
     if candidate.is_absolute():
         return candidate
-    return (md_path.parent / candidate).resolve()
+    local = (md_path.parent / candidate).resolve()
+    if local.exists():
+        return local
+    parent = (md_path.parent.parent / candidate).resolve()
+    if parent.exists():
+        return parent
+    return local
 
 
 def prepare_math(math: str) -> tuple[str, str | None]:
@@ -91,12 +205,25 @@ def prepare_math(math: str) -> tuple[str, str | None]:
 
 
 class WordWriter:
-    def __init__(self, word, out_path: Path):
+    def __init__(
+        self,
+        word,
+        out_path: Path,
+        *,
+        build_math: bool = True,
+        trace_math: bool = False,
+        linearize_latex: bool = False,
+    ):
         self.word = word
         word.Documents.Add()
         self.doc = word.ActiveDocument
         self.sel = word.Selection
         self.out_path = out_path
+        self.build_math = build_math
+        self.trace_math = trace_math
+        self.linearize_latex = linearize_latex
+        self.source_path: Path | None = None
+        self.current_line: int | None = None
         self.math_inserted = 0
         self.math_buildup_failed = 0
         self.image_inserted = 0
@@ -205,7 +332,13 @@ class WordWriter:
         self.goto_end()
         self.set_normal()
         table = com_retry(lambda: self.doc.Tables.Add(self.sel.Range, len(rows), cols))
-        table.Style = "Table Grid"
+        try:
+            table.Style = WD_STYLE_TABLE_GRID
+        except pywintypes.com_error:
+            try:
+                table.Style = "Table Grid"
+            except pywintypes.com_error:
+                pass
         table.AllowAutoFit = True
         table.AutoFitBehavior(WD_AUTOFIT_WINDOW)
         for r_idx, row in enumerate(rows, start=1):
@@ -238,6 +371,13 @@ class WordWriter:
         math, _ = prepare_math(math)
         if not math:
             return
+        if self.linearize_latex:
+            math = latex_to_word_linear(math)
+        if self.trace_math:
+            location = ""
+            if self.source_path is not None and self.current_line is not None:
+                location = f"{self.source_path.name}:{self.current_line}"
+            print(f"[math] {location} display={display} {math[:100]}", flush=True)
         start = self.sel.Range.Start
         self.sel.TypeText(math)
         end = self.sel.Range.End
@@ -246,10 +386,11 @@ class WordWriter:
         try:
             com_retry(lambda: self.doc.OMaths.Add(rng))
             self.math_inserted += 1
-            try:
-                com_retry(lambda: self.doc.OMaths(self.doc.OMaths.Count).BuildUp())
-            except Exception:
-                self.math_buildup_failed += 1
+            if self.build_math:
+                try:
+                    com_retry(lambda: self.doc.OMaths(self.doc.OMaths.Count).BuildUp())
+                except Exception:
+                    self.math_buildup_failed += 1
         except Exception:
             self.math_buildup_failed += 1
         self.sel.SetRange(self.doc.Content.End - 1, self.doc.Content.End - 1)
@@ -257,6 +398,7 @@ class WordWriter:
 
 def parse_markdown(md_path: Path, writer: WordWriter) -> None:
     lines = md_path.read_text(encoding="utf-8").splitlines()
+    writer.source_path = md_path
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -278,9 +420,11 @@ def parse_markdown(md_path: Path, writer: WordWriter) -> None:
 
         if stripped == "$$" or stripped.startswith("$$"):
             math_lines: list[str] = []
+            math_start_line = i + 1
             if stripped != "$$":
                 initial = stripped[2:]
                 if initial.endswith("$$"):
+                    writer.current_line = math_start_line
                     writer.add_display_math(initial[:-2])
                     i += 1
                     continue
@@ -289,6 +433,7 @@ def parse_markdown(md_path: Path, writer: WordWriter) -> None:
             while i < len(lines) and lines[i].strip() != "$$":
                 math_lines.append(lines[i])
                 i += 1
+            writer.current_line = math_start_line
             writer.add_display_math("\n".join(math_lines))
             i += 1
             continue
@@ -351,9 +496,22 @@ def inspect_docx(path: Path) -> dict[str, int | bool]:
     }
 
 
-def convert_one(word, md_path: Path) -> tuple[Path, dict[str, int | bool], int]:
+def convert_one(
+    word,
+    md_path: Path,
+    *,
+    build_math: bool = True,
+    trace_math: bool = False,
+    linearize_latex: bool = False,
+) -> tuple[Path, dict[str, int | bool], int]:
     out_path = md_path.with_name(md_path.stem + "_OMML.docx")
-    writer = WordWriter(word, out_path)
+    writer = WordWriter(
+        word,
+        out_path,
+        build_math=build_math,
+        trace_math=trace_math,
+        linearize_latex=linearize_latex,
+    )
     try:
         parse_markdown(md_path, writer)
         failed = writer.math_buildup_failed
@@ -364,13 +522,49 @@ def convert_one(word, md_path: Path) -> tuple[Path, dict[str, int | bool], int]:
     return out_path, inspect_docx(out_path), failed
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Export Markdown manuscript files to Word DOCX with OMML equations."
+    )
+    parser.add_argument(
+        "markdown",
+        nargs="*",
+        type=Path,
+        help="Markdown file(s) to export. Defaults to the synchronized v3 main/full manuscripts.",
+    )
+    parser.add_argument(
+        "--no-buildup",
+        action="store_true",
+        help="Insert OMML math objects but skip Word BuildUp formatting for better COM stability.",
+    )
+    parser.add_argument(
+        "--trace-math",
+        action="store_true",
+        help="Print Markdown line locations while inserting equations.",
+    )
+    parser.add_argument(
+        "--linearize-latex",
+        action="store_true",
+        help="Convert selected LaTeX commands before inserting equations. Off by default because it can reduce OMML fidelity.",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
+    args = parse_args()
+    targets = args.markdown or TARGETS
     word = win32.gencache.EnsureDispatch("Word.Application")
     word.Visible = False
     results = []
     try:
-        for md_path in TARGETS:
-            out_path, stats, failed = convert_one(word, md_path)
+        for md_path in targets:
+            out_path, stats, failed = convert_one(
+                word,
+                md_path,
+                build_math=not args.no_buildup,
+                trace_math=args.trace_math,
+                linearize_latex=args.linearize_latex,
+            )
             results.append((out_path, stats, failed))
     finally:
         word.Quit()

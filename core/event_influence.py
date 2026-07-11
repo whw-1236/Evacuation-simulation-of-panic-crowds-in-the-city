@@ -474,7 +474,7 @@ class EventInfluenceCalculator:
             'panic_reduction': min(0.2, panic_reduction)
         }
 
-    def calc_opinion_management_effect(self, active, residents, dt):
+    def calc_opinion_management_effect(self, active, residents, dt, total_residents=None):
         """
         事件5: 实施舆情管理的影响 【公式关联版】
 
@@ -502,8 +502,16 @@ class EventInfluenceCalculator:
         返回:
             dict: 影响结果（用于事件影响计算链）
         """
+        total_count = int(total_residents) if total_residents is not None else len(residents)
+        total_count = max(0, total_count)
+        target_count = len(residents)
+        target_ratio = target_count / total_count if total_count else 0.0
+
         if not active or not residents:
             return {
+                'active': False,
+                'active_resident_count': 0,
+                'active_resident_ratio': 0.0,
                 'official_info_boost': 0,  # 官方信息传播加速量
                 'rumor_suppress_rate': 0,  # 谣言抑制率
                 'seir_infection_reduction': 0,  # SEIR感染率降低
@@ -542,6 +550,9 @@ class EventInfluenceCalculator:
         panic_spread_reduction = k_spread * avg_panic * avg_official * dt
 
         return {
+            'active': True,
+            'active_resident_count': target_count,
+            'active_resident_ratio': target_ratio,
             'official_info_boost': min(0.15, official_info_boost),
             'rumor_suppress_rate': min(0.20, rumor_suppress_rate),
             'seir_infection_reduction': min(0.10, seir_infection_reduction),
@@ -1465,8 +1476,13 @@ class EventInfluenceCalculator:
             sim.gov.last_deployment * 0.2, sim.residents, dt)
 
         # 事件5: 实施舆情管理
+        opinion_residents = [
+            r for r in sim.residents
+            if bool(getattr(r, '_opinion_management_active', False))
+        ]
         effects['government']['opinion_manage'] = self.calc_opinion_management_effect(
-            sim.gov.public_opinion_active, sim.residents, dt)
+            bool(opinion_residents), opinion_residents, dt,
+            total_residents=len(sim.residents))
 
         # ==================== 电网事件 ====================
         # 事件6: 区域断电
@@ -1547,6 +1563,7 @@ class EventInfluenceCalculator:
             # 【新增】情绪抑制统计
             'total_emotion_suppression': 0.0,
             'active_suppression_mechanisms': 0,
+            'opinion_management_emotion_change': 0.0,
         }
 
         gov_effects = effects.get('government', {})
@@ -1596,10 +1613,14 @@ class EventInfluenceCalculator:
             opinion = gov_effects['opinion_manage']
             rumor_suppress = opinion.get('rumor_suppress_rate', 0)
             panic_reduction = opinion.get('panic_spread_reduction', 0)
+            target_ratio = opinion.get('active_resident_ratio', 0)
 
             # 间接情绪影响 = 谣言抑制 × 谣言对情绪的影响系数
-            indirect_emotion_effect = rumor_suppress * 0.3 + panic_reduction * 0.2
+            indirect_emotion_effect = (
+                rumor_suppress * 0.3 + panic_reduction * 0.2
+            ) * target_ratio
             summary['total_emotion_change'] -= indirect_emotion_effect
+            summary['opinion_management_emotion_change'] -= indirect_emotion_effect
             summary['total_emotion_suppression'] += indirect_emotion_effect
 
             if opinion.get('official_info_boost', 0) > 0:
@@ -1696,10 +1717,22 @@ class EventInfluenceCalculator:
 
         # ============ 应用情绪变化 ============
         emotion_change = summary.get('total_emotion_change', 0)
-        if abs(emotion_change) > 0.001:
+        opinion_emotion_change = summary.get('opinion_management_emotion_change', 0)
+        global_emotion_change = emotion_change - opinion_emotion_change
+        if abs(global_emotion_change) > 0.001:
             scale = 0.1
             for r in sim.residents:
-                new_emotion = r.emotion + emotion_change * scale
+                new_emotion = r.emotion + global_emotion_change * scale
+                r.emotion = max(0, min(1, new_emotion))
+
+        opinion_target_residents = [
+            r for r in sim.residents
+            if bool(getattr(r, '_opinion_management_active', False))
+        ]
+        if abs(opinion_emotion_change) > 0.001 and opinion_target_residents:
+            scale = 0.1
+            for r in opinion_target_residents:
+                new_emotion = r.emotion + opinion_emotion_change * scale
                 r.emotion = max(0, min(1, new_emotion))
 
         # ============ 【公式关联】应用舆情管理的间接效果 ============
@@ -1710,7 +1743,7 @@ class EventInfluenceCalculator:
             # 【公式关联1】增加官方信息传播
             official_boost = opinion_effect.get('official_info_boost', 0)
             if official_boost > 0:
-                for r in sim.residents:
+                for r in opinion_target_residents:
                     # 公式: info_official += boost × (1 - current_official)
                     # 官方信息越少的人，增量越大
                     current = r.info_received.get('official', 0)
@@ -1720,7 +1753,7 @@ class EventInfluenceCalculator:
             # 【公式关联2】抑制谣言相信度
             rumor_suppress = opinion_effect.get('rumor_suppress_rate', 0)
             if rumor_suppress > 0:
-                for r in sim.residents:
+                for r in opinion_target_residents:
                     # 公式: rumor_belief -= k × official × rumor_belief
                     # 官方信息越多，谣言相信度越高的人，抑制效果越明显
                     official = r.info_received.get('official', 0)
@@ -1730,7 +1763,7 @@ class EventInfluenceCalculator:
             # 【公式关联3】SEIR感染率降低（通过信息澄清）
             seir_reduction = opinion_effect.get('seir_infection_reduction', 0)
             if seir_reduction > 0:
-                for r in sim.residents:
+                for r in opinion_target_residents:
                     if r.state == 'S':
                         # 高官方信息 + 低情绪的S状态居民，有概率变成R（理性抵制）
                         official = r.info_received.get('official', 0)
