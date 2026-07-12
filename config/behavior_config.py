@@ -49,6 +49,13 @@ class GovernmentBehaviorConfig:
     # 启动舆情管理的舆情压力阈值
     OPINION_MANAGE_THRESHOLD = 0.4  # 舆情压力>0.4启动管理
 
+    # 舆情状态方程（单位：每小时）。`public_opinion_pressure` 是事件5
+    # 自动触发和CSV导出的唯一舆情状态；这里的参数只控制其动态演化，
+    # 不改变历史的综合求助压力 P(Eq.23)。
+    OPINION_PRESSURE_ACCUMULATION = 0.10
+    OPINION_PRESSURE_DECAY_RATE = 0.025
+    OPINION_MANAGEMENT_RELIEF_RATE = 0.12
+
     # 向电网分配资源的停电比例阈值
     RESOURCE_TO_GRID_THRESHOLD = 0.05  # 停电比例>5%开始支援电网
 

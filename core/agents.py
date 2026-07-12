@@ -492,6 +492,31 @@ class GovernmentAgent:
     - public_opinion_active: 触发事件5(实施舆情管理)
     """
 
+    # A government action is controlled independently.  ``use_manual_events``
+    # and the ``manual_*`` booleans are retained for old UI/config callers,
+    # but a manual ON for one action must never force every other action OFF.
+    _EVENT_MODE_ALIASES = {
+        'warning': 'emergency_warning',
+        'emergency_warning': 'emergency_warning',
+        'grid': 'resource_to_grid',
+        'resource_to_grid': 'resource_to_grid',
+        'enterprise': 'resource_to_enterprise',
+        'resource_to_enterprise': 'resource_to_enterprise',
+        'resident': 'resource_to_resident',
+        'resource_to_resident': 'resource_to_resident',
+        'opinion': 'public_opinion',
+        'opinion_manage': 'public_opinion',
+        'public_opinion': 'public_opinion',
+    }
+    _EVENT_MANUAL_ATTR = {
+        'emergency_warning': 'manual_emergency_warning',
+        'resource_to_grid': 'manual_resource_to_grid',
+        'resource_to_enterprise': 'manual_resource_to_enterprise',
+        'resource_to_resident': 'manual_resource_to_resident',
+        'public_opinion': 'manual_public_opinion',
+    }
+    _VALID_EVENT_MODES = {'auto', 'on', 'off'}
+
     def __init__(self, initiative=0.5, response=1.0,
                  w_L=1.0, w_E=1.0, w_Q=1.0, w_C=1.0, delta=0.02,
                  behavior_config=None):
@@ -559,6 +584,27 @@ class GovernmentAgent:
         self.manual_resource_to_resident = False
         self.manual_public_opinion = False
 
+        # New tri-state, per-action control API.  ``auto`` is the default for
+        # every event and remains so when a different event is forced ON/OFF.
+        self.event_modes = {
+            event: 'auto' for event in self._EVENT_MANUAL_ATTR
+        }
+
+        # Audit/state fields.  The dynamic value is written by
+        # EventInfluenceCalculator after each step and used on the next
+        # government decision.  It deliberately differs from the historical
+        # emotion/panic proxy once the authoritative state is available.
+        self.authoritative_public_opinion_pressure = None
+        self.last_opinion_pressure = 0.0
+        self.last_opinion_threshold_margin = -self.opinion_threshold
+
+        # Actual amounts are event-gated and are consumed by event influence
+        # and CSV/audit code.  They avoid treating all deployment as if every
+        # resource intervention had occurred.
+        self.last_resource_to_grid_amount = 0.0
+        self.last_resource_to_enterprise_amount = 0.0
+        self.last_resource_to_resident_amount = 0.0
+
         # ============ 区域目标控制 ============
         # target_all_zones=True时，事件影响所有区域
         # target_all_zones=False时，仅影响target_zones列表中的区域
@@ -567,6 +613,66 @@ class GovernmentAgent:
 
         # 各区域的资源分配比例（供event_influence使用）
         self.zone_resource_allocation = {}
+
+    @classmethod
+    def _normalize_event_name(cls, event_name):
+        key = str(event_name or '').strip().lower()
+        if key not in cls._EVENT_MODE_ALIASES:
+            supported = ', '.join(sorted(cls._EVENT_MANUAL_ATTR))
+            raise ValueError(f'Unsupported government event {event_name!r}; expected one of: {supported}')
+        return cls._EVENT_MODE_ALIASES[key]
+
+    def set_event_mode(self, event_name, mode):
+        """Set one government action to ``auto``, ``on`` or ``off``.
+
+        This is the authoritative public API for UI/config/batch controls.
+        Legacy ``manual_*`` fields mirror an ON state for callers that still
+        inspect them, while an explicit OFF is preserved in ``event_modes``.
+        """
+        event = self._normalize_event_name(event_name)
+        normalized_mode = str(mode or '').strip().lower()
+        if normalized_mode not in self._VALID_EVENT_MODES:
+            raise ValueError(
+                f'Unsupported mode {mode!r}; expected auto/on/off'
+            )
+        self.event_modes[event] = normalized_mode
+        setattr(self, self._EVENT_MANUAL_ATTR[event], normalized_mode == 'on')
+        # Compatibility-only status for old UIs.  Event resolution never uses
+        # this as a global switch.
+        self.use_manual_events = any(
+            current_mode != 'auto' for current_mode in self.event_modes.values()
+        ) or any(
+            bool(getattr(self, attr, False))
+            for attr in self._EVENT_MANUAL_ATTR.values()
+        )
+
+    def get_event_mode(self, event_name):
+        """Return the effective requested mode for one government action."""
+        event = self._normalize_event_name(event_name)
+        mode = self.event_modes.get(event, 'auto')
+        if mode != 'auto':
+            return mode
+        # Old callers can still set one legacy flag directly.  False is
+        # intentionally interpreted as "no override", not a global OFF.
+        if bool(getattr(self, self._EVENT_MANUAL_ATTR[event], False)):
+            return 'on'
+        return 'auto'
+
+    def _resolve_event_active(self, event_name, automatic_value):
+        mode = self.get_event_mode(event_name)
+        if mode == 'on':
+            return True
+        if mode == 'off':
+            return False
+        return bool(automatic_value)
+
+    def set_public_opinion_pressure(self, pressure):
+        """Receive the authoritative dynamic public-opinion state."""
+        try:
+            pressure = float(pressure)
+        except (TypeError, ValueError):
+            pressure = 0.0
+        self.authoritative_public_opinion_pressure = max(0.0, min(1.0, pressure))
 
     def is_target_zone(self, zone_id):
         """
@@ -638,22 +744,30 @@ class GovernmentAgent:
         # ============ 事件1: 发布应急预警 ============
         # 【人为控制模式】由外部控制开始/结束
         # 【自动模式】停电比例 > warning_threshold 时触发
-        if self.use_manual_events:
-            self.emergency_warning_issued = self.manual_emergency_warning
-        else:
-            if outage_ratio > self.warning_threshold and not self.emergency_warning_issued:
-                self.emergency_warning_issued = True
-            elif outage_ratio <= self.warning_threshold * 0.5:
-                self.emergency_warning_issued = False
+        auto_warning = self.emergency_warning_issued
+        if outage_ratio > self.warning_threshold:
+            auto_warning = True
+        elif outage_ratio <= self.warning_threshold * 0.5:
+            auto_warning = False
+        self.emergency_warning_issued = self._resolve_event_active(
+            'emergency_warning', auto_warning
+        )
 
         # ============ 事件5: 实施舆情管理 ============
         # 【人为控制模式】由外部控制开始/结束
         # 【自动模式】舆情压力 > opinion_threshold 时触发
-        if self.use_manual_events:
-            self.public_opinion_active = self.manual_public_opinion
-        else:
-            opinion_pressure = emotion_impact * 0.5 + max_panic * 0.5
-            self.public_opinion_active = opinion_pressure > self.opinion_threshold
+        proxy_opinion_pressure = emotion_impact * 0.5 + max_panic * 0.5
+        authoritative_pressure = self.authoritative_public_opinion_pressure
+        if authoritative_pressure is None:
+            authoritative_pressure = proxy_opinion_pressure
+        self.last_opinion_pressure = max(0.0, min(1.0, float(authoritative_pressure)))
+        self.last_opinion_threshold_margin = (
+            self.last_opinion_pressure - self.opinion_threshold
+        )
+        self.public_opinion_active = self._resolve_event_active(
+            'public_opinion',
+            self.last_opinion_pressure > self.opinion_threshold,
+        )
 
         # ============ 资源下发决策 ============
         # 公式: deployment = initiative × 3.0 × response × (1 + pressure) × 0.4
@@ -669,13 +783,14 @@ class GovernmentAgent:
         # ============ 事件2: 政府分配资源给电网 ============
         # 【人为控制模式】由外部控制开始/结束
         # 【自动模式】有停电且有资源时触发
-        if self.use_manual_events:
-            self.resource_to_grid = self.manual_resource_to_grid
-        else:
-            if actual_deployment > 0.1 and outage_ratio > 0:
-                self.resource_to_grid = True
-            else:
-                self.resource_to_grid = False
+        auto_resource_to_grid = actual_deployment > 0.1 and outage_ratio > 0
+        self.resource_to_grid = self._resolve_event_active(
+            'resource_to_grid', auto_resource_to_grid
+        )
+        self.last_resource_to_grid_amount = (
+            actual_deployment * self.allocation_grid
+            if self.resource_to_grid else 0.0
+        )
 
         self.last_deployment = actual_deployment
 
@@ -685,7 +800,7 @@ class GovernmentAgent:
         """保持用户设定参数不变"""
         pass
 
-    def allocate_resources(self, enterprises, deployed_resources, region_panic_levels=None, residents=None):
+    def _allocate_resources_legacy(self, enterprises, deployed_resources, region_panic_levels=None, residents=None):
         """
         资源分配给企业和居民 - 按区域严重程度差异化分配
 
@@ -833,6 +948,166 @@ class GovernmentAgent:
 
             if not resident_allocated:
                 self.resource_to_resident = False
+
+    def allocate_resources(self, enterprises, deployed_resources, region_panic_levels=None, residents=None):
+        """Allocate event-gated government support without cross-event locks.
+
+        The previous implementation used one shared ``use_manual_events``
+        switch.  Turning on event 5 therefore made events 1--4 implicitly
+        false, and a manual event-3 flag did not execute compensation.  This
+        implementation resolves every intervention independently and records
+        the amount that was actually routed through each intervention.
+        """
+        enterprises = list(enterprises or [])
+        residents = list(residents or [])
+        region_panic_levels = dict(region_panic_levels or {})
+        try:
+            deployed_resources = max(0.0, float(deployed_resources))
+        except (TypeError, ValueError):
+            deployed_resources = 0.0
+
+        # Clear per-step audit amounts before resolving the current actions.
+        self.last_resource_to_enterprise_amount = 0.0
+        self.last_resource_to_resident_amount = 0.0
+        self.zone_resource_allocation = {}
+
+        resource_for_enterprise = deployed_resources * self.allocation_enterprise
+        resource_for_resident = deployed_resources * self.allocation_resident
+
+        def _request_value(enterprise):
+            try:
+                return max(0.0, float(enterprise.request()))
+            except (AttributeError, TypeError, ValueError):
+                return 0.0
+
+        # Build a common severity map so manual and automatic allocations use
+        # exactly the same targeting/normalization rule.
+        zone_enterprise_stats = {}
+        for enterprise in enterprises:
+            zone = getattr(enterprise, 'zone', 'unknown')
+            stat = zone_enterprise_stats.setdefault(
+                zone, {'count': 0, 'total_request': 0.0, 'crisis_count': 0}
+            )
+            stat['count'] += 1
+            stat['total_request'] += _request_value(enterprise)
+            stat['crisis_count'] += int(bool(getattr(enterprise, 'is_in_crisis', False)))
+
+        zone_resident_stats = {}
+        for resident in residents:
+            zone = getattr(resident, 'zone', 'unknown')
+            stat = zone_resident_stats.setdefault(
+                zone, {'count': 0, 'outage_count': 0}
+            )
+            stat['count'] += 1
+            stat['outage_count'] += int(not bool(getattr(resident, 'powered', True)))
+
+        all_zones = (
+            set(zone_enterprise_stats)
+            | set(zone_resident_stats)
+            | set(region_panic_levels)
+        )
+        if not self.target_all_zones and self.target_zones:
+            all_zones = {zone for zone in all_zones if self.is_target_zone(zone)}
+
+        zone_severity = {}
+        for zone in all_zones:
+            resident_stat = zone_resident_stats.get(zone, {})
+            enterprise_stat = zone_enterprise_stats.get(zone, {})
+            resident_count = resident_stat.get('count', 0)
+            enterprise_count = enterprise_stat.get('count', 0)
+            outage_severity = (
+                resident_stat.get('outage_count', 0) / resident_count
+                if resident_count else 0.0
+            )
+            panic_severity = max(0.0, min(1.0, float(region_panic_levels.get(zone, 0.0))))
+            if enterprise_count:
+                avg_request = enterprise_stat.get('total_request', 0.0) / enterprise_count
+                crisis_ratio = enterprise_stat.get('crisis_count', 0) / enterprise_count
+                enterprise_severity = avg_request * 0.6 + crisis_ratio * 0.4
+            else:
+                enterprise_severity = 0.0
+            zone_severity[zone] = (
+                outage_severity * 0.4
+                + panic_severity * 0.3
+                + enterprise_severity * 0.3
+            )
+
+        total_severity = sum(zone_severity.values())
+        if all_zones and total_severity > 1e-12:
+            zone_weights = {
+                zone: severity / total_severity
+                for zone, severity in zone_severity.items()
+            }
+        elif all_zones:
+            equal_weight = 1.0 / len(all_zones)
+            zone_weights = {zone: equal_weight for zone in all_zones}
+        else:
+            zone_weights = {}
+
+        # Event 3: resources to enterprises.  Manual ON now follows the same
+        # compensation route as automatic activation rather than only toggling
+        # a display flag.
+        avg_request = (
+            sum(_request_value(enterprise) for enterprise in enterprises) / len(enterprises)
+            if enterprises else 0.0
+        )
+        auto_enterprise = bool(enterprises) and avg_request > self.enterprise_threshold
+        self.resource_to_enterprise = self._resolve_event_active(
+            'resource_to_enterprise', auto_enterprise
+        )
+        if self.resource_to_enterprise and resource_for_enterprise > 0 and enterprises:
+            targets_by_zone = {}
+            for enterprise in enterprises:
+                zone = getattr(enterprise, 'zone', 'unknown')
+                if all_zones and zone not in all_zones:
+                    continue
+                targets_by_zone.setdefault(zone, []).append(enterprise)
+
+            # A manual intervention may be intentionally proactive, so a
+            # zero-request enterprise still receives an equal baseline share.
+            for zone, targets in targets_by_zone.items():
+                zone_budget = resource_for_enterprise * zone_weights.get(
+                    zone, 1.0 / max(1, len(targets_by_zone))
+                )
+                weighted_needs = []
+                for enterprise in targets:
+                    need = max(
+                        _request_value(enterprise),
+                        0.25 * max(0.0, float(getattr(enterprise, 'desperation_level', 0.0))),
+                        1e-9,
+                    )
+                    enterprise_type = str(getattr(enterprise, 'enterprise_type', '')).lower()
+                    type_multiplier = {
+                        'small': 1.4, 'medium': 1.2, 'large': 1.0,
+                        '小型': 1.4, '中型': 1.2, '大型': 1.0,
+                    }.get(enterprise_type, 1.0)
+                    weighted_needs.append((enterprise, need * type_multiplier))
+                total_need = sum(weight for _, weight in weighted_needs)
+                for enterprise, weighted_need in weighted_needs:
+                    compensation = zone_budget * weighted_need / max(total_need, 1e-12)
+                    receive_compensation = getattr(enterprise, 'receive_compensation', None)
+                    if callable(receive_compensation):
+                        receive_compensation(compensation)
+                        self.last_resource_to_enterprise_amount += compensation
+
+        # Event 4: resources to residents.  The resource pool is recorded only
+        # when this event is active; EventInfluenceCalculator uses the same
+        # gate for behavioural effects.
+        avg_emotion = (
+            sum(max(0.0, float(getattr(resident, 'emotion', 0.0))) for resident in residents) / len(residents)
+            if residents else 0.0
+        )
+        high_severity = any(severity > 0.3 for severity in zone_severity.values())
+        high_panic = any(float(value) > 0.5 for value in region_panic_levels.values())
+        auto_resident = bool(residents) and (
+            avg_emotion > self.resident_threshold or high_severity or high_panic
+        )
+        self.resource_to_resident = self._resolve_event_active(
+            'resource_to_resident', auto_resident
+        )
+        if self.resource_to_resident and resource_for_resident > 0 and residents:
+            self.zone_resource_allocation = zone_weights.copy()
+            self.last_resource_to_resident_amount = resource_for_resident
 
 
 class PowerGridAgent:

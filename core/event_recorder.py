@@ -332,10 +332,13 @@ class EventDetector:
         # 6. 区域断电（包括完全停电和部分停电/切负荷）
         # 获取部分停电的区域
         partial_outage_zones = set(getattr(sim, 'partial_outage_entities', {}).keys())
+        previous_partial_outage_zones = set(
+            getattr(self, 'prev_partial_zones', set())
+        )
 
         for zone, powered in current_zone_status.items():
             prev_powered = self.prev_zone_status.get(zone, True)
-            prev_partial = zone in getattr(self, 'prev_partial_zones', set())
+            prev_partial = zone in previous_partial_outage_zones
             curr_partial = zone in partial_outage_zones
 
             # 完全停电：zone_status 从 True 变为 False
@@ -345,9 +348,6 @@ class EventDetector:
             # 部分停电（切负荷）：加入 partial_outage_entities
             elif not prev_partial and curr_partial:
                 self.recorder.start_event(GRID_BLACKOUT, zone)
-
-        # 保存当前部分停电区域，供下一步检测
-        self.prev_partial_zones = partial_outage_zones.copy()
 
         # 检查是否使用人为控制模式
         use_manual = getattr(sim.grid, 'use_manual_events', False)
@@ -430,12 +430,19 @@ class EventDetector:
 
         # 9. 恢复供电（包括完全恢复和部分停电区域恢复）
         partial_outage_zones = set(getattr(sim, 'partial_outage_entities', {}).keys())
-        prev_partial_zones = getattr(self, 'prev_partial_zones', set())
+        prev_partial_zones = previous_partial_outage_zones
 
         for zone, powered in current_zone_status.items():
             prev_powered = self.prev_zone_status.get(zone, True)
             was_partial = zone in prev_partial_zones
             is_partial = zone in partial_outage_zones
+
+            # A full incident may enter a staged, partial-restoration phase
+            # before all selected loads are back.  Do not record GRID_RESTORE
+            # at that intermediate red->amber transition; the partial branch
+            # below emits the one authoritative restore at final completion.
+            if not prev_powered and powered and is_partial:
+                continue
 
             # 完全停电恢复：zone_status 从 False 变为 True
             if not prev_powered and powered:
@@ -448,6 +455,10 @@ class EventDetector:
                 self.recorder.end_event(GRID_BLACKOUT, zone)
                 self.recorder.end_event(GRID_REPAIR, zone)
                 self.recorder.record_instant_event(GRID_RESTORE, zone)
+
+        # Commit the partial-outage cache only after both transition detectors
+        # have consumed the prior step's state.
+        self.prev_partial_zones = partial_outage_zones.copy()
 
     def _detect_enterprise_events(self, sim):
         """检测企业事件"""

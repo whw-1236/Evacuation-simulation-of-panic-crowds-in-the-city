@@ -18,9 +18,12 @@ import os
 import sys
 import csv
 import io
+import json
+import math
 import random
 import traceback
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import datetime
 
 # 项目根目录加入 sys.path
@@ -75,6 +78,244 @@ def _load_outage_causes():
         return Config().load_priority.OUTAGE_CAUSES
     except Exception:
         return {'equipment_failure': {'name': '设备故障'}}
+
+
+def _safe_float(value, default=0.0):
+    """Convert UI/export values without letting an optional v2 field break a run."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _latest_value(source, fallback=0.0):
+    """Read either a scalar or the latest element of a simulation history."""
+    if isinstance(source, (list, tuple, np.ndarray)):
+        return _safe_float(source[-1], fallback) if len(source) else _safe_float(fallback)
+    return _safe_float(source, fallback)
+
+
+def _outage_state_to_audit(state, district=''):
+    """Normalize a v2 outage dataclass/dict and tolerate the pre-v2 fields."""
+    if state is None:
+        return {}
+    try:
+        audit = state.to_audit_dict() if callable(getattr(state, 'to_audit_dict', None)) else state
+    except Exception:
+        audit = state
+    if isinstance(audit, Mapping):
+        data = dict(audit)
+    else:
+        fields = (
+            'event_id', 'district', 'status', 'mode', 'cause', 'damage_level',
+            'requested_shed_ratio', 'realized_shed_ratio', 'seed',
+            'affected_zone_ids', 'affected_loads', 'affected_zone_count',
+            'affected_load_count', 'detection_remaining_hours',
+            'mobilization_remaining_hours', 'scheduled_remaining_hours',
+            'total_work', 'work_done', 'remaining_work', 'current_capacity',
+            'progress', 'eta_hours', 'start_step', 'repair_started_step',
+            'restored_step',
+        )
+        data = {name: getattr(audit, name) for name in fields if hasattr(audit, name)}
+    if district and not data.get('district'):
+        data['district'] = district
+    if 'affected_zone_count' not in data:
+        data['affected_zone_count'] = len(data.get('affected_zone_ids') or [])
+    if 'affected_load_count' not in data:
+        data['affected_load_count'] = len(data.get('affected_loads') or [])
+    total_work = _safe_float(data.get('total_work', 0.0))
+    work_done = _safe_float(data.get('work_done', 0.0))
+    if 'remaining_work' not in data:
+        data['remaining_work'] = max(0.0, total_work - work_done)
+    if 'progress' not in data:
+        data['progress'] = (work_done / total_work) if total_work > 0 else 0.0
+    return data
+
+
+def _get_outage_state_audits(sim):
+    """Return current per-district outage state records, including a legacy fallback."""
+    raw_states = None
+    for attr in ('district_outage_states', 'outage_states'):
+        candidate = getattr(sim, attr, None)
+        if candidate:
+            raw_states = candidate
+            break
+
+    audits = []
+    if isinstance(raw_states, Mapping):
+        for district, state in raw_states.items():
+            data = _outage_state_to_audit(state, str(district))
+            if data:
+                audits.append(data)
+    elif isinstance(raw_states, (list, tuple)):
+        audits = [_outage_state_to_audit(state) for state in raw_states]
+        audits = [item for item in audits if item]
+
+    if not audits:
+        getter = getattr(sim, 'get_outage_state', None)
+        districts = list((getattr(sim, 'district_to_zones', {}) or {}).keys())
+        if callable(getter) and districts:
+            for district in districts:
+                try:
+                    data = _outage_state_to_audit(getter(district), district)
+                except Exception:
+                    data = {}
+                if data:
+                    audits.append(data)
+
+    # Pre-v2 compatibility: the UI can still describe the old single-district state.
+    if not audits and getattr(sim, 'district_outage_mode', None):
+        total_work = _safe_float(getattr(sim, 'district_total_work', 0.0))
+        progress = _safe_float(getattr(sim, 'district_repair_progress', 0.0))
+        audits.append({
+            'district': getattr(sim, 'district_name', ''),
+            'status': 'repairing' if getattr(sim, 'district_repair_started', False) else 'detecting',
+            'mode': getattr(sim, 'district_outage_mode', ''),
+            'cause': getattr(sim, 'district_outage_cause', ''),
+            'requested_shed_ratio': 1.0 if getattr(sim, 'district_outage_mode', '') == 'full' else 0.0,
+            'realized_shed_ratio': 0.0,
+            'total_work': total_work,
+            'work_done': total_work * progress,
+            'remaining_work': total_work * max(0.0, 1.0 - progress),
+            'progress': progress,
+            'current_capacity': 0.0,
+            'affected_zone_count': sum(
+                1 for powered in (getattr(sim, 'zone_status', {}) or {}).values() if not powered),
+            'affected_load_count': 0,
+        })
+    return audits
+
+
+def _outage_metrics_snapshot(sim):
+    """Aggregate active v2 incidents into a compact, CSV-safe UI snapshot."""
+    audits = _get_outage_state_audits(sim)
+    inactive = {'', 'inactive', 'normal', 'restored', 'completed', 'cancelled', 'none'}
+    active = [
+        state for state in audits
+        if str(state.get('status', '')).lower() not in inactive
+    ]
+    if not active:
+        return {
+            'active': False, 'state_count': 0, 'event_id': '', 'phase': '正常供电',
+            'mode': '', 'cause': '', 'seed': '', 'requested_shed_ratio': 0.0,
+            'realized_shed_ratio': 0.0, 'affected_zone_count': 0,
+            'affected_load_count': 0, 'detection_remaining_hours': 0.0,
+            'mobilization_remaining_hours': 0.0, 'total_work': 0.0,
+            'work_done': 0.0, 'remaining_work': 0.0, 'current_capacity': 0.0,
+            'progress': 0.0, 'eta_hours': 0.0, 'estimated_recovery_step': None,
+        }
+
+    total_work = sum(_safe_float(item.get('total_work', 0.0)) for item in active)
+    work_done = sum(_safe_float(item.get('work_done', 0.0)) for item in active)
+    remaining_work = sum(_safe_float(item.get('remaining_work', 0.0)) for item in active)
+    capacity = sum(_safe_float(item.get('current_capacity', 0.0)) for item in active)
+    affected_loads = sum(int(_safe_float(item.get('affected_load_count', 0))) for item in active)
+    affected_zones = sum(int(_safe_float(item.get('affected_zone_count', 0))) for item in active)
+    weights = [max(1, int(_safe_float(item.get('affected_load_count', 0)))) for item in active]
+    weight_total = sum(weights)
+    requested = sum(
+        _safe_float(item.get('requested_shed_ratio', 0.0)) * weight
+        for item, weight in zip(active, weights)
+    ) / weight_total
+    realized = sum(
+        _safe_float(item.get('realized_shed_ratio', 0.0)) * weight
+        for item, weight in zip(active, weights)
+    ) / weight_total
+    eta_values = []
+    for item in active:
+        scheduled = item.get('scheduled_remaining_hours')
+        if scheduled is not None:
+            eta_values.append(max(0.0, _safe_float(scheduled)))
+            continue
+        repair_eta = item.get('eta_hours')
+        if repair_eta is None:
+            item_capacity = _safe_float(item.get('current_capacity', 0.0))
+            repair_eta = (_safe_float(item.get('remaining_work', 0.0)) / item_capacity
+                          if item_capacity > 0 else float('inf'))
+        eta_values.append(
+            max(0.0, _safe_float(item.get('detection_remaining_hours', 0.0))) +
+            max(0.0, _safe_float(item.get('mobilization_remaining_hours', 0.0))) +
+            _safe_float(repair_eta, float('inf'))
+        )
+    eta_hours = max(eta_values) if eta_values else float('inf')
+    dt = _safe_float(getattr(sim, 'dt', 0.0))
+    estimated_step = None
+    if math.isfinite(eta_hours) and dt > 0:
+        estimated_step = int(getattr(sim, 'step_count', 0) + math.ceil(eta_hours / dt))
+    phases = sorted({str(item.get('status', '') or 'active') for item in active})
+    modes = sorted({str(item.get('mode', '') or '') for item in active})
+    causes = sorted({str(item.get('cause', '') or '') for item in active})
+    event_ids = [str(item.get('event_id', '')) for item in active if item.get('event_id')]
+    seeds = [str(item.get('seed', '')) for item in active if item.get('seed') is not None]
+    return {
+        'active': True,
+        'state_count': len(active),
+        'event_id': ','.join(event_ids),
+        'phase': '/'.join(phases),
+        'mode': '/'.join(modes),
+        'cause': '/'.join(causes),
+        'seed': ','.join(seeds),
+        'requested_shed_ratio': requested,
+        'realized_shed_ratio': realized,
+        'affected_zone_count': affected_zones,
+        'affected_load_count': affected_loads,
+        'detection_remaining_hours': max(
+            (_safe_float(item.get('detection_remaining_hours', 0.0)) for item in active), default=0.0),
+        'mobilization_remaining_hours': max(
+            (_safe_float(item.get('mobilization_remaining_hours', 0.0)) for item in active), default=0.0),
+        'total_work': total_work,
+        'work_done': work_done,
+        'remaining_work': remaining_work,
+        'current_capacity': capacity,
+        'progress': (work_done / total_work) if total_work > 0 else 0.0,
+        'eta_hours': eta_hours,
+        'estimated_recovery_step': estimated_step,
+    }
+
+
+def _csv_number(value, digits=4):
+    """Format numbers consistently, keeping unavailable/infinite repair ETA explicit."""
+    if value is None:
+        return ''
+    number = _safe_float(value, float('nan'))
+    if math.isnan(number):
+        return ''
+    if math.isinf(number):
+        return 'inf' if number > 0 else '-inf'
+    return f'{number:.{digits}f}'
+
+
+def _system_help_components(sim, raw_emotion):
+    """Expose Eq.23 components when core supplies them; derive only for legacy UI CSV."""
+    components = getattr(sim, 'opinion_components', {}) or {}
+    if isinstance(components, Mapping):
+        def _component(*names):
+            for name in names:
+                if name in components:
+                    return _safe_float(components[name])
+            return None
+
+        emotion = _component('emotion', 'emotion_component', 'emotion_pressure')
+        enterprise = _component('enterprise', 'enterprise_component', 'q_component')
+        critical = _component('critical', 'critical_component', 'c_component')
+        if emotion is not None and enterprise is not None and critical is not None:
+            return {
+                'emotion': emotion,
+                'enterprise': enterprise,
+                'critical': critical,
+                'source': 'core',
+            }
+
+    # Exact legacy Eq.23 fallback.  It keeps old runs interpretable but is not
+    # treated as a second authoritative opinion state.
+    q_value = _latest_value(getattr(sim, 'Q_hist', []), 0.0)
+    c_value = _latest_value(getattr(sim, 'C_hist', []), 0.0)
+    return {
+        'emotion': 0.4 * min(1.0, max(0.0, 2.0 * (raw_emotion - 0.3))),
+        'enterprise': 0.3 * min(1.0, max(0.0, q_value)),
+        'critical': 0.3 * min(1.0, max(0.0, c_value)),
+        'source': 'legacy_derived',
+    }
 
 
 # ============================================================
@@ -157,7 +398,11 @@ class SimulationWorker(QThread):
         self._step_interval_ms = 30
 
         # worker 自己维护的历史 (避免改 simulation.py)
+        # `opinion_hist` remains the legacy Eq.23 composite, now labelled
+        # "系统综合求助压力" in the UI.  The authoritative dynamic public-opinion
+        # state is kept separately so the two quantities cannot be confused.
         self.opinion_hist = []
+        self.public_opinion_hist = []
         self.emotion_hist = []           # raw, 严格按论文 §3.2.4 Eq.5 (sim 算的)
         self.emotion_display_hist = []   # UI-only: raw + chronic-anxiety floor + trailing avg
         self.stress_hist = []
@@ -259,6 +504,18 @@ class SimulationWorker(QThread):
 
         # 从 sim.X_hist 拿 (这些 IJDRR 本来就有)
         self.opinion_hist.append(sim.P_hist[-1] if sim.P_hist else 0.0)
+        public_hist = getattr(sim, 'public_opinion_hist', None)
+        if isinstance(public_hist, (list, tuple, np.ndarray)) and len(public_hist):
+            public_pressure = _latest_value(public_hist, self.opinion_hist[-1])
+        else:
+            event_influence = getattr(sim, 'event_influence', None)
+            public_pressure = _safe_float(
+                getattr(sim, 'public_opinion_pressure',
+                        getattr(event_influence, 'public_opinion_pressure',
+                                getattr(event_influence, 'opinion_pressure', self.opinion_hist[-1]))),
+                self.opinion_hist[-1],
+            )
+        self.public_opinion_hist.append(public_pressure)
         self.emotion_hist.append(sim.emotion_hist[-1] if sim.emotion_hist else 0.0)
         self.recovery_hist.append(sim.recovery_hist[-1] if sim.recovery_hist else 1.0)
         self.blackout_hist.append(sim.blackout_hist[-1] if sim.blackout_hist else 0.0)
@@ -322,25 +579,31 @@ class SimulationWorker(QThread):
             'active': int(raw_event_stats.get('active_events', 0) or 0),
             'completed': int(raw_event_stats.get('completed_events', 0) or 0),
         }
-        cause_values = list((getattr(s, 'zone_outage_cause', {}) or {}).values())
+        cause_values = [
+            value for value in (getattr(s, 'zone_outage_cause', {}) or {}).values()
+            if value
+        ]
         dominant_cause = ''
         if cause_values:
             dominant_cause = max(set(cause_values), key=cause_values.count)
         outage_command = getattr(s, 'last_ui_outage_command', {}) or {}
-        outage_mode = (
-            outage_command.get('mode') or
-            getattr(s, 'district_outage_mode', '') or
-            ''
-        )
-        outage_cause = (
-            outage_command.get('cause') or
-            getattr(s, 'district_outage_cause', '') or
-            dominant_cause
-        )
+        outage = _outage_metrics_snapshot(s)
+        outage_mode = outage.get('mode') or outage_command.get('mode') or getattr(s, 'district_outage_mode', '') or ''
+        outage_cause = outage.get('cause') or outage_command.get('cause') or getattr(s, 'district_outage_cause', '') or dominant_cause
+        help_components = _system_help_components(s, self.emotion_hist[-1])
+        action_log = getattr(s, 'ui_action_log', []) or []
+        last_action = action_log[-1] if isinstance(action_log, list) and action_log else {}
         return {
             'step': s.step_count,
             't_hour': getattr(s, 'current_hour', 0.0),
+            # Backward-compatible `P`; do not label this as social opinion.
             'P': self.opinion_hist[-1],
+            'system_help_pressure': self.opinion_hist[-1],
+            'public_opinion_pressure': self.public_opinion_hist[-1],
+            'system_help_emotion_component': help_components['emotion'],
+            'system_help_enterprise_component': help_components['enterprise'],
+            'system_help_critical_component': help_components['critical'],
+            'system_help_component_source': help_components['source'],
             'emotion_raw': self.emotion_hist[-1],
             'emotion_display': self.emotion_display_hist[-1],
             'emotion': self.emotion_display_hist[-1],  # 兼容旧字段, 给 status bar 用
@@ -355,8 +618,14 @@ class SimulationWorker(QThread):
             'history_len': len(self.opinion_hist),
             'outage_mode': outage_mode,
             'outage_cause': outage_cause,
-            'outage_severity': float(outage_command.get('severity_ratio', 0.0) or 0.0),
+            'outage_severity': float(outage.get('requested_shed_ratio', outage_command.get('severity_ratio', 0.0)) or 0.0),
             'outage_scope': outage_command.get('scope', ''),
+            'outage': outage,
+            'outage_last_error': str(getattr(s, 'last_ui_outage_error', '') or ''),
+            'outage_last_warning': str(getattr(s, 'last_ui_outage_warning', '') or ''),
+            'ui_action_count': len(action_log) if isinstance(action_log, list) else 0,
+            'ui_last_action': str(last_action.get('action', '')) if isinstance(last_action, Mapping) else '',
+            'ui_last_action_step': int(_safe_float(last_action.get('step', 0))) if isinstance(last_action, Mapping) else 0,
             'gov_events': gov_events,
             'event_stats': event_stats,
             'event5_district_ratio': float(getattr(s, 'event5_active_district_ratio', 0.0)),
@@ -373,7 +642,7 @@ class SimulationWorker(QThread):
 # 右侧图表面板 — 6 个时间序列子图
 # ============================================================
 class ChartPanel(QWidget):
-    """6 子图: 社会舆情 / 情绪 / 压力 / 恐慌 / flee+herd (§5.1) / SEIR"""
+    """6 子图: 系统求助/动态舆情、情绪、压力、恐慌、cascade 与 SEIR。"""
 
     def __init__(self):
         super().__init__()
@@ -392,7 +661,7 @@ class ChartPanel(QWidget):
         self.ax_seir = self.fig.add_subplot(616)
 
         for ax, title in [
-            (self.ax_opinion, '社会舆情 P (Eq.23)'),
+            (self.ax_opinion, '系统综合求助压力（Eq.23）/ 权威舆情压力（动态）'),
             (self.ax_emotion, '平均情绪 Emotion (UI 显示: chronic-anxiety floor; raw 见 CSV)'),
             (self.ax_stress, '平均压力 σ (master stress)'),
             (self.ax_panic, '平均恐慌 P_i = σ^0.8'),
@@ -404,7 +673,11 @@ class ChartPanel(QWidget):
             ax.grid(True, alpha=0.3)
             ax.tick_params(labelsize=7)
 
-        self.line_opinion, = self.ax_opinion.plot([], [], '-', color='#c0392b', lw=1.4)
+        self.line_opinion, = self.ax_opinion.plot(
+            [], [], '-', color='#c0392b', lw=1.4, label='系统综合求助压力 (Eq.23)')
+        self.line_public_opinion, = self.ax_opinion.plot(
+            [], [], '--', color='#6c3483', lw=1.3, label='权威舆情压力 (dynamic)')
+        self.ax_opinion.legend(loc='upper right', fontsize=6, ncol=2)
         # emotion: display 主线 (蓝实线) + raw 参考线 (灰虚线), 让 reviewer 同时看到原值
         self.line_emotion, = self.ax_emotion.plot([], [], '-', color='#3498db', lw=1.6,
                                                   label='UI display (floor)')
@@ -426,6 +699,7 @@ class ChartPanel(QWidget):
         self.ax_seir.legend(loc='upper right', fontsize=7, ncol=4)
 
         self._intervention_markers = []
+        self._intervention_annotations = []
 
     def update_data(self, worker):
         n = len(worker.opinion_hist)
@@ -433,6 +707,7 @@ class ChartPanel(QWidget):
             return
         xs = np.arange(n)
         self.line_opinion.set_data(xs, worker.opinion_hist)
+        self.line_public_opinion.set_data(xs, worker.public_opinion_hist)
         # emotion: 主线用 display (chronic-anxiety floor), 参考线显示 raw §3.2.4 公式值
         self.line_emotion.set_data(xs, worker.emotion_display_hist)
         self.line_emotion_raw.set_data(xs, worker.emotion_hist)
@@ -452,6 +727,16 @@ class ChartPanel(QWidget):
                    self.ax_panic, self.ax_cascade, self.ax_seir]:
             line = ax.axvline(step, color='#7f8c8d', lw=0.8, ls='--', alpha=0.5)
             self._intervention_markers.append(line)
+        if label:
+            # Existing marker lines were anonymous.  A compact label on the
+            # top panel makes screenshots auditable without covering all six plots.
+            annotation = self.ax_opinion.text(
+                step, 0.98, str(label)[:32],
+                transform=self.ax_opinion.get_xaxis_transform(), rotation=90,
+                va='top', ha='right', fontsize=5.5, color='#566573',
+                alpha=0.85, clip_on=True,
+            )
+            self._intervention_annotations.append(annotation)
 
 
 # ============================================================
@@ -635,14 +920,27 @@ class MapPanel(QWidget):
             self.init_map(sim)
             return
 
-        # 区域颜色 3 态: 绿=有电 / 琥珀=部分停电 (zone_status=True 但 outage_cause 已设) / 红=全停
-        # 部分停电模式下 simulation.py:1381 保留 zone_status=True (按 §3.5.1 负荷分级切除设计),
-        # 单看 zone_status 会误判 "全绿 = 没事". 用 zone_outage_cause 区分两种态.
+        # 区域颜色权威来源是 v2 `zone_power_fraction`：0=红色全停，
+        # (0,1)=琥珀色部分供电，1=绿色正常。旧引擎没有该字段时，再回退到
+        # zone_status + zone_outage_cause，避免把历史结果误显示为全绿。
         outage_cause_dict = getattr(sim, 'zone_outage_cause', {}) or {}
+        zone_fractions = getattr(sim, 'zone_power_fraction', {}) or {}
+        if not isinstance(zone_fractions, Mapping):
+            zone_fractions = {}
         zone_colors = []
         for zid in self.zone_ids:
+            fraction = zone_fractions.get(zid)
+            if fraction is not None:
+                fraction = max(0.0, min(1.0, _safe_float(fraction, 1.0)))
+                if fraction <= 1e-9:
+                    zone_colors.append('#e57373')   # 全停 红
+                elif fraction < 1.0 - 1e-9:
+                    zone_colors.append('#FFC107')   # 部分供电 琥珀
+                else:
+                    zone_colors.append('#81c784')   # 正常供电 绿
+                continue
             powered = sim.zone_status.get(zid, True)
-            has_cause = zid in outage_cause_dict
+            has_cause = bool(outage_cause_dict.get(zid))
             if not powered:
                 zone_colors.append('#e57373')   # 全停 红
             elif has_cause:
@@ -724,6 +1022,9 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_label = QLabel('未启动 — 选好城市/区/MML/graph 后按 ▶ 启动')
         self.status_bar.addWidget(self.status_label)
+        self.repair_status_label = QLabel('事故/修复: 未启动')
+        self.repair_status_label.setToolTip('统一事故状态、修复工作量与预计恢复时间将在此显示')
+        self.status_bar.addPermanentWidget(self.repair_status_label)
         self.event_status_label = QLabel('事件: 未启动')
         self.status_bar.addPermanentWidget(self.event_status_label)
 
@@ -871,19 +1172,39 @@ class MainWindow(QMainWindow):
 
         gov_btn_row = QHBoxLayout()
         self.btn_warning = mkbtn('🚨 应急预警', self.act_toggle_warning, checkable=True,
-                                 tooltip='事件1: 发布应急预警, 缓解居民情绪')
+                                 tooltip='事件1：按下方模式选择器，将本事件独立设为 AUTO / ON / OFF')
         self.btn_res_grid = mkbtn('⚡ 资源→电网', self.act_toggle_resource_grid, checkable=True,
-                                  tooltip='事件2: 政府资源拨给电网, 加速修复')
+                                   tooltip='事件2：按下方模式选择器，将本事件独立设为 AUTO / ON / OFF')
         self.btn_res_enterprise = mkbtn('🏭 资源→企业', self.act_toggle_resource_enterprise, checkable=True,
-                                        tooltip='事件3: 政府资源拨给企业, 减少经济损失')
+                                         tooltip='事件3：按下方模式选择器，将本事件独立设为 AUTO / ON / OFF')
         self.btn_res_resident = mkbtn('🏘 资源→居民', self.act_toggle_resource_resident, checkable=True,
-                                       tooltip='事件4: 政府资源拨给居民, 缓解情绪/恐慌')
+                                        tooltip='事件4：按下方模式选择器，将本事件独立设为 AUTO / ON / OFF')
         self.btn_info = mkbtn('📢 舆情管理', self.act_toggle_info, checkable=True,
-                              tooltip='事件5: 实施舆情管理')
+                               tooltip='事件5：按下方模式选择器，将本事件独立设为 AUTO / ON / OFF')
         for b in [self.btn_warning, self.btn_res_grid, self.btn_res_enterprise,
                   self.btn_res_resident, self.btn_info]:
             gov_btn_row.addWidget(b)
         gov_layout.addLayout(gov_btn_row)
+
+        gov_mode_row = QHBoxLayout()
+        gov_mode_row.addWidget(QLabel('点击事件设置为:'))
+        self.combo_gov_event_mode = QComboBox()
+        self.combo_gov_event_mode.addItem('强制开启 (ON)', 'on')
+        self.combo_gov_event_mode.addItem('自动判定 (AUTO)', 'auto')
+        self.combo_gov_event_mode.addItem('强制关闭 (OFF)', 'off')
+        self.combo_gov_event_mode.setToolTip(
+            '选择本次点击某个事件按钮时写入的独立状态；AUTO 只释放该事件，'
+            '不会改变同一政府 Agent 的其他事件。')
+        gov_mode_row.addWidget(self.combo_gov_event_mode)
+        gov_mode_row.addStretch()
+        gov_layout.addLayout(gov_mode_row)
+        self._gov_button_base_labels = {
+            self.btn_warning: '🚨 应急预警',
+            self.btn_res_grid: '⚡ 资源→电网',
+            self.btn_res_enterprise: '🏭 资源→企业',
+            self.btn_res_resident: '🏘 资源→居民',
+            self.btn_info: '📢 舆情管理',
+        }
         bar.addWidget(gb_gov, stretch=3)
 
         # 区县停电控制
@@ -906,18 +1227,26 @@ class MainWindow(QMainWindow):
         district_mode_row.addWidget(QLabel('停电模式:'))
         self.combo_district_outage_mode = QComboBox()
         self.combo_district_outage_mode.addItem('全停', 'full')
-        self.combo_district_outage_mode.addItem('部分停电', 'partial')
+        self.combo_district_outage_mode.addItem('部分停电（按实际负荷切除）', 'partial')
         self.combo_district_outage_mode.currentIndexChanged.connect(self._on_district_outage_mode_changed)
         district_mode_row.addWidget(self.combo_district_outage_mode)
         district_mode_row.addWidget(QLabel('原因:'))
         self.combo_district_outage_cause = QComboBox()
         self._add_outage_causes(self.combo_district_outage_cause)
         district_mode_row.addWidget(self.combo_district_outage_cause)
+        district_mode_row.addWidget(QLabel('种子:'))
+        self.sb_outage_seed = QSpinBox()
+        self.sb_outage_seed.setRange(0, 2_147_483_647)
+        self.sb_outage_seed.setValue(42)
+        self.sb_outage_seed.setToolTip(
+            '同一城市、参数和种子应得到相同的切负荷对象与恢复顺序；'
+            '全局事件也使用此种子选择受影响区域。')
+        district_mode_row.addWidget(self.sb_outage_seed)
         district_outage_layout.addLayout(district_mode_row)
 
         cont, self.lbl_district_severity, self.slider_district_severity = mkslider(
-            '区县切负荷比例', 0, 100, 50, 1,
-            on_change=lambda v, lbl, fmt: lbl.setText('区县切负荷比例: ' + fmt.format(v) + '%'),
+            '实际切负荷比例', 0, 100, 50, 1,
+            on_change=lambda v, lbl, fmt: lbl.setText('实际切负荷比例: ' + fmt.format(v) + '%'),
             on_release=lambda: None,
             fmt='{:.0f}',
         )
@@ -927,7 +1256,7 @@ class MainWindow(QMainWindow):
         self.btn_district_outage = mkbtn(
             '⚡ 触发所选区县停电',
             self.act_trigger_selected_outage,
-            tooltip='按所选城市/区县、模式、原因和严重度触发行政区停电情景'
+            tooltip='按所选区县触发统一事故状态机；部分停电按实际加权负荷切除，不是随机整区全停'
         )
         district_outage_layout.addWidget(self.btn_district_outage)
         bar.addWidget(gb_district_outage, stretch=3)
@@ -969,8 +1298,8 @@ class MainWindow(QMainWindow):
         grid_btn_row = QHBoxLayout()
         self.btn_temp_station = mkbtn('🔌 临时供电站', self.act_toggle_temp_station, checkable=True,
                                        tooltip='事件: 架设临时供电站, 部分恢复关键负荷')
-        self.btn_repair = mkbtn('🔧 抢修', self.act_toggle_repair, checkable=True,
-                                tooltip='事件: 启动主动抢修')
+        self.btn_repair = mkbtn('🔧 强化抢修', self.act_toggle_repair, checkable=True,
+                                 tooltip='在基线自动抢修上强化修复能力（默认 1.5×）；关闭后仍保留基线修复')
         grid_btn_row.addWidget(self.btn_temp_station)
         grid_btn_row.addWidget(self.btn_repair)
         grid_btn_row.addStretch()
@@ -984,7 +1313,7 @@ class MainWindow(QMainWindow):
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel('停电模式:'))
         self.btn_mode_full = mkbtn('全停', lambda: self._set_outage_mode('full'), checkable=True)
-        self.btn_mode_partial = mkbtn('部分停电', lambda: self._set_outage_mode('partial'), checkable=True)
+        self.btn_mode_partial = mkbtn('部分停电（实际负荷）', lambda: self._set_outage_mode('partial'), checkable=True)
         self.btn_mode_full.setChecked(True)
         self._outage_mode = 'full'
         mode_row.addWidget(self.btn_mode_full)
@@ -1149,14 +1478,16 @@ class MainWindow(QMainWindow):
         if not govs:
             return
 
-        for attr, btn in [
-            ('manual_emergency_warning', self.btn_warning),
-            ('manual_resource_to_grid', self.btn_res_grid),
-            ('manual_resource_to_enterprise', self.btn_res_enterprise),
-            ('manual_resource_to_resident', self.btn_res_resident),
-            ('manual_public_opinion', self.btn_info),
+        for event_key, attr, btn in [
+            ('emergency_warning', 'manual_emergency_warning', self.btn_warning),
+            ('resource_to_grid', 'manual_resource_to_grid', self.btn_res_grid),
+            ('resource_to_enterprise', 'manual_resource_to_enterprise', self.btn_res_enterprise),
+            ('resource_to_resident', 'manual_resource_to_resident', self.btn_res_resident),
+            ('public_opinion', 'manual_public_opinion', self.btn_info),
         ]:
-            btn.setChecked(all(bool(getattr(g, attr, False)) for g in govs))
+            modes = {self._gov_event_mode(g, event_key, attr) for g in govs}
+            display_mode = next(iter(modes)) if len(modes) == 1 else 'mixed'
+            self._set_gov_button_display(btn, display_mode)
 
         mults = []
         for district in targets:
@@ -1230,6 +1561,50 @@ class MainWindow(QMainWindow):
         self._populate_scope_controls()
         self.map_panel.init_map(sim)
         self.status_label.setText('运行中')
+        self.repair_status_label.setText('事故/修复: 正常供电')
+
+    def _format_repair_status(self, outage, current_step, total_steps, last_error='', last_warning=''):
+        """Keep repair-state semantics visible without relying on map colour alone."""
+        if last_error and (not outage or not outage.get('active', False)):
+            return f'事故预检失败: {last_error}', last_error
+        if not outage or not outage.get('active', False):
+            text = '事故/修复: 正常供电'
+            detail = '当前没有活动的区县停电事故。'
+            if last_warning:
+                text += ' | 数据预警'
+                detail += f' 数据预警={last_warning}'
+            return text, detail
+
+        eta_hours = _safe_float(outage.get('eta_hours', float('inf')), float('inf'))
+        eta_text = f'{eta_hours:.1f}h' if math.isfinite(eta_hours) else '无可用容量'
+        estimate_step = outage.get('estimated_recovery_step')
+        estimate_text = f'步≈{estimate_step}' if estimate_step is not None else '步≈未知'
+        if total_steps and estimate_step is not None and estimate_step > total_steps:
+            estimate_text += '（超出本次窗口）'
+        total_work = _safe_float(outage.get('total_work', 0.0))
+        done_work = _safe_float(outage.get('work_done', 0.0))
+        capacity = _safe_float(outage.get('current_capacity', 0.0))
+        wait_hours = (_safe_float(outage.get('detection_remaining_hours', 0.0)) +
+                      _safe_float(outage.get('mobilization_remaining_hours', 0.0)))
+        compact = (
+            f"事故={outage.get('phase', 'active')} | W={done_work:.1f}/{total_work:.1f} "
+            f"({outage.get('progress', 0.0):.0%}) | C={capacity:.2f}/h | "
+            f"剩余={eta_text}, {estimate_text} | 切负荷="
+            f"{outage.get('requested_shed_ratio', 0.0):.0%}/"
+            f"{outage.get('realized_shed_ratio', 0.0):.0%} | "
+            f"区/负荷={outage.get('affected_zone_count', 0)}/"
+            f"{outage.get('affected_load_count', 0)}"
+        )
+        detail = (
+            f"{compact} | 等待={wait_hours:.1f}h | 请求/实际切负荷="
+            f"{outage.get('requested_shed_ratio', 0.0):.0%}/"
+            f"{outage.get('realized_shed_ratio', 0.0):.0%} | "
+            f"影响区={outage.get('affected_zone_count', 0)}、负荷={outage.get('affected_load_count', 0)}"
+        )
+        if last_warning:
+            compact += ' | 数据预警'
+            detail += f' | 数据预警={last_warning}'
+        return compact, detail
 
     def on_step_done(self, m):
         self._step_count = m['step']
@@ -1260,20 +1635,20 @@ class MainWindow(QMainWindow):
         total = self.worker.total_steps if self.worker is not None else 0
         step_label = f"{m['step']}/{total}" if total > 0 else str(m['step'])
 
-        # 大电网状态 (跟 zone_status 解耦): 部分停电模式下 zone 仍 powered=True,
-        # 必须看 district_outage_mode 才知道行政区级触发了停电
-        dist_mode = getattr(self.sim_ref, 'district_outage_mode', None)
-        if dist_mode:
-            prog = float(getattr(self.sim_ref, 'district_repair_progress', 0.0))
-            district_str = f' | 大电网:{dist_mode} 修复{prog*100:.0f}%'
-        else:
-            district_str = ''
+        outage = m.get('outage', {}) or {}
+        repair_text, repair_tooltip = self._format_repair_status(
+            outage, m['step'], total, m.get('outage_last_error', ''),
+            m.get('outage_last_warning', ''))
+        self.repair_status_label.setText(repair_text)
+        self.repair_status_label.setToolTip(repair_tooltip)
 
         self.status_label.setText(
             f"步={step_label} | t={m['t_hour']:.1f}h | "
-            f"舆情={m['P']:.2f} | σ={m['stress']:.2f} | 恐慌={m['panic']:.2f} | "
+            f"舆情={m.get('public_opinion_pressure', m['P']):.2f} | "
+            f"系统求助={m.get('system_help_pressure', m['P']):.2f} | "
+            f"σ={m['stress']:.2f} | 恐慌={m['panic']:.2f} | "
             f"flee={m['flee_ratio']:.2f} | herd={m['herd_ratio']:.2f} | "
-            f"zone停电={m['blackout']:.0%}{district_str} | {seir_str}{rec_str}"
+            f"zone停电={m['blackout']:.0%} | {seir_str}{rec_str}"
         )
         gov = m.get('gov_events', {})
         ev = m.get('event_stats', {})
@@ -1378,58 +1753,113 @@ class MainWindow(QMainWindow):
             try:
                 with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
                     w = csv.writer(f)
-                    # 注: emotion_raw 是 §3.2.4 Eq.5 严格按公式算的 (sim core 输出, 论文可引);
-                    # emotion_display 是 UI 渲染层加 chronic-anxiety floor 后的可视化值, 不入论文
-                    w.writerow(['step', 't_hour', 'P_opinion',
-                                'emotion_raw', 'emotion_display',
-                                'stress', 'panic', 'flee_ratio', 'herd_ratio',
-                                'recovery_rate', 'blackout_ratio',
-                                'gov_R_deploy',
-                                'seir_S', 'seir_E', 'seir_I', 'seir_R',
-                                'outage_mode', 'outage_cause',
-                                'outage_severity', 'outage_scope',
-                                'gov_warning_active', 'gov_resource_grid_active',
-                                'gov_resource_enterprise_active',
-                                'gov_resource_resident_active',
-                                'gov_opinion_active',
-                                'event_total', 'event_active',
-                                'event5_district_ratio', 'event5_resident_ratio'])
+                    # v2: P_hist 已明确命名为系统综合求助压力；动态舆情单独记录。
+                    # emotion_display 是 UI floor，仅供演示，不应作为论文原始指标。
+                    w.writerow([
+                        'schema_version', 'step', 't_hour',
+                        'system_help_pressure', 'public_opinion_pressure',
+                        'system_help_emotion_component',
+                        'system_help_enterprise_component',
+                        'system_help_critical_component', 'system_help_component_source',
+                        'emotion_raw', 'emotion_display', 'stress', 'panic',
+                        'flee_ratio', 'herd_ratio', 'recovery_rate', 'blackout_ratio',
+                        'gov_R_deploy', 'seir_S', 'seir_E', 'seir_I', 'seir_R',
+                        'outage_event_id', 'outage_state', 'outage_mode', 'outage_cause',
+                        'outage_seed', 'outage_active_districts',
+                        'outage_requested_shed_ratio', 'outage_realized_shed_ratio',
+                        'outage_affected_zone_count', 'outage_affected_load_count',
+                        'outage_detection_remaining_hours',
+                        'outage_mobilization_remaining_hours',
+                        'outage_total_work', 'outage_work_done', 'outage_remaining_work',
+                        'outage_current_capacity', 'outage_progress', 'outage_eta_hours',
+                        'outage_estimated_recovery_step', 'outage_scope',
+                        'gov_warning_active', 'gov_resource_grid_active',
+                        'gov_resource_enterprise_active',
+                        'gov_resource_resident_active', 'gov_opinion_active',
+                        'event_total', 'event_active',
+                        'event5_district_ratio', 'event5_resident_ratio',
+                        'ui_action_count', 'ui_last_action', 'ui_last_action_step',
+                    ])
                     for r in self._data_records:
                         seir = r.get('seir', {})
                         raw_e = r.get('emotion_raw', r.get('emotion', 0.0))
                         disp_e = r.get('emotion_display', r.get('emotion', 0.0))
                         gov = r.get('gov_events', {})
                         ev = r.get('event_stats', {})
+                        outage = r.get('outage', {}) or {}
                         w.writerow([
-                            r['step'], f"{r['t_hour']:.2f}",
-                            f"{r['P']:.4f}",
-                            f"{raw_e:.4f}", f"{disp_e:.4f}",
-                            f"{r['stress']:.4f}", f"{r['panic']:.4f}",
-                            f"{r['flee_ratio']:.4f}", f"{r['herd_ratio']:.4f}",
-                            f"{r['recovery']:.4f}", f"{r['blackout']:.4f}",
-                            f"{r['R']:.4f}",
-                            f"{seir.get('S', 0):.4f}", f"{seir.get('E', 0):.4f}",
-                            f"{seir.get('I', 0):.4f}", f"{seir.get('R', 0):.4f}",
-                            r.get('outage_mode', ''),
-                            r.get('outage_cause', ''),
-                            f"{r.get('outage_severity', 0.0):.4f}",
+                            'ui_trace_v2', r['step'], _csv_number(r['t_hour'], 2),
+                            _csv_number(r.get('system_help_pressure', r.get('P', 0.0))),
+                            _csv_number(r.get('public_opinion_pressure', r.get('P', 0.0))),
+                            _csv_number(r.get('system_help_emotion_component', 0.0)),
+                            _csv_number(r.get('system_help_enterprise_component', 0.0)),
+                            _csv_number(r.get('system_help_critical_component', 0.0)),
+                            r.get('system_help_component_source', ''),
+                            _csv_number(raw_e), _csv_number(disp_e),
+                            _csv_number(r['stress']), _csv_number(r['panic']),
+                            _csv_number(r['flee_ratio']), _csv_number(r['herd_ratio']),
+                            _csv_number(r['recovery']), _csv_number(r['blackout']),
+                            _csv_number(r['R']),
+                            _csv_number(seir.get('S', 0)), _csv_number(seir.get('E', 0)),
+                            _csv_number(seir.get('I', 0)), _csv_number(seir.get('R', 0)),
+                            outage.get('event_id', ''), outage.get('phase', ''),
+                            outage.get('mode', r.get('outage_mode', '')),
+                            outage.get('cause', r.get('outage_cause', '')),
+                            outage.get('seed', ''), outage.get('state_count', 0),
+                            _csv_number(outage.get('requested_shed_ratio', r.get('outage_severity', 0.0))),
+                            _csv_number(outage.get('realized_shed_ratio', 0.0)),
+                            outage.get('affected_zone_count', 0), outage.get('affected_load_count', 0),
+                            _csv_number(outage.get('detection_remaining_hours', 0.0)),
+                            _csv_number(outage.get('mobilization_remaining_hours', 0.0)),
+                            _csv_number(outage.get('total_work', 0.0)),
+                            _csv_number(outage.get('work_done', 0.0)),
+                            _csv_number(outage.get('remaining_work', 0.0)),
+                            _csv_number(outage.get('current_capacity', 0.0)),
+                            _csv_number(outage.get('progress', 0.0)),
+                            _csv_number(outage.get('eta_hours', 0.0)),
+                            outage.get('estimated_recovery_step', ''),
                             r.get('outage_scope', ''),
-                            gov.get('warning', 0),
-                            gov.get('resource_grid', 0),
-                            gov.get('resource_enterprise', 0),
-                            gov.get('resource_resident', 0),
-                            gov.get('opinion', 0),
-                            ev.get('total', 0),
-                            ev.get('active', 0),
-                            f"{r.get('event5_district_ratio', 0.0):.4f}",
-                            f"{r.get('event5_resident_ratio', 0.0):.4f}",
+                            gov.get('warning', 0), gov.get('resource_grid', 0),
+                            gov.get('resource_enterprise', 0), gov.get('resource_resident', 0),
+                            gov.get('opinion', 0), ev.get('total', 0), ev.get('active', 0),
+                            _csv_number(r.get('event5_district_ratio', 0.0)),
+                            _csv_number(r.get('event5_resident_ratio', 0.0)),
+                            r.get('ui_action_count', 0), r.get('ui_last_action', ''),
+                            r.get('ui_last_action_step', 0),
                         ])
+                self._export_ui_action_log(ts)
                 self.status_label.setText(f'数据已保存({len(self._data_records)}行) → {csv_path}')
                 print(f'[save_data] {csv_path} ({len(self._data_records)} 行)')
             except Exception as e:
                 self.status_label.setText(f'数据保存失败: {e}')
                 traceback.print_exc()
             self._data_records = []
+
+    def _export_ui_action_log(self, timestamp):
+        """Persist UI commands separately from time-series rows for audit/replay."""
+        action_log = getattr(self.sim_ref, 'ui_action_log', []) if self.sim_ref is not None else []
+        if not isinstance(action_log, list) or not action_log:
+            return None
+        path = os.path.join(OUT_TRACE_DIR, f'ui_actions_{timestamp}.csv')
+        base_fields = ['schema_version', 'step', 't_hour', 'action', 'scope']
+        extra_fields = sorted({
+            str(key) for record in action_log if isinstance(record, Mapping)
+            for key in record.keys() if key not in base_fields
+        })
+        with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+            writer = csv.DictWriter(f, fieldnames=base_fields + extra_fields)
+            writer.writeheader()
+            for record in action_log:
+                if not isinstance(record, Mapping):
+                    continue
+                row = {}
+                for key in base_fields + extra_fields:
+                    value = record.get(key, '')
+                    if isinstance(value, (dict, list, tuple, set)):
+                        value = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+                    row[key] = value
+                writer.writerow(row)
+        return path
 
     def act_export_events(self):
         if self.sim_ref is None:
@@ -1441,7 +1871,9 @@ class MainWindow(QMainWindow):
         csv_path = os.path.join(OUT_TRACE_DIR, f'events_step{step:05d}_{ts}.csv')
         try:
             count = self.sim_ref.export_events_to_csv_with_names(csv_path, finalize=False)
-            self.status_label.setText(f'事件已导出({count}条) → {csv_path}')
+            action_path = self._export_ui_action_log(ts)
+            action_hint = f'；UI动作日志 → {action_path}' if action_path else ''
+            self.status_label.setText(f'事件已导出({count}条) → {csv_path}{action_hint}')
             print(f'[save_events] {csv_path} ({count} 条)')
         except Exception as e:
             self.status_label.setText(f'事件导出失败: {e}')
@@ -1452,16 +1884,119 @@ class MainWindow(QMainWindow):
         if self.worker is not None:
             self.chart_panel.mark_intervention(len(self.worker.opinion_hist), label)
 
-    def _record_outage_command(self, sim, scope, mode, cause, severity, **extra):
+    def _append_ui_action_log(self, sim, action, scope='', **details):
+        """Append an auditable UI command on the simulation thread."""
+        action_log = getattr(sim, 'ui_action_log', None)
+        if not isinstance(action_log, list):
+            action_log = []
+            sim.ui_action_log = action_log
+        record = {
+            'schema_version': 'ui_action_v2',
+            'step': int(getattr(sim, 'step_count', 0)),
+            't_hour': _safe_float(getattr(sim, 'current_hour', 0.0)),
+            'action': action,
+            'scope': scope,
+        }
+        record.update(details)
+        action_log.append(record)
+        sim.last_ui_action = record
+        return record
+
+    def _record_outage_command(self, sim, scope, mode, cause, shed_ratio, **extra):
         payload = {
             'scope': scope,
             'mode': mode,
             'cause': cause,
-            'severity_ratio': float(severity),
+            # Keep the old field for reader compatibility, but make the v2
+            # semantic explicit: this is a requested *load-shed* ratio.
+            'severity_ratio': float(shed_ratio),
+            'requested_shed_ratio': float(shed_ratio),
             'step': getattr(sim, 'step_count', 0),
         }
         payload.update(extra)
         sim.last_ui_outage_command = payload
+
+    @staticmethod
+    def _requested_shed_ratio(mode, slider_value):
+        return 1.0 if mode == 'full' else max(0.0, min(1.0, _safe_float(slider_value)))
+
+    def _trigger_outage_scenario(self, sim, district, mode, cause, shed_ratio,
+                                 seed, scope_zone_ids=None):
+        """Use the v2 public API; use legacy routing only for an older checkout."""
+        preflight = getattr(sim, 'validate_outage_preflight', None)
+        if callable(preflight):
+            try:
+                report = preflight(district)
+                warnings = list((report or {}).get('warnings', []) or [])
+                sim.last_ui_outage_warning = '; '.join(map(str, warnings))
+            except Exception as exc:
+                # The trigger remains the authoritative validator.  A UI-only
+                # inspection error must not hide a valid simulation command.
+                sim.last_ui_outage_warning = f'preflight display unavailable: {exc}'
+        trigger = getattr(sim, 'trigger_outage_scenario', None)
+        if callable(trigger):
+            return trigger(
+                district=district,
+                mode=mode,
+                cause=cause,
+                shed_ratio=shed_ratio,
+                damage_level=None,
+                seed=seed,
+                scope_zone_ids=scope_zone_ids,
+            )
+
+        legacy = getattr(sim, 'trigger_independent_district_outages', None)
+        if not callable(legacy):
+            raise RuntimeError('当前仿真缺少 trigger_outage_scenario() 统一停电接口')
+        # Compatibility only: do not directly mutate zone_status in the UI.
+        legacy({
+            district: {
+                'enabled': True,
+                'mode': mode,
+                'cause': cause,
+                'severity_ratio': shed_ratio,
+                'use_all_zones': scope_zone_ids is None,
+                'selected_zones': list(scope_zone_ids or []),
+            }
+        })
+        return {'compatibility_path': 'trigger_independent_district_outages'}
+
+    def _force_restore_outage(self, sim, district=None):
+        """Use the v2 public restore operation and retain a safe old-engine fallback."""
+        restore = getattr(sim, 'force_restore_outage', None)
+        if callable(restore):
+            return restore(district=district)
+
+        legacy_restore = getattr(sim, '_restore_district_power', None)
+        if callable(legacy_restore):
+            return legacy_restore()
+
+        # Last-resort compatibility for a pre-v2 engine that has no public
+        # restore method.  This branch is intentionally isolated from normal UI.
+        for zone_id in list((getattr(sim, 'zone_status', {}) or {}).keys()):
+            sim.zone_status[zone_id] = True
+            if hasattr(sim, 'zone_duration'):
+                sim.zone_duration[zone_id] = 0
+        if hasattr(sim, 'zone_outage_cause'):
+            sim.zone_outage_cause.clear()
+        if hasattr(sim, 'partial_outage_entities'):
+            sim.partial_outage_entities.clear()
+        for resident in getattr(sim, 'residents', []):
+            resident.powered = True
+            resident._is_load_shed = False
+        for enterprise in getattr(sim, 'enterprises', []):
+            enterprise.powered = True
+            enterprise._is_load_shed = False
+        for node in getattr(sim, 'csv_nodes', []):
+            node['powered'] = True
+            node['outage_duration'] = 0
+        if hasattr(sim, 'district_outage_mode'):
+            sim.district_outage_mode = None
+        if hasattr(sim, 'district_repair_started'):
+            sim.district_repair_started = False
+        if hasattr(sim, 'district_repair_progress'):
+            sim.district_repair_progress = 0.0
+        return {'compatibility_path': 'inline_restore'}
 
     def _group_zones_by_district(self, sim, zones):
         grouped = defaultdict(list)
@@ -1481,30 +2016,49 @@ class MainWindow(QMainWindow):
             return
         mode = self.combo_district_outage_mode.currentData() or 'full'
         cause = self.combo_district_outage_cause.currentData() or 'equipment_failure'
-        severity = self.slider_district_severity.value() / 100.0
+        shed_ratio = self._requested_shed_ratio(
+            mode, self.slider_district_severity.value() / 100.0)
+        if mode == 'partial' and shed_ratio <= 0.0:
+            self.status_label.setText('实际切负荷比例为 0%，未创建停电事故')
+            return
+        if mode == 'partial' and shed_ratio >= 1.0:
+            mode = 'full'
         scope = self._selected_outage_scope_text()
-        configs = {
-            district: {
-                'enabled': True,
-                'mode': mode,
-                'cause': cause,
-                'severity_ratio': severity,
-                'use_all_zones': True,
-            }
-            for district in targets
-        }
+        seed = int(self.sb_outage_seed.value())
 
         def _do(sim):
-            sim.trigger_independent_district_outages(configs)
+            results = {}
+            try:
+                for district in targets:
+                    results[district] = self._trigger_outage_scenario(
+                        sim, district, mode, cause, shed_ratio, seed, scope_zone_ids=None)
+            except Exception as exc:
+                message = f'停电事故预检拒绝: {exc}'
+                sim.last_ui_outage_error = message
+                self._append_ui_action_log(
+                    sim, 'trigger_outage_scenario', scope, districts=list(targets),
+                    mode=mode, cause=cause, requested_shed_ratio=shed_ratio,
+                    seed=seed, result='rejected', error=message)
+                if self.worker is not None:
+                    self.worker.error.emit(message)
+                return
+            sim.last_ui_outage_error = ''
             self._record_outage_command(
-                sim, scope, mode, cause, severity,
+                sim, scope, mode, cause, shed_ratio,
                 command='district_outage', targets=','.join(targets))
+            self._append_ui_action_log(
+                sim, 'trigger_outage_scenario', scope,
+                districts=list(targets), mode=mode, cause=cause,
+                requested_shed_ratio=shed_ratio, seed=seed,
+                scope_zone_ids='all_district_zones', results=results,
+                preflight_warning=str(getattr(sim, 'last_ui_outage_warning', '') or ''),
+            )
 
         self.worker.queue_action(_do)
         cause_label = self.combo_district_outage_cause.currentText()
         tag = f'{scope} 停电 {mode}/{cause_label}'
         if mode == 'partial':
-            tag += f' {int(severity * 100)}%'
+            tag += f' 实际负荷{int(shed_ratio * 100)}%'
         self._mark(tag)
 
     def act_trigger_outage(self):
@@ -1512,48 +2066,81 @@ class MainWindow(QMainWindow):
             return
         mode = getattr(self, '_outage_mode', 'full')
         cause = self.combo_outage_cause.currentData() or 'equipment_failure'
-        severity = self.slider_severity.value() / 100.0
+        shed_ratio = self._requested_shed_ratio(mode, self.slider_severity.value() / 100.0)
+        if mode == 'partial' and shed_ratio <= 0.0:
+            self.status_label.setText('实际切负荷比例为 0%，未创建停电事故')
+            return
+        if mode == 'partial' and shed_ratio >= 1.0:
+            mode = 'full'
         impact_ratio = self.slider_global_impact.value() / 100.0
+        seed = int(self.sb_outage_seed.value())
 
         def _do(sim):
-            partial_zones = set(getattr(sim, 'partial_outage_entities', {}).keys())
-            caused_zones = set((getattr(sim, 'zone_outage_cause', {}) or {}).keys())
-            available_zones = [
-                z for z, powered in sim.zone_status.items()
-                if powered and z not in partial_zones and z not in caused_zones
-            ]
-            if not available_zones:
-                self._record_outage_command(
-                    sim, 'global', mode, cause, severity,
-                    command='global_outage', impact_ratio=impact_ratio, target_count=0)
-                return
-            target_count = max(1, int(np.ceil(len(available_zones) * impact_ratio)))
-            target_count = min(target_count, len(available_zones))
-            selected_zones = random.sample(available_zones, target_count)
-            grouped = self._group_zones_by_district(sim, selected_zones)
-            configs = {
-                district: {
-                    'enabled': True,
-                    'mode': mode,
-                    'cause': cause,
-                    'severity_ratio': severity,
-                    'use_all_zones': False,
-                    'selected_zones': zones,
+            try:
+                partial_zones = set(getattr(sim, 'partial_outage_entities', {}).keys())
+                caused_zones = {
+                    zone_id for zone_id, zone_cause
+                    in (getattr(sim, 'zone_outage_cause', {}) or {}).items()
+                    if zone_cause
                 }
-                for district, zones in grouped.items()
-            }
-            sim.trigger_independent_district_outages(configs)
+                zone_fractions = getattr(sim, 'zone_power_fraction', {}) or {}
+                if not isinstance(zone_fractions, Mapping):
+                    zone_fractions = {}
+                available_zones = [
+                    z for z, powered in sim.zone_status.items()
+                    if powered and z not in partial_zones and z not in caused_zones
+                    and _safe_float(zone_fractions.get(z, 1.0), 1.0) >= 1.0 - 1e-9
+                ]
+                if not available_zones:
+                    self._record_outage_command(
+                        sim, 'global', mode, cause, shed_ratio,
+                        command='global_outage', impact_ratio=impact_ratio, target_count=0)
+                    self._append_ui_action_log(
+                        sim, 'trigger_outage_scenario', 'global', mode=mode, cause=cause,
+                        requested_shed_ratio=shed_ratio, impact_ratio=impact_ratio,
+                        seed=seed, target_count=0, result='no_available_zones',
+                    )
+                    return
+                target_count = max(1, int(np.ceil(len(available_zones) * impact_ratio)))
+                target_count = min(target_count, len(available_zones))
+                selected_zones = random.Random(seed).sample(
+                    sorted(available_zones, key=str), target_count)
+                grouped = self._group_zones_by_district(sim, selected_zones)
+                results = {}
+                for district in sorted(grouped):
+                    results[district] = self._trigger_outage_scenario(
+                        sim, district, mode, cause, shed_ratio, seed,
+                        scope_zone_ids=grouped[district])
+            except Exception as exc:
+                message = f'停电事故预检拒绝: {exc}'
+                sim.last_ui_outage_error = message
+                self._append_ui_action_log(
+                    sim, 'trigger_outage_scenario', 'global', mode=mode, cause=cause,
+                    requested_shed_ratio=shed_ratio, impact_ratio=impact_ratio,
+                    seed=seed, result='rejected', error=message)
+                if self.worker is not None:
+                    self.worker.error.emit(message)
+                return
+            sim.last_ui_outage_error = ''
             self._record_outage_command(
-                sim, 'global', mode, cause, severity,
+                sim, 'global', mode, cause, shed_ratio,
                 command='global_outage',
                 impact_ratio=impact_ratio,
-                target_count=target_count)
+                target_count=target_count,
+                selected_zones=list(selected_zones))
+            self._append_ui_action_log(
+                sim, 'trigger_outage_scenario', 'global', districts=sorted(grouped),
+                mode=mode, cause=cause, requested_shed_ratio=shed_ratio,
+                impact_ratio=impact_ratio, seed=seed,
+                scope_zone_ids=list(selected_zones), results=results,
+                preflight_warning=str(getattr(sim, 'last_ui_outage_warning', '') or ''),
+            )
 
         self.worker.queue_action(_do)
         cause_label = self.combo_outage_cause.currentText()
         tag = f'全局停电 {mode}/{cause_label} 影响{int(impact_ratio * 100)}%'
         if mode == 'partial':
-            tag += f' 切负荷{int(severity * 100)}%'
+            tag += f' 实际负荷{int(shed_ratio * 100)}%'
         self._mark(tag)
 
     def act_restore_power(self):
@@ -1561,35 +2148,13 @@ class MainWindow(QMainWindow):
             return
 
         def _do(sim):
-            # zone 级: 全部恢复 powered=True + 清 outage_cause (避免 amber 残留)
-            for z in list(sim.zone_status.keys()):
-                sim.zone_status[z] = True
-                if hasattr(sim, 'zone_duration'):
-                    sim.zone_duration[z] = 0
-                if hasattr(sim, 'zone_outage_cause') and z in sim.zone_outage_cause:
-                    del sim.zone_outage_cause[z]
-            # 大电网级: 清行政区停电模式 + 重置修复进度
-            if hasattr(sim, 'district_outage_mode'):
-                sim.district_outage_mode = None
-            if hasattr(sim, 'district_repair_started'):
-                sim.district_repair_started = False
-            if hasattr(sim, 'district_repair_progress'):
-                sim.district_repair_progress = 0.0
-            if hasattr(sim, 'partial_outage_entities'):
-                sim.partial_outage_entities.clear()
-            for r in getattr(sim, 'residents', []):
-                r.powered = True
-                r._is_load_shed = False
-            for e in getattr(sim, 'enterprises', []):
-                e.powered = True
-                e._is_load_shed = False
-            for node in getattr(sim, 'csv_nodes', []):
-                node['powered'] = True
-                node['outage_duration'] = 0
+            result = self._force_restore_outage(sim)
             self._record_outage_command(
                 sim, 'restore', 'restore', '', 0.0, command='restore_power')
+            self._append_ui_action_log(
+                sim, 'force_restore_outage', 'global', result=result)
         self.worker.queue_action(_do)
-        self._mark('恢复')
+        self._mark('强制恢复供电')
 
     def act_apply_resource_multiplier(self):
         if self.worker is None or self.sim_ref is None:
@@ -1600,6 +2165,7 @@ class MainWindow(QMainWindow):
         if not targets:
             self.status_label.setText('未选中当前仿真已加载的政府 Agent')
             return
+        scope = self._selected_gov_scope_text()
 
         def _do(sim):
             for d in targets:
@@ -1616,114 +2182,187 @@ class MainWindow(QMainWindow):
                 base_cap = float(base.get('base_resource_capacity', 100.0) or 100.0)
                 gov.base_resource_capacity = max(0.0, min(200.0, base_cap * mult))
                 gov.current_resource_level = gov.base_resource_capacity
-                gov.use_manual_events = self._any_gov_manual_on(gov)
+            self._append_ui_action_log(
+                sim, 'set_government_resource_multiplier', scope,
+                districts=list(targets), multiplier=mult)
         self.worker.queue_action(_do)
-        self._mark(f'{self._selected_gov_scope_text()} 资源×{mult:.2f}')
+        self._mark(f'{scope} 资源×{mult:.2f}')
 
     def act_toggle_info(self):
         if self.worker is None:
             return
-        on = self.btn_info.isChecked()
+        event_mode = self._selected_gov_event_mode()
         targets = self._selected_gov_targets(self.sim_ref)
         if not targets:
             self.status_label.setText('未选中当前仿真已加载的政府 Agent')
             return
+        scope = self._selected_gov_scope_text()
 
         def _do(sim):
             for d in targets:
                 gov = sim.gov_agents.get(d)
                 if gov is None:
                     continue
-                gov.manual_public_opinion = on
-                gov.use_manual_events = self._any_gov_manual_on(gov)
+                self._set_gov_event_mode(
+                    gov, 'public_opinion', 'manual_public_opinion', event_mode)
+            self._append_ui_action_log(
+                sim, 'set_government_event_mode', scope,
+                districts=list(targets), event='public_opinion', mode=event_mode)
         self.worker.queue_action(_do)
-        scope = self._selected_gov_scope_text()
-        self._mark(f'{scope} 舆情管理 ON' if on else f'{scope} 舆情管理 OFF')
+        self._set_gov_button_display(self.btn_info, event_mode)
+        self._mark(f'{scope} 舆情管理 {event_mode.upper()}')
 
     def act_toggle_warning(self):
         if self.worker is None:
             return
-        on = self.btn_warning.isChecked()
+        event_mode = self._selected_gov_event_mode()
         targets = self._selected_gov_targets(self.sim_ref)
         if not targets:
             self.status_label.setText('未选中当前仿真已加载的政府 Agent')
             return
+        scope = self._selected_gov_scope_text()
 
         def _do(sim):
             for d in targets:
                 gov = sim.gov_agents.get(d)
                 if gov is None:
                     continue
-                gov.manual_emergency_warning = on
-                gov.use_manual_events = self._any_gov_manual_on(gov)
+                self._set_gov_event_mode(
+                    gov, 'emergency_warning', 'manual_emergency_warning', event_mode)
+            self._append_ui_action_log(
+                sim, 'set_government_event_mode', scope,
+                districts=list(targets), event='emergency_warning', mode=event_mode)
         self.worker.queue_action(_do)
-        scope = self._selected_gov_scope_text()
-        self._mark(f'{scope} 应急预警 ON' if on else f'{scope} 应急预警 OFF')
+        self._set_gov_button_display(self.btn_warning, event_mode)
+        self._mark(f'{scope} 应急预警 {event_mode.upper()}')
 
     def _any_gov_manual_on(self, gov):
-        return any([gov.manual_emergency_warning, gov.manual_resource_to_grid,
-                    gov.manual_resource_to_enterprise, gov.manual_resource_to_resident,
-                    gov.manual_public_opinion])
+        """Legacy-only aggregate switch; v2 uses independent event modes."""
+        return any([
+            bool(getattr(gov, 'manual_emergency_warning', False)),
+            bool(getattr(gov, 'manual_resource_to_grid', False)),
+            bool(getattr(gov, 'manual_resource_to_enterprise', False)),
+            bool(getattr(gov, 'manual_resource_to_resident', False)),
+            bool(getattr(gov, 'manual_public_opinion', False)),
+        ])
+
+    def _gov_event_mode(self, gov, event_key, legacy_attr):
+        getter = getattr(gov, 'get_event_mode', None)
+        if callable(getter):
+            try:
+                mode = str(getter(event_key)).lower()
+                if mode in {'auto', 'on', 'off'}:
+                    return mode
+            except Exception:
+                pass
+        for attr in ('event_modes', '_event_modes'):
+            modes = getattr(gov, attr, None)
+            if isinstance(modes, Mapping) and event_key in modes:
+                mode = str(modes[event_key]).lower()
+                if mode in {'auto', 'on', 'off'}:
+                    return mode
+        return 'on' if bool(getattr(gov, legacy_attr, False)) else 'auto'
+
+    def _gov_event_is_forced_on(self, gov, event_key, legacy_attr):
+        return self._gov_event_mode(gov, event_key, legacy_attr) == 'on'
+
+    def _selected_gov_event_mode(self):
+        mode = self.combo_gov_event_mode.currentData()
+        return mode if mode in {'auto', 'on', 'off'} else 'on'
+
+    def _set_gov_button_display(self, button, mode):
+        base = getattr(self, '_gov_button_base_labels', {}).get(button, button.text())
+        suffix = {'on': ' [ON]', 'off': ' [OFF]', 'mixed': ' [混合]'}.get(mode, '')
+        button.blockSignals(True)
+        button.setChecked(mode == 'on')
+        button.blockSignals(False)
+        button.setText(base + suffix)
+
+    def _set_gov_event_mode(self, gov, event_key, legacy_attr, mode):
+        """V2: each event is independently auto/on; old engine retains its bridge."""
+        mode = str(mode).lower()
+        if mode not in {'auto', 'on', 'off'}:
+            raise ValueError(f'Unsupported government event mode: {mode!r}')
+        setter = getattr(gov, 'set_event_mode', None)
+        if callable(setter):
+            setter(event_key, mode)
+            return
+        # Older agents only distinguish manually-on from automatic.  Preserve
+        # the no-cross-event behavior for AUTO/ON; explicit OFF needs v2.
+        setattr(gov, legacy_attr, mode == 'on')
+        gov.use_manual_events = self._any_gov_manual_on(gov)
 
     def act_toggle_resource_grid(self):
         if self.worker is None:
             return
-        on = self.btn_res_grid.isChecked()
+        event_mode = self._selected_gov_event_mode()
         targets = self._selected_gov_targets(self.sim_ref)
         if not targets:
             self.status_label.setText('未选中当前仿真已加载的政府 Agent')
             return
+        scope = self._selected_gov_scope_text()
 
         def _do(sim):
             for d in targets:
                 gov = sim.gov_agents.get(d)
                 if gov is None:
                     continue
-                gov.manual_resource_to_grid = on
-                gov.use_manual_events = self._any_gov_manual_on(gov)
+                self._set_gov_event_mode(
+                    gov, 'resource_to_grid', 'manual_resource_to_grid', event_mode)
+            self._append_ui_action_log(
+                sim, 'set_government_event_mode', scope,
+                districts=list(targets), event='resource_to_grid', mode=event_mode)
         self.worker.queue_action(_do)
-        scope = self._selected_gov_scope_text()
-        self._mark(f'{scope} 资源→电网 ON' if on else f'{scope} 资源→电网 OFF')
+        self._set_gov_button_display(self.btn_res_grid, event_mode)
+        self._mark(f'{scope} 资源→电网 {event_mode.upper()}')
 
     def act_toggle_resource_enterprise(self):
         if self.worker is None:
             return
-        on = self.btn_res_enterprise.isChecked()
+        event_mode = self._selected_gov_event_mode()
         targets = self._selected_gov_targets(self.sim_ref)
         if not targets:
             self.status_label.setText('未选中当前仿真已加载的政府 Agent')
             return
+        scope = self._selected_gov_scope_text()
 
         def _do(sim):
             for d in targets:
                 gov = sim.gov_agents.get(d)
                 if gov is None:
                     continue
-                gov.manual_resource_to_enterprise = on
-                gov.use_manual_events = self._any_gov_manual_on(gov)
+                self._set_gov_event_mode(
+                    gov, 'resource_to_enterprise', 'manual_resource_to_enterprise', event_mode)
+            self._append_ui_action_log(
+                sim, 'set_government_event_mode', scope,
+                districts=list(targets), event='resource_to_enterprise', mode=event_mode)
         self.worker.queue_action(_do)
-        scope = self._selected_gov_scope_text()
-        self._mark(f'{scope} 资源→企业 ON' if on else f'{scope} 资源→企业 OFF')
+        self._set_gov_button_display(self.btn_res_enterprise, event_mode)
+        self._mark(f'{scope} 资源→企业 {event_mode.upper()}')
 
     def act_toggle_resource_resident(self):
         if self.worker is None:
             return
-        on = self.btn_res_resident.isChecked()
+        event_mode = self._selected_gov_event_mode()
         targets = self._selected_gov_targets(self.sim_ref)
         if not targets:
             self.status_label.setText('未选中当前仿真已加载的政府 Agent')
             return
+        scope = self._selected_gov_scope_text()
 
         def _do(sim):
             for d in targets:
                 gov = sim.gov_agents.get(d)
                 if gov is None:
                     continue
-                gov.manual_resource_to_resident = on
-                gov.use_manual_events = self._any_gov_manual_on(gov)
+                self._set_gov_event_mode(
+                    gov, 'resource_to_resident', 'manual_resource_to_resident', event_mode)
+            self._append_ui_action_log(
+                sim, 'set_government_event_mode', scope,
+                districts=list(targets), event='resource_to_resident', mode=event_mode)
         self.worker.queue_action(_do)
-        scope = self._selected_gov_scope_text()
-        self._mark(f'{scope} 资源→居民 ON' if on else f'{scope} 资源→居民 OFF')
+        self._set_gov_button_display(self.btn_res_resident, event_mode)
+        self._mark(f'{scope} 资源→居民 {event_mode.upper()}')
 
     def act_apply_grid_params(self):
         if self.worker is None or self.sim_ref is None:
@@ -1746,6 +2385,9 @@ class MainWindow(QMainWindow):
             sim.grid.current_resource_level = max(
                 0.0, sim.grid.base_resource_capacity - occupied
             )
+            self._append_ui_action_log(
+                sim, 'set_grid_parameters', 'global', initiative_multiplier=init_mult,
+                response_multiplier=resp_mult, lambda_prop=lam, resource_capacity=cap)
         self.worker.queue_action(_do)
         self._mark(f'电网 i×{init_mult:.2f}/r×{resp_mult:.2f}/λ={lam:.2f}/cap={cap:.0f}')
 
@@ -1759,10 +2401,13 @@ class MainWindow(QMainWindow):
 
         def _do(sim):
             sim.grid.manual_temp_station = on
-            sim.grid.use_manual_events = self._any_grid_manual_on(sim.grid)
+            if not callable(getattr(sim, 'trigger_outage_scenario', None)):
+                sim.grid.use_manual_events = self._any_grid_manual_on(sim.grid)
             sim.grid.is_setting_temp_power = on
+            self._append_ui_action_log(
+                sim, 'set_grid_temp_station', 'global', mode='on' if on else 'auto')
         self.worker.queue_action(_do)
-        self._mark('临时供电站 ON' if on else '临时供电站 OFF')
+        self._mark('临时供电站 ON' if on else '临时供电站 AUTO')
 
     def act_toggle_repair(self):
         if self.worker is None:
@@ -1771,11 +2416,21 @@ class MainWindow(QMainWindow):
 
         def _do(sim):
             sim.grid.manual_repair = on
-            sim.grid.use_manual_events = self._any_grid_manual_on(sim.grid)
-            ongoing = getattr(sim.grid, 'ongoing_repairs', None) or {}
-            sim.grid.is_repairing = on or len(ongoing) > 0
+            # V2 repair progress has its own state machine: button OFF means
+            # baseline repair, not "stop all repair".  Preserve old behavior
+            # only for a simulation that does not yet expose the v2 interface.
+            sim.grid.enhanced_repair_enabled = on
+            setter = getattr(sim.grid, 'set_enhanced_repair', None)
+            if callable(setter):
+                setter(on)
+            if not callable(getattr(sim, 'trigger_outage_scenario', None)):
+                sim.grid.use_manual_events = self._any_grid_manual_on(sim.grid)
+                ongoing = getattr(sim.grid, 'ongoing_repairs', None) or {}
+                sim.grid.is_repairing = on or len(ongoing) > 0
+            self._append_ui_action_log(
+                sim, 'set_enhanced_repair', 'global', mode='on' if on else 'baseline')
         self.worker.queue_action(_do)
-        self._mark('抢修 ON' if on else '抢修 OFF')
+        self._mark('强化抢修 ON' if on else '强化抢修 BASELINE')
 
     def closeEvent(self, event):
         self.stop_sim()

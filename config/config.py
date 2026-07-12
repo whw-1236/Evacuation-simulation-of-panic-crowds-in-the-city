@@ -223,6 +223,9 @@ class SimulationConfig:
     # 【重要】每步代表现实世界15分钟
     TOTAL_STEPS = 1000  # 总仿真步数（1000步 × 0.25小时 = 250小时 ≈ 10.4天）
     DT = 0.25  # 每步时间间隔（小时），0.25 = 15分钟
+    # Incident selection uses a simulation-scoped RNG; batch runners should
+    # set this explicitly for reproducible partial-load selections.
+    RANDOM_SEED = 42
 
     # 时间换算参考：
     # - 1小时 = 4步
@@ -497,6 +500,7 @@ class LoadPriorityConfig:
             'base_damage': 0,  # 无损坏
             'repair_difficulty': 0.0,  # 无需修复
             'detection_delay': 0.0,
+            'scheduled_duration_hours': 2.0,
             'estimated_repair_days': '无需修复',
         },
     }
@@ -533,6 +537,9 @@ class GridRepairConfig:
     # 基础参数
     # 【重要调整】大幅降低基础修复能力，使大灾害需要更长修复时间
     BASE_REPAIR_CAPACITY = 1.5  # 基础修复能力（单位/小时）← 从5.0降到1.5
+    # UI "强化抢修" applies this multiplier.  Baseline repair remains active
+    # when the switch is off, preserving a valid no-intervention control.
+    ACCELERATED_REPAIR_MULTIPLIER = 1.5
 
     # 资源效率计算参数
     RESOURCE_EFFICIENCY_BASE = 0.3  # 资源效率基础值
