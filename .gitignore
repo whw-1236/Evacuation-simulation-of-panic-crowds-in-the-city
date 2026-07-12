@@ -249,8 +249,13 @@ zotero_selected_entries.txt
 zip/
 analysis/
 Reference/
-scripts/
-tests/
+scripts/*
+!scripts/run_outage_v2_acceptance.py
+tests/*
+!tests/run_smoke_tests.py
+!tests/test_literature_validation_controls.py
+!tests/test_government_intervention_controls.py
+!tests/test_outage_state_machine.py
 requirements.txt
 ui/
 test/

@@ -7,12 +7,10 @@
 3. 干预动作 (资源加倍, 应急预警) 能进入仿真且改变指标
 4. Stress ↔ Panic 解耦合 (相关系数 < 0.99)
 5. * emotion display chronic-anxiety floor 公式: display >= 0.5*(stress-0.15) 当 stress > 0.15
-6. * 部分停电 trigger_outage(mode='partial') 后:
-   - sim.zone_outage_cause 被填
-   - sim.district_outage_mode == 'partial'
-7. * 恢复供电 (模拟 act_restore_power) 后:
-   - sim.zone_outage_cause 空
-   - sim.district_outage_mode == None
+6. * 统一 v2 部分停电入口 trigger_outage_scenario() 在同一步创建可审计修复状态
+   - total_work > 0、受影响负荷非空、ETA 可读
+   - 沈阳单 zone 也产生琥珀色的实体级部分停电，而非把 1/1 zone 变红
+7. * 设备故障在 600 步内自动恢复，随后 force_restore_outage() 可安全清理第二次事故
 
 运行: python -m ui.smoke_test
 """
@@ -31,23 +29,7 @@ matplotlib.use('Agg')
 import numpy as np
 
 # 不直接调 SimulationWorker.start() (那需要 QThread event loop), 走它内部独立方法
-from ui.main_window import SimulationWorker
-
-
-def _restore_power_inline(sim):
-    """模拟 MainWindow.act_restore_power._do, 跑在同一线程里 (smoke 用)"""
-    for z in list(sim.zone_status.keys()):
-        sim.zone_status[z] = True
-        if hasattr(sim, 'zone_duration'):
-            sim.zone_duration[z] = 0
-        if hasattr(sim, 'zone_outage_cause') and z in sim.zone_outage_cause:
-            del sim.zone_outage_cause[z]
-    if hasattr(sim, 'district_outage_mode'):
-        sim.district_outage_mode = None
-    if hasattr(sim, 'district_repair_started'):
-        sim.district_repair_started = False
-    if hasattr(sim, 'district_repair_progress'):
-        sim.district_repair_progress = 0.0
+from ui.main_window import SimulationWorker, _outage_metrics_snapshot
 
 
 def main():
@@ -55,7 +37,9 @@ def main():
     print(f'CWD: {os.getcwd()}')
 
     w = SimulationWorker(
-        city='厦门市', district='思明区',
+        # 沈河区目前只有一个运行时 zone，正好覆盖“单 zone 仍必须实际负荷
+        # 切除”的回归场景；厦门的重复 raw zone ID 由数据预检单独处理。
+        city='沈阳市', district='沈河区',
         n_residents=300, n_enterprises=10,    # 减小, smoke 跑得快
         use_road_graph=True,
         use_mml=True,
@@ -71,20 +55,29 @@ def main():
           f'use_road_graph={getattr(sim, "use_road_graph", False)}, '
           f'shelters={len(getattr(sim, "shelters", []) or [])}')
 
-    # ===== 阶段 1: 触发部分停电 + 验证 zone_outage_cause / district_mode 被设 =====
-    zones = list(sim.zone_status.keys())
-    half = max(1, len(zones) // 2)
-    print(f'\n[阶段1] 触发部分停电 (severity=0.8) 一半 zone ({half}/{len(zones)})')
-    sim.trigger_outage(zones[:half], mode='partial',
-                       cause='equipment_failure', severity_ratio=0.8)
-
-    n_cause_set = len(getattr(sim, 'zone_outage_cause', {}))
-    dist_mode = getattr(sim, 'district_outage_mode', None)
-    print(f'   zone_outage_cause 已填: {n_cause_set} 个 zone')
-    print(f'   district_outage_mode = {dist_mode!r}')
-    assert n_cause_set > 0, 'FAIL: 部分停电后 zone_outage_cause 应非空'
-    assert dist_mode == 'partial', f"FAIL: district_outage_mode 应 'partial', 得 {dist_mode!r}"
-    print('   [OK] 阶段1 通过 (partial outage 正确设了 cause + district_mode)')
+    # ===== 阶段 1: 统一接口 + 单 zone 实际负荷切除 =====
+    trigger = getattr(sim, 'trigger_outage_scenario', None)
+    assert callable(trigger), 'FAIL: UI v2 依赖 trigger_outage_scenario()'
+    district = next(iter(getattr(sim, 'district_to_zones', {}) or {}), w.district)
+    print(f'\n[阶段1] 统一入口：{district} 50% 实际加权负荷切除 (seed=42)')
+    trigger(
+        district=district, mode='partial', cause='equipment_failure',
+        shed_ratio=0.5, damage_level=None, seed=42, scope_zone_ids=None,
+    )
+    outage = _outage_metrics_snapshot(sim)
+    print(f"   状态={outage['phase']}, W={outage['work_done']:.1f}/{outage['total_work']:.1f}, "
+          f"负荷={outage['affected_load_count']}, 请求/实际="
+          f"{outage['requested_shed_ratio']:.1%}/{outage['realized_shed_ratio']:.1%}, "
+          f"ETA={outage['eta_hours']}")
+    assert outage['active'], 'FAIL: 触发当步必须存在活动事故状态'
+    assert outage['total_work'] > 0, 'FAIL: 触发当步必须创建 total_work'
+    assert outage['affected_load_count'] > 0, 'FAIL: 单 zone partial 必须切除实体负荷'
+    assert abs(outage['realized_shed_ratio'] - 0.5) <= 0.20, (
+        f"FAIL: 实际切负荷比例应接近 50%，得 {outage['realized_shed_ratio']:.1%}")
+    fractions = getattr(sim, 'zone_power_fraction', {}) or {}
+    assert any(0.0 < float(value) < 1.0 for value in fractions.values()), (
+        'FAIL: 单 zone partial 应产生 0<zone_power_fraction<1 的琥珀色区域')
+    print('   [OK] 阶段1 通过（单 zone 未被错误升级为全区全停）')
 
     # ===== 阶段 2: 推 30 步 + 验证 history 累计 =====
     print(f'\n[阶段2] 推 30 步, 中间 step 15 干预 (资源 ×1.8)')
@@ -95,9 +88,14 @@ def main():
         if i == 14:
             for gov in sim.gov_agents.values():
                 gov.initiative = min(1.0, gov.initiative * 1.8)
-                gov.use_manual_events = True
-                gov.manual_emergency_warning = True
-                gov.manual_resource_to_resident = True
+                setter = getattr(gov, 'set_event_mode', None)
+                if callable(setter):
+                    setter('emergency_warning', 'on')
+                    setter('resource_to_resident', 'on')
+                else:
+                    gov.use_manual_events = True
+                    gov.manual_emergency_warning = True
+                    gov.manual_resource_to_resident = True
     print(f'   30 步 in {time.time()-t0:.1f}s')
 
     n = len(w.opinion_hist)
@@ -127,19 +125,36 @@ def main():
     assert floor_ok, 'FAIL: emotion_display 未达 chronic-anxiety floor'
     print('   [OK] 阶段3 通过 (display ≥ max(raw_avg, 0.5·(σ-0.15)))')
 
-    # ===== 阶段 4: 恢复供电 + 验证 cause / mode 被清 =====
-    print(f'\n[阶段4] 模拟全城恢复供电')
-    _restore_power_inline(sim)
-    n_cause_after = len(getattr(sim, 'zone_outage_cause', {}))
-    dist_mode_after = getattr(sim, 'district_outage_mode', None)
-    print(f'   zone_outage_cause 现 {n_cause_after} 个 (应为 0)')
-    print(f'   district_outage_mode 现 {dist_mode_after!r} (应为 None)')
-    assert n_cause_after == 0, f'FAIL: 恢复后 zone_outage_cause 应清空, 现 {n_cause_after}'
-    assert dist_mode_after is None, f'FAIL: 恢复后 district_outage_mode 应 None, 现 {dist_mode_after!r}'
-    print('   [OK] 阶段4 通过 (restore 清干净了)')
+    # ===== 阶段 4: 等待自动修复，必须在 600 步内收敛 =====
+    print('\n[阶段4] 等待设备故障自动修复（最多 600 步）')
+    restored = False
+    for _ in range(600):
+        sim.step()
+        w._record_step()
+        outage = _outage_metrics_snapshot(sim)
+        if not outage['active']:
+            restored = True
+            break
+    print(f"   自动恢复={restored}, step={sim.step_count}, "
+          f"history={len(w.opinion_hist)}")
+    assert restored, 'FAIL: equipment_failure 应在 600 步内自动恢复'
+    print('   [OK] 阶段4 通过（自动修复状态机收敛）')
 
-    # ===== 阶段 5: Stress ↔ Panic 解耦合 =====
-    print(f'\n[阶段5] Stress ↔ Panic 解耦合检查')
+    # ===== 阶段 5: 第二次事故 + 强制恢复清理 =====
+    print('\n[阶段5] 第二次事故与 force_restore_outage() 清理')
+    trigger(
+        district=district, mode='full', cause='equipment_failure',
+        shed_ratio=1.0, damage_level=None, seed=42, scope_zone_ids=None,
+    )
+    assert _outage_metrics_snapshot(sim)['active'], 'FAIL: 恢复后应可再次触发事故'
+    restore = getattr(sim, 'force_restore_outage', None)
+    assert callable(restore), 'FAIL: UI v2 依赖 force_restore_outage()'
+    restore(district=None)
+    assert not _outage_metrics_snapshot(sim)['active'], 'FAIL: 强制恢复后不应保留活动事故'
+    print('   [OK] 阶段5 通过（强制恢复无残留）')
+
+    # ===== 阶段 6: Stress ↔ Panic 解耦合 =====
+    print(f'\n[阶段6] Stress ↔ Panic 解耦合检查')
     s = np.array(w.stress_hist)
     p = np.array(w.panic_hist)
     if s.std() > 0 and p.std() > 0:
@@ -149,15 +164,15 @@ def main():
         print(f'   Stress 均值: {s.mean():.3f}, Panic 均值: {p.mean():.3f}')
     print('   (panic = σ^0.8, 数学上跟 stress 紧密相关, 这只是描述指标)')
 
-    # ===== 阶段 6: §5.1 cascade 信号 =====
-    print(f'\n[阶段6] §5.1 cascade 信号 (MML + graph-on, 30 步较短可能 cascade 未起)')
+    # ===== 阶段 7: §5.1 cascade 信号 =====
+    print(f'\n[阶段7] §5.1 cascade 信号 (MML + graph-on, 前 30 步较短可能 cascade 未起)')
     flee_max = float(max(w.flee_hist)) if w.flee_hist else 0.0
     herd_max = float(max(w.herd_hist)) if w.herd_hist else 0.0
     print(f'   flee_ratio 峰值: {flee_max:.3f}')
     print(f'   herd_ratio 峰值: {herd_max:.3f}')
 
     print('\n' + '=' * 60)
-    print('[OK] 全部 6 阶段冒烟通过')
+    print('[OK] 全部 7 阶段冒烟通过')
     print('     UI 可用 `python -m ui.main_window` 启动验证视觉效果')
     print('=' * 60)
     return 0
