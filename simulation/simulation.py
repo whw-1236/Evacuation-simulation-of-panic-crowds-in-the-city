@@ -18,6 +18,8 @@ import numpy as np
 import random
 import sys
 import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 # 项目根目录 = 论文仿真系统/
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +34,103 @@ from core.social_force import IntegratedForceCalculator
 from core.behavior_switching import init_store_state
 from core.event_recorder import EventRecorder, EventDetector
 from core.event_influence import EventInfluenceCalculator
+
+
+@dataclass
+class AffectedLoad:
+    """One load unit selected by a district outage incident.
+
+    The simulation has no electrical feeder topology.  A resident, enterprise,
+    or CSV POI is therefore the smallest auditable load unit.  Keeping the
+    object reference here avoids a second, divergent selection path during
+    staged restoration.
+    """
+
+    kind: str
+    ref: Any
+    zone_id: Any
+    level: int
+    weight: float
+    ordinal: int
+    restored: bool = False
+    restore_threshold: float = 0.0
+
+
+@dataclass
+class DistrictOutageState:
+    """Authoritative, per-district outage and repair state.
+
+    ``zone_status`` and the legacy district fields remain compatibility views;
+    this object is the only source that advances repair work.
+    """
+
+    event_id: str
+    district: str
+    status: str
+    mode: str
+    cause: str
+    damage_level: float
+    repair_difficulty: float
+    requested_shed_ratio: float
+    realized_shed_ratio: float
+    seed: int
+    affected_zone_ids: List[Any] = field(default_factory=list)
+    affected_loads: List[AffectedLoad] = field(default_factory=list)
+    detection_remaining_hours: float = 0.0
+    mobilization_remaining_hours: float = 0.0
+    scheduled_remaining_hours: Optional[float] = None
+    total_work: float = 0.0
+    work_done: float = 0.0
+    current_capacity: float = 0.0
+    start_step: int = 0
+    repair_started_step: Optional[int] = None
+    restored_step: Optional[int] = None
+    completion_reason: Optional[str] = None
+    completion_recorded: bool = False
+
+    @property
+    def progress(self) -> float:
+        if self.total_work <= 0:
+            return 1.0 if self.status == 'restored' else 0.0
+        return max(0.0, min(1.0, self.work_done / self.total_work))
+
+    @property
+    def remaining_work(self) -> float:
+        return max(0.0, self.total_work - self.work_done)
+
+    def to_audit_dict(self) -> Dict[str, Any]:
+        """Return only serialisable fields for UI/CSV/headless exports."""
+        capacity = max(0.0, self.current_capacity)
+        eta = (self.remaining_work / capacity) if capacity > 0 else float('inf')
+        if self.scheduled_remaining_hours is not None:
+            eta = max(0.0, self.scheduled_remaining_hours)
+        return {
+            'event_id': self.event_id,
+            'district': self.district,
+            'status': self.status,
+            'mode': self.mode,
+            'cause': self.cause,
+            'damage_level': self.damage_level,
+            'repair_difficulty': self.repair_difficulty,
+            'requested_shed_ratio': self.requested_shed_ratio,
+            'realized_shed_ratio': self.realized_shed_ratio,
+            'seed': self.seed,
+            'affected_zone_count': len(self.affected_zone_ids),
+            'affected_load_count': len(self.affected_loads),
+            'detection_remaining_hours': self.detection_remaining_hours,
+            'mobilization_remaining_hours': self.mobilization_remaining_hours,
+            'scheduled_remaining_hours': self.scheduled_remaining_hours,
+            'total_work': self.total_work,
+            'work_done': self.work_done,
+            'remaining_work': self.remaining_work,
+            'current_capacity': self.current_capacity,
+            'progress': self.progress,
+            'eta_hours': eta,
+            'start_step': self.start_step,
+            'repair_started_step': self.repair_started_step,
+            'restored_step': self.restored_step,
+            'completion_reason': self.completion_reason,
+        }
 
 
 class BlackoutSimulation:
@@ -93,6 +192,11 @@ class BlackoutSimulation:
         self.N_residents = config.simulation.N_RESIDENTS
         self.N_enterprises = config.simulation.N_ENTERPRISES
         self.seir_ratios = config.simulation.SEIR_RATIOS.copy()
+        # A simulation-scoped RNG makes partial-load selection reproducible
+        # without perturbing unrelated behaviour-model random draws.
+        self.random_seed = int(getattr(config.simulation, 'RANDOM_SEED', 42))
+        self._outage_rng = random.Random(self.random_seed)
+        self._outage_event_counter = 0
 
         # ==================== 停电配置 ====================
         self.outage_config = outage_config  # 外部传入的停电配置
@@ -162,12 +266,18 @@ class BlackoutSimulation:
         mode = BlackoutSimulation._normalize_opinion_mode(
             getattr(self, 'opinion_mode', 'auto')
         )
+        # ``auto`` means no global override.  District-specific UI controls
+        # use GovernmentAgent.set_event_mode() directly and must survive the
+        # next simulation step.
         if mode == 'auto':
             self._update_opinion_audit_state()
             return
-        active = (mode == 'on')
         for gov in self.gov_agents.values():
-            gov.public_opinion_active = active
+            setter = getattr(gov, 'set_event_mode', None)
+            if callable(setter):
+                setter('public_opinion', mode)
+            elif mode != 'auto':
+                gov.public_opinion_active = (mode == 'on')
         self._update_opinion_audit_state()
 
     def _update_opinion_audit_state(self):
@@ -766,6 +876,469 @@ class BlackoutSimulation:
             return self.gov_agents[district]
         return self.gov
 
+    def _resolve_outage_district(self, district=None, scope_zone_ids=None):
+        """Resolve old single-city calls to one canonical district key."""
+        if district in self.district_to_zones:
+            return district
+        scope_districts = {
+            self.zone_to_district.get(zone)
+            for zone in (scope_zone_ids or [])
+            if self.zone_to_district.get(zone) in self.district_to_zones
+        }
+        if len(scope_districts) == 1:
+            return next(iter(scope_districts))
+        if len(self.district_to_zones) == 1:
+            return next(iter(self.district_to_zones))
+        raise ValueError(f'Cannot resolve outage district from {district!r}')
+
+    # ------------------------------------------------------------------
+    # Authoritative outage / repair state machine
+    # ------------------------------------------------------------------
+    def validate_outage_preflight(self, district=None):
+        """Validate the minimal data contract before an outage is mutated.
+
+        GeoJSON loading historically overwrote duplicate ``XZQDM`` keys in
+        ``regions``.  ``all_zone_ids`` retains the raw sequence, so it is the
+        only reliable way to surface that data-quality error after loading.
+        This method is intentionally read-only and is also used by tests and
+        batch runners before an incident is scheduled.
+        """
+        errors = []
+        warnings = []
+        raw_ids = list(getattr(self.region_manager, 'all_zone_ids', []))
+        duplicates = sorted({str(z) for z in raw_ids if raw_ids.count(z) > 1})
+        if duplicates:
+            # The loader canonicalises an ID to its final feature.  Surface
+            # this as a research-data warning (and in the UI audit) instead of
+            # turning an otherwise usable city into an un-runnable demo.
+            warnings.append('duplicate_zone_ids:' + ','.join(duplicates))
+        if not self.district_to_zones:
+            errors.append('no_district_zone_mapping')
+        if district is not None and district not in self.district_to_zones:
+            errors.append('unknown_district:' + str(district))
+        orphan_zones = [z for z in self.region_manager.regions
+                        if z not in self.zone_to_district]
+        if orphan_zones:
+            warnings.append('orphan_zone_mapping:' + ','.join(map(str, orphan_zones)))
+        return {'ok': not errors, 'errors': errors, 'warnings': warnings}
+
+    # Alternate name retained for callers that use the verb first.
+    preflight_outage_data = validate_outage_preflight
+
+    @staticmethod
+    def _outage_is_active(state):
+        return state is not None and state.status in {
+            'detecting', 'mobilizing', 'repairing', 'scheduled'
+        }
+
+    def get_district_outage_state(self, district):
+        """Return the durable state object for programmatic inspection."""
+        return self.district_outage_states.get(district)
+
+    def get_outage_state(self, district=None):
+        """Return a serialisable state snapshot for the UI and CSV exporters."""
+        if district is None:
+            active = [s for s in self.district_outage_states.values()
+                      if self._outage_is_active(s)]
+            if active:
+                state = active[0]
+            else:
+                state = self.district_outage_states.get(self.district_name)
+                if state is None and self.district_outage_states:
+                    state = next(iter(self.district_outage_states.values()))
+        else:
+            state = self.district_outage_states.get(district)
+        if state is None:
+            return {
+                'status': 'normal', 'progress': 0.0,
+                'total_work': 0.0, 'work_done': 0.0,
+                'requested_shed_ratio': 0.0, 'realized_shed_ratio': 0.0,
+                'affected_load_count': 0, 'eta_hours': 0.0,
+            }
+        return state.to_audit_dict()
+
+    def _scope_load_units(self, district, scope_zone_ids=None):
+        """Return deterministic entity-level load units for one district.
+
+        The map data has no feeder graph.  Residents, enterprises, and mapped
+        CSV facilities are therefore the auditable load units.  A stable
+        ordinal makes selection and staged restoration reproducible under a
+        supplied seed without changing the model-wide random stream.
+        """
+        district_zones = list(self.district_to_zones.get(district, []))
+        if scope_zone_ids is None:
+            scope = district_zones
+        else:
+            wanted = set(scope_zone_ids)
+            scope = [z for z in district_zones if z in wanted]
+        if not scope:
+            return [], []
+
+        weights = self.config.load_priority.LOAD_WEIGHTS
+        facility_levels = self.config.load_priority.FACILITY_LOAD_LEVELS
+        units = []
+        ordinal = 0
+        for resident in self.residents:
+            if resident.zone in scope:
+                units.append(AffectedLoad(
+                    'resident', resident, resident.zone, 3, weights[3], ordinal
+                ))
+                ordinal += 1
+        for enterprise in self.enterprises:
+            zone = getattr(enterprise, 'zone', None)
+            if zone in scope:
+                units.append(AffectedLoad(
+                    'enterprise', enterprise, zone, 3, weights[3], ordinal
+                ))
+                ordinal += 1
+        for node in self.csv_nodes:
+            zone = node.get('zone')
+            if zone in scope:
+                level = facility_levels.get(node.get('category', 'industry'), 3)
+                units.append(AffectedLoad(
+                    'node', node, zone, level, weights[level], ordinal
+                ))
+                ordinal += 1
+        return units, scope
+
+    def get_weighted_outage_ratio(self, district=None):
+        """Return current unserved weighted load, never a zone-count proxy."""
+        if district is None:
+            units = []
+            for district_name in self.district_to_zones:
+                district_units, _ = self._scope_load_units(district_name)
+                units.extend(district_units)
+        else:
+            units, _ = self._scope_load_units(district)
+        total = sum(load.weight for load in units)
+        if total <= 0.0:
+            return 0.0
+        unserved = 0.0
+        for load in units:
+            if load.kind == 'node':
+                powered = bool(load.ref.get('powered', True))
+            else:
+                powered = self._is_entity_powered(load.ref, load.zone_id)
+            if not powered:
+                unserved += load.weight
+        return max(0.0, min(1.0, unserved / total))
+
+    @staticmethod
+    def _set_load_power(load, powered):
+        """Apply a state-machine power projection to one entity only."""
+        if load.kind == 'node':
+            load.ref['powered'] = bool(powered)
+            load.ref['_is_load_shed'] = not bool(powered)
+            return
+        load.ref.powered = bool(powered)
+        load.ref._is_load_shed = not bool(powered)
+
+    def _rebuild_outage_projection(self, state):
+        """Project one authoritative state onto legacy map/entity views."""
+        all_units, scope = self._scope_load_units(state.district, state.affected_zone_ids)
+        all_weight_by_zone = {z: 0.0 for z in scope}
+        shed_weight_by_zone = {z: 0.0 for z in scope}
+        partial = {z: {'residents': [], 'enterprises': [], 'nodes': []} for z in scope}
+        selected = {id(load.ref): load for load in state.affected_loads if not load.restored}
+
+        for load in all_units:
+            all_weight_by_zone[load.zone_id] = all_weight_by_zone.get(load.zone_id, 0.0) + load.weight
+            is_shed = id(load.ref) in selected
+            if is_shed:
+                shed_weight_by_zone[load.zone_id] = shed_weight_by_zone.get(load.zone_id, 0.0) + load.weight
+                if load.kind == 'resident':
+                    partial[load.zone_id]['residents'].append(load.ref)
+                elif load.kind == 'enterprise':
+                    partial[load.zone_id]['enterprises'].append(load.ref)
+                else:
+                    partial[load.zone_id]['nodes'].append(load.ref)
+            self._set_load_power(load, not is_shed)
+
+        for zone in scope:
+            total = all_weight_by_zone.get(zone, 0.0)
+            shed = shed_weight_by_zone.get(zone, 0.0)
+            if total <= 0.0:
+                # A full physical outage still colours an empty sampled zone
+                # red; a partial outage cannot silently manufacture demand.
+                fraction = 0.0 if state.mode == 'full' else 1.0
+            else:
+                fraction = max(0.0, min(1.0, 1.0 - shed / total))
+            self.zone_power_fraction[zone] = fraction
+            # False is reserved for true zero-supply zones.  A one-zone city
+            # with a 50% load shed therefore renders amber, not red.
+            self.zone_status[zone] = fraction > 0.0
+            self.zone_outage_cause[zone] = state.cause if fraction < 1.0 else None
+            if fraction < 1.0:
+                self.partial_outage_entities[zone] = partial[zone]
+            else:
+                self.partial_outage_entities.pop(zone, None)
+
+    def _sync_legacy_outage_projection(self):
+        """Keep historic scalar fields as a read-only projection of active state."""
+        active = [s for s in self.district_outage_states.values()
+                  if self._outage_is_active(s)]
+        if not active:
+            self.district_powered = True
+            self.district_outage_mode = None
+            self.district_outage_cause = None
+            self.district_repair_progress = 0.0
+            self.district_repair_started = False
+            self.district_recovered = True
+            return
+        primary = active[0]
+        self.district_powered = primary.mode != 'full' or primary.progress > 0.0
+        self.district_outage_mode = primary.mode
+        self.district_outage_cause = primary.cause
+        self.district_repair_progress = primary.progress
+        self.district_repair_started = primary.status == 'repairing'
+        self.district_recovered = False
+        self.district_total_work = primary.total_work
+        self.district_completed_work = primary.work_done
+        self.district_fault_detection_time = primary.detection_remaining_hours
+        self.district_fault_ready = primary.status == 'repairing'
+
+    def _project_grid_repairs(self):
+        """Expose the state machine to event logging without a second progress path."""
+        projected = {}
+        for state in self.district_outage_states.values():
+            if state.status == 'repairing':
+                for zone in state.affected_zone_ids:
+                    projected[zone] = {
+                        'event_id': state.event_id,
+                        'damage_level': state.damage_level,
+                        'repair_difficulty': state.repair_difficulty,
+                        'progress': state.progress,
+                        'total_work': state.total_work,
+                        'work_done': state.work_done,
+                        'start_step': state.repair_started_step,
+                    }
+        self.grid.ongoing_repairs = projected
+        self.grid.is_repairing = bool(projected)
+        self.grid.repair_progress_percent = max(
+            (state.progress * 100 for state in self.district_outage_states.values()
+             if self._outage_is_active(state)), default=0.0
+        )
+
+    def _restore_outage_state(self, state, restored_step=None, reason='automatic'):
+        """Complete or forcibly restore exactly one incident and clean projections."""
+        for load in state.affected_loads:
+            load.restored = True
+            self._set_load_power(load, True)
+        for zone in state.affected_zone_ids:
+            self.zone_status[zone] = True
+            self.zone_power_fraction[zone] = 1.0
+            self.zone_duration[zone] = 0.0
+            self.zone_outage_cause.pop(zone, None)
+            self.partial_outage_entities.pop(zone, None)
+        state.work_done = state.total_work
+        state.status = 'restored'
+        state.restored_step = self.step_count if restored_step is None else restored_step
+        state.completion_reason = reason
+        if not state.completion_recorded:
+            history = getattr(self, 'outage_event_history', None)
+            if history is None:
+                history = []
+                self.outage_event_history = history
+            history.append(state.to_audit_dict())
+            state.completion_recorded = True
+        self._just_restored_zones.extend(state.affected_zone_ids)
+        self._project_grid_repairs()
+        self._sync_legacy_outage_projection()
+
+    def force_restore_outage(self, district=None, reason='manual'):
+        """Force restoration while retaining a completed audit record.
+
+        ``reason`` is accepted for UI/action logs; operational state is cleaned
+        identically for automatic and manual recovery so a second incident can
+        start in the same simulation instance.
+        """
+        candidates = ([self.district_outage_states.get(district)] if district is not None
+                      else list(self.district_outage_states.values()))
+        restored = []
+        for state in candidates:
+            if self._outage_is_active(state):
+                self._restore_outage_state(state, reason=reason)
+                restored.append(state.district)
+        return restored
+
+    def trigger_outage_scenario(self, district, mode, cause, shed_ratio,
+                                damage_level=None, seed=None,
+                                scope_zone_ids=None,
+                                scheduled_duration_hours=None):
+        """Transactionally create the only outage/repair state for a district.
+
+        ``shed_ratio`` affects selected demand only.  It is deliberately not
+        used to scale physical repair work.  ``mode='partial'`` selects actual
+        weighted entity loads in level 3 -> 2 -> 1 order; ``full`` selects the
+        entire requested scope.
+        """
+        preflight = self.validate_outage_preflight()
+        if not preflight['ok']:
+            raise ValueError('Outage preflight failed: ' + '; '.join(preflight['errors']))
+        if district not in self.district_to_zones:
+            raise ValueError(f'Unknown district: {district!r}')
+        mode = str(mode or 'partial').lower()
+        if mode not in {'full', 'partial'}:
+            raise ValueError("mode must be 'full' or 'partial'")
+        try:
+            requested = float(shed_ratio)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('shed_ratio must be numeric') from exc
+        if not 0.0 <= requested <= 1.0:
+            raise ValueError('shed_ratio must be in [0, 1]')
+        if requested <= 0.0:
+            return None
+        if mode == 'full' or requested >= 1.0:
+            mode, requested = 'full', 1.0
+
+        existing = self.district_outage_states.get(district)
+        if self._outage_is_active(existing):
+            raise RuntimeError(f'District {district!r} already has active outage {existing.event_id}')
+        causes = self.config.load_priority.OUTAGE_CAUSES
+        if cause not in causes:
+            raise ValueError(f'Unknown outage cause: {cause!r}')
+        candidate_loads, scope = self._scope_load_units(district, scope_zone_ids)
+        if not candidate_loads:
+            raise ValueError(f'District {district!r} has no selectable loads in scope')
+
+        event_seed = int(seed) if seed is not None else self._outage_rng.randrange(0, 2 ** 31)
+        rng = random.Random(event_seed)
+        total_weight = sum(load.weight for load in candidate_loads)
+        if mode == 'full':
+            selected = list(candidate_loads)
+        else:
+            selected = []
+            selected_weight = 0.0
+            target_weight = total_weight * requested
+            for level in (3, 2, 1):
+                peers = [load for load in candidate_loads if load.level == level]
+                rng.shuffle(peers)
+                for load in peers:
+                    if selected_weight >= target_weight:
+                        break
+                    selected.append(load)
+                    selected_weight += load.weight
+                if selected_weight >= target_weight:
+                    break
+        selected_weight = sum(load.weight for load in selected)
+        if not selected or selected_weight <= 0.0:
+            return None
+
+        cause_cfg = causes[cause]
+        damage = float(cause_cfg['base_damage'] if damage_level is None else damage_level)
+        if damage < 0.0:
+            raise ValueError('damage_level must be non-negative')
+        difficulty = float(cause_cfg['repair_difficulty'])
+        self._outage_event_counter += 1
+        event_id = f'{district}:{self._outage_event_counter:04d}'
+        scheduled = None
+        if cause == 'planned_outage':
+            scheduled = float(
+                scheduled_duration_hours if scheduled_duration_hours is not None
+                else cause_cfg.get('scheduled_duration_hours', 2.0)
+            )
+            if scheduled <= 0.0:
+                raise ValueError('scheduled_duration_hours must be positive')
+        else:
+            repair_cfg = self.config.grid_repair
+            total_work = (
+                damage * repair_cfg.DAMAGE_WORK_MULTIPLIER
+                + difficulty * repair_cfg.DIFFICULTY_WORK_MULTIPLIER
+            )
+            total_work = max(0.0, total_work)
+        state = DistrictOutageState(
+            event_id=event_id,
+            district=district,
+            status='scheduled' if scheduled is not None else 'detecting',
+            mode=mode,
+            cause=cause,
+            damage_level=damage,
+            repair_difficulty=difficulty,
+            requested_shed_ratio=requested,
+            realized_shed_ratio=selected_weight / total_weight,
+            seed=event_seed,
+            affected_zone_ids=list(scope),
+            affected_loads=selected,
+            detection_remaining_hours=0.0 if scheduled is not None else float(cause_cfg.get('detection_delay', 0.0)),
+            mobilization_remaining_hours=0.0,
+            scheduled_remaining_hours=scheduled,
+            total_work=0.0 if scheduled is not None else total_work,
+            current_capacity=(0.0 if scheduled is not None
+                              else self.grid.calculate_repair_capacity(self.config)),
+            start_step=self.step_count,
+        )
+        selected_weight_total = selected_weight
+        restore_weight = 0.0
+        # Recovery priority is the reverse of shedding priority: L1 -> L2 -> L3.
+        for load in sorted(state.affected_loads, key=lambda x: (x.level, x.ordinal)):
+            restore_weight += load.weight
+            load.restore_threshold = (
+                state.total_work * restore_weight / selected_weight_total
+                if state.total_work > 0 else 0.0
+            )
+
+        # Commit point: every validation and selection error above leaves the
+        # existing map, entity, and compatibility views untouched.
+        self.district_outage_states[district] = state
+        self._rebuild_outage_projection(state)
+        self._sync_legacy_outage_projection()
+        self._project_grid_repairs()
+        return state
+
+    def _advance_outage_repair_states(self, repair_capacity):
+        """Advance all active incidents from the one authoritative work source."""
+        active = [s for s in self.district_outage_states.values()
+                  if self._outage_is_active(s)]
+        if not active:
+            self._project_grid_repairs()
+            return []
+        completed = []
+        ready = []
+        for state in active:
+            if state.status == 'scheduled':
+                state.scheduled_remaining_hours = max(
+                    0.0, float(state.scheduled_remaining_hours or 0.0) - self.dt
+                )
+                state.current_capacity = 0.0
+                if state.scheduled_remaining_hours <= 0.0:
+                    completed.append(state)
+                continue
+            if state.detection_remaining_hours > 0.0:
+                state.detection_remaining_hours = max(0.0, state.detection_remaining_hours - self.dt)
+                state.status = 'detecting'
+                continue
+            if state.mobilization_remaining_hours > 0.0:
+                state.mobilization_remaining_hours = max(0.0, state.mobilization_remaining_hours - self.dt)
+                state.status = 'mobilizing'
+                continue
+            ready.append(state)
+
+        if ready:
+            capacity = max(0.0, float(repair_capacity)) / len(ready)
+            if bool(getattr(self.grid, 'manual_repair', False)):
+                capacity *= float(getattr(
+                    self.config.grid_repair, 'ACCELERATED_REPAIR_MULTIPLIER', 1.5
+                ))
+            for state in ready:
+                state.status = 'repairing'
+                state.current_capacity = capacity
+                if state.repair_started_step is None:
+                    state.repair_started_step = self.step_count
+                state.work_done = min(state.total_work, state.work_done + capacity * self.dt)
+                for load in state.affected_loads:
+                    if not load.restored and state.work_done + 1e-12 >= load.restore_threshold:
+                        load.restored = True
+                        self._set_load_power(load, True)
+                self._rebuild_outage_projection(state)
+                if state.work_done + 1e-12 >= state.total_work:
+                    completed.append(state)
+
+        for state in completed:
+            self._restore_outage_state(state)
+        self._project_grid_repairs()
+        self._sync_legacy_outage_projection()
+        return [state.district for state in completed]
+
     def trigger_district_outage_by_names(self, district_names, mode='full', cause='equipment_failure',
                                          severity_ratio=0.5):
         """
@@ -777,6 +1350,16 @@ class BlackoutSimulation:
             cause: 停电原因
             severity_ratio: 部分停电时的切负荷比例
         """
+        return {
+            district: self.trigger_outage_scenario(
+                district=district,
+                mode=mode,
+                cause=cause,
+                shed_ratio=severity_ratio,
+            )
+            for district in district_names
+        }
+
         zones_to_outage = []
         for d_name in district_names:
             zones = self.district_to_zones.get(d_name, [])
@@ -815,6 +1398,30 @@ class BlackoutSimulation:
                 '湖里区': {...}
             }
         """
+        # Compatibility adapter.  The previous implementation selected whole
+        # zones and wrote ``zone_status`` directly; that made a one-zone city
+        # turn a requested partial outage into a full blackout with no repair
+        # state.  All callers now share the transactional state-machine API.
+        self.district_independent_configs = district_configs
+        results = {}
+        for district_name, cfg in district_configs.items():
+            if not cfg.get('enabled', False):
+                continue
+            scope = None
+            if not cfg.get('use_all_zones', True):
+                scope = list(cfg.get('selected_zones', []))
+            results[district_name] = self.trigger_outage_scenario(
+                district=district_name,
+                mode=cfg.get('mode', 'partial'),
+                cause=cfg.get('cause', 'equipment_failure'),
+                shed_ratio=cfg.get('shed_ratio', cfg.get('severity_ratio', 0.5)),
+                damage_level=cfg.get('damage_level'),
+                seed=cfg.get('seed'),
+                scope_zone_ids=scope,
+                scheduled_duration_hours=cfg.get('scheduled_duration_hours'),
+            )
+        return results
+
         import random
 
         print("[独立配置] 按行政区独立触发停电...")
@@ -924,10 +1531,19 @@ class BlackoutSimulation:
         self.district_repair_progress = 0.0  # 大电网修复进度 (0-1)
         self.district_repair_started = False  # 是否开始修复
         self.district_recovered = False  # 是否已恢复
+        # The legacy scalar fields above are a compatibility projection only.
+        self.district_recovered = False
+        # Each district now owns one durable outage record, including completed
+        # records for audit and repeat-incident validation.
+        self.district_outage_states: Dict[str, DistrictOutageState] = {}
+        self.outage_event_history: List[Dict[str, Any]] = []
 
         # ==================== 社区级别状态（用于事件记录） ====================
         # 各社区的供电状态（由行政区状态决定）
         self.zone_status = {rid: True for rid in self.region_manager.regions.keys()}
+        # Authoritative visual/behavioural supply fraction.  ``zone_status`` is
+        # retained for older consumers: False only means an actual full outage.
+        self.zone_power_fraction = {rid: 1.0 for rid in self.zone_status}
 
         # 社区停电时长（用于事件检测）
         self.zone_duration = {rid: 0 for rid in self.zone_status}
@@ -985,6 +1601,21 @@ class BlackoutSimulation:
 
         事件仍在社区级别记录。
         """
+        oc = self.outage_config or {}
+        scope_zone_ids = oc.get('zones')
+        return self.trigger_outage_scenario(
+            district=self._resolve_outage_district(
+                oc.get('district', self.district_name), scope_zone_ids
+            ),
+            mode=oc.get('mode', 'full'),
+            cause=oc.get('cause', 'equipment_failure'),
+            shed_ratio=oc.get('shed_ratio', oc.get('severity_ratio', 0.5)),
+            damage_level=oc.get('damage_level'),
+            seed=oc.get('seed'),
+            scope_zone_ids=scope_zone_ids,
+            scheduled_duration_hours=oc.get('scheduled_duration_hours'),
+        )
+
         oc = self.outage_config
         mode = oc.get('mode', 'full')
         cause = oc.get('cause', 'equipment_failure')
@@ -1027,6 +1658,11 @@ class BlackoutSimulation:
         参数:
             cause: 停电原因
         """
+        return self.trigger_outage_scenario(
+            district=self._resolve_outage_district(self.district_name),
+            mode='full', cause=cause, shed_ratio=1.0,
+        )
+
         # 所有社区停电
         for zone_id in self.zone_status:
             self.zone_status[zone_id] = False
@@ -1076,6 +1712,11 @@ class BlackoutSimulation:
             cause: 停电原因
             severity_ratio: 切负荷比例 (0-1)，表示要切除的区域比例
         """
+        return self.trigger_outage_scenario(
+            district=self._resolve_outage_district(self.district_name),
+            mode='partial', cause=cause, shed_ratio=severity_ratio,
+        )
+
         import random
         load_config = self.config.load_priority
 
@@ -1490,6 +2131,15 @@ class BlackoutSimulation:
             sim.trigger_district_outage(mode='partial', severity_ratio=0.4)
             sim.trigger_district_outage(mode='full', damage_level=80)  # 自定义损坏程度
         """
+        district = self._resolve_outage_district(self.district_name)
+        return self.trigger_outage_scenario(
+            district=district,
+            mode=mode,
+            cause=cause,
+            shed_ratio=severity_ratio,
+            damage_level=damage_level,
+        )
+
         if self.district_outage_mode is not None:
             print(f"[警告] 行政区 {self.district_name} 已处于停电状态")
             return
@@ -1580,8 +2230,14 @@ class BlackoutSimulation:
 
         新代码请使用 trigger_district_outage()
         """
-        # 直接调用新接口
-        self.trigger_district_outage(mode=mode, cause=cause, severity_ratio=severity_ratio)
+        district = self._resolve_outage_district(self.district_name, zone_ids)
+        return self.trigger_outage_scenario(
+            district=district,
+            mode=mode,
+            cause=cause,
+            shed_ratio=severity_ratio,
+            scope_zone_ids=zone_ids,
+        )
 
     def restore_zone(self, zone_id):
         """
@@ -1606,7 +2262,16 @@ class BlackoutSimulation:
         self.Q_hist = []  # 企业平均求助强度
         self.C_hist = []  # 关键设施求助
         self.R_hist = []  # 政府资源下发量
-        self.P_hist = []  # 综合舆情指数
+        # Historical compatibility name.  Eq.23 is a composite help-pressure
+        # indicator, not the authoritative public-opinion state.
+        self.P_hist = []
+        self.system_help_pressure_hist = self.P_hist
+        self.public_opinion_hist = []
+        self.opinion_components_hist = []
+        self.opinion_components = {
+            'emotion': 0.0, 'enterprise': 0.0, 'critical': 0.0,
+        }
+        self.public_opinion_pressure = 0.0
 
         # 系统状态历史
         self.emotion_hist = []  # 平均情绪
@@ -1615,6 +2280,9 @@ class BlackoutSimulation:
         self.blackout_hist = []  # 区域停电率
         self.informed_hist = []  # 居民知情率
         self.outage_count_hist = []  # 停电区域数
+        self.full_outage_zone_ratio_hist = []
+        self.unpowered_resident_ratio_hist = []
+        self.outage_repair_hist = []
 
         # SEIR状态历史
         self.seir_hist = {'S': [], 'E': [], 'I': [], 'R': []}
@@ -1806,7 +2474,7 @@ class BlackoutSimulation:
                                 self._assign_fault_severity(zone)
                                 break
 
-    def zone_recover(self, R):
+    def zone_recover(self, R=None):
         """
         行政区级别大电网修复逻辑
 
@@ -1819,6 +2487,13 @@ class BlackoutSimulation:
         【修复能力公式】
         修复能力 = 基础修复能力 × 资源效率 × 积极程度系数 × 响应效率系数
         """
+        # The legacy logic below is intentionally unreachable for incidents
+        # created by public APIs.  Progress is advanced exactly once here from
+        # the DistrictOutageState work counter.
+        capacity = (self.grid.calculate_repair_capacity(self.config)
+                    if R is None else R)
+        return self._advance_outage_repair_states(capacity)
+
         if not self.recovery_allowed:
             return
 
@@ -2116,9 +2791,14 @@ class BlackoutSimulation:
         Q_total = sum(enterprise_requests)
         Q_avg = Q_total / len(self.enterprises) if self.enterprises else 0.0
 
-        powered_residents = sum(1 for r in self.residents if self.zone_status.get(r.zone, True))
+        powered_residents = sum(
+            1 for r in self.residents if self._is_entity_powered(r, r.zone)
+        )
         powered_ratio = powered_residents / len(self.residents) if self.residents else 1.0
-        outage_ratio = 1 - powered_ratio
+        # Government, grid, and critical infrastructure use the same actual
+        # weighted unserved demand.  Resident and zone shares remain separate
+        # diagnostic fields rather than interchangeable outage definitions.
+        outage_ratio = self.get_weighted_outage_ratio()
 
         C_total = sum(c.request(outage_ratio, emotion_factor) for c in self.criticals)
 
@@ -2128,6 +2808,11 @@ class BlackoutSimulation:
         critical_component = min(1.0, C_total / (len(self.criticals) + 1e-6))
         P = 0.4 * emotion_component + 0.3 * enterprise_component + 0.3 * critical_component
         P = min(1.0, P)
+        self.opinion_components = {
+            'emotion': 0.4 * emotion_component,
+            'enterprise': 0.3 * enterprise_component,
+            'critical': 0.3 * critical_component,
+        }
 
         # 6. 各区政府独立决策
         # 预计算按区分组
@@ -2153,8 +2838,7 @@ class BlackoutSimulation:
             d_ent = district_enterprises.get(district, [])
 
             d_avg_emo = np.mean([r.emotion for r in d_res]) if d_res else 0
-            d_outage_count = sum(1 for z in d_zones if not self.zone_status.get(z, True))
-            d_outage_ratio = d_outage_count / len(d_zones) if d_zones else 0
+            d_outage_ratio = self.get_weighted_outage_ratio(district)
             d_Q = sum(e.request() for e in d_ent)
             d_loss = sum(e.loss for e in d_ent)
             d_panic = {z: region_panic_levels.get(z, 0) for z in d_zones}
@@ -2173,15 +2857,21 @@ class BlackoutSimulation:
             total_gov_influence += inf
         self._apply_opinion_mode_override()
 
-        # 电网决策（电网仍是全局共享资源）
-        R = self.grid.decide_recovery(total_gov_influence, outage_ratio, P, region_panic_levels)
+        # Event 2 is the only route by which government support enters the
+        # grid resource pool.  A repair *capacity* must never be fed back as
+        # if it were a new resource allocation.
+        grid_support = sum(
+            max(0.0, float(getattr(gov, 'last_resource_to_grid_amount', 0.0)))
+            for gov in self.gov_agents.values()
+        )
+        self.grid.update_resources(grid_support)
+        R = self.grid.calculate_repair_capacity(self.config)
 
-        # 执行恢复和传播
+        # Baseline repair remains active with Event 2 and accelerated repair
+        # OFF.  Event 2 changes the pool; grid.manual_repair only multiplies
+        # the capacity inside the authoritative state machine.
         self.zone_recover(R)
         self.zone_propagate()
-
-        # 更新资源
-        self.grid.update_resources(R)
 
         # 各区政府按贡献比例分配资源
         for district, gov in self.gov_agents.items():
@@ -2190,11 +2880,9 @@ class BlackoutSimulation:
             d_zones = self.district_to_zones.get(district, [])
             d_panic = {z: region_panic_levels.get(z, 0) for z in d_zones}
 
-            if total_gov_influence > 0:
-                R_district = R * (district_gov_influence[district] / total_gov_influence)
-            else:
-                R_district = R / n_districts if n_districts > 0 else 0
-            gov.allocate_resources(d_ent, R_district, d_panic, d_res)
+            gov.allocate_resources(
+                d_ent, float(getattr(gov, 'last_deployment', 0.0)), d_panic, d_res
+            )
 
         # ============ 区域物资系统更新 ============
         # 【核心流程】
@@ -2216,13 +2904,15 @@ class BlackoutSimulation:
                 self.zone_supply_levels[zone_id] = max(0, self.zone_supply_levels[zone_id] - consumption)
 
         # 3. 各区政府发放物资时补充库存
-        if R > 0:
+        if any(
+            getattr(gov, 'last_resource_to_resident_amount', 0.0) > 0
+            for gov in self.gov_agents.values()
+        ):
             for district, gov in self.gov_agents.items():
                 zone_allocation = getattr(gov, 'zone_resource_allocation', {})
-                if total_gov_influence > 0:
-                    R_d = R * (district_gov_influence.get(district, 0) / total_gov_influence)
-                else:
-                    R_d = R / n_districts if n_districts > 0 else 0
+                R_d = max(0.0, float(
+                    getattr(gov, 'last_resource_to_resident_amount', 0.0)
+                ))
                 for zone_id, allocation_ratio in zone_allocation.items():
                     if zone_id in self.zone_supply_levels:
                         replenish = R_d * allocation_ratio * self.gov_supply_replenish_rate
@@ -2271,11 +2961,12 @@ class BlackoutSimulation:
             resource_to_resident = getattr(district_gov, 'resource_to_resident', False)
             if resource_to_resident:
                 district = self.zone_to_district.get(r.zone)
-                if total_gov_influence > 0 and district:
-                    R_d = R * (district_gov_influence.get(district, 0) / total_gov_influence)
-                else:
-                    R_d = R / n_districts if n_districts > 0 else 0
-                gov_resource_for_resident = R_d
+                n_district_residents = len(district_residents.get(district, []))
+                gov_resource_for_resident = (
+                    max(0.0, float(getattr(
+                        district_gov, 'last_resource_to_resident_amount', 0.0
+                    ))) / max(1, n_district_residents)
+                )
             else:
                 gov_resource_for_resident = 0
 
@@ -2293,9 +2984,7 @@ class BlackoutSimulation:
 
         # Agent调整 —— 各区政府独立调整
         for district, gov in self.gov_agents.items():
-            d_zones = self.district_to_zones.get(district, [])
-            d_outage_count = sum(1 for z in d_zones if not self.zone_status.get(z, True))
-            d_outage_ratio = d_outage_count / len(d_zones) if d_zones else 0
+            d_outage_ratio = self.get_weighted_outage_ratio(district)
             gov.adjust(P, d_outage_ratio)
         self.grid.adjust(outage_ratio, P)
         for c in self.criticals:
@@ -2307,6 +2996,7 @@ class BlackoutSimulation:
         self.C_hist.append(C_total)
         self.R_hist.append(R)
         self.P_hist.append(P)
+        self.opinion_components_hist.append(self.opinion_components.copy())
 
         self.emotion_hist.append(avg_emo)
         self.emotion_std_hist.append(emotion_std)
@@ -2314,6 +3004,15 @@ class BlackoutSimulation:
         self.blackout_hist.append(outage_ratio)
         self.informed_hist.append(np.mean([r.informed for r in self.residents]))
         self.outage_count_hist.append(sum(1 for st in self.zone_status.values() if not st))
+        self.full_outage_zone_ratio_hist.append(
+            sum(1 for st in self.zone_status.values() if not st)
+            / max(1, len(self.zone_status))
+        )
+        self.unpowered_resident_ratio_hist.append(1.0 - powered_ratio)
+        self.outage_repair_hist.append({
+            district: state.to_audit_dict()
+            for district, state in self.district_outage_states.items()
+        })
 
         # SEIR统计
         for state in ['S', 'E', 'I', 'R']:
@@ -2341,6 +3040,11 @@ class BlackoutSimulation:
         self.event_influence.apply_effects(self, event_effects, self.dt)
         self.last_event_effects = event_effects
         self.last_event_summary = event_effects.get('summary', {})
+        self.public_opinion_pressure = float(getattr(
+            self.event_influence, 'public_opinion_pressure',
+            getattr(self.event_influence, 'opinion_pressure', 0.0)
+        ))
+        self.public_opinion_hist.append(self.public_opinion_pressure)
 
         # 保存事件影响统计（可选，用于分析）
         if not hasattr(self, 'event_effects_hist'):
@@ -2361,8 +3065,17 @@ class BlackoutSimulation:
         return {
             'step': self.step_count,
             'zone_status': self.zone_status.copy(),
+            'zone_power_fraction': self.zone_power_fraction.copy(),
             'zone_duration': self.zone_duration.copy(),
             'ongoing_repairs': list(self.grid.ongoing_repairs.keys()),
+            'outage_states': {
+                district: state.to_audit_dict()
+                for district, state in self.district_outage_states.items()
+            },
+            'outage_event_history': list(self.outage_event_history),
+            'weighted_outage_ratio': self.get_weighted_outage_ratio(),
+            'public_opinion_pressure': self.public_opinion_pressure,
+            'system_help_pressure': self.P_hist[-1] if self.P_hist else 0.0,
             'residents': self.residents,
             'enterprises': self.enterprises,
             'emotion_avg': self.emotion_hist[-1] if self.emotion_hist else 0,

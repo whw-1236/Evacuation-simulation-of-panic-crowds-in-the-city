@@ -214,6 +214,11 @@ class EventInfluenceCalculator:
             # 事件5: 实施舆情管理 → 降低居民恐慌传播速度
             'opinion_manage_spread': 0.25,  # 舆情管理抑制传播的效率
             'opinion_manage_seir': 0.2,  # 舆情管理降低SEIR传播速率
+            # Authoritative public-opinion state equation (per hour).  The
+            # legacy ``opinion_pressure`` field remains an alias of this state.
+            'opinion_pressure_accumulation': 0.10,
+            'opinion_pressure_decay_rate': 0.025,
+            'opinion_manage_pressure_relief': 0.12,
 
             # ============ 电网事件影响系数 ============
             # 事件6: 区域断电 → 触发居民情绪上升、企业停工
@@ -297,9 +302,46 @@ class EventInfluenceCalculator:
             'supply_point_coverage': 0.6,  # 物资发放点覆盖率（影响多少居民）
         }
 
-        # 状态追踪
-        self.gov_pressure = 0.0  # 政府压力指数
-        self.opinion_pressure = 0.0  # 舆情压力指数
+        behavior_config = getattr(config, 'gov_behavior', config) if config is not None else None
+        if behavior_config is not None:
+            for coefficient, field in (
+                ('opinion_pressure_accumulation', 'OPINION_PRESSURE_ACCUMULATION'),
+                ('opinion_pressure_decay_rate', 'OPINION_PRESSURE_DECAY_RATE'),
+                ('opinion_manage_pressure_relief', 'OPINION_MANAGEMENT_RELIEF_RATE'),
+            ):
+                value = getattr(behavior_config, field, None)
+                if value is not None:
+                    try:
+                        self.coefficients[coefficient] = max(0.0, float(value))
+                    except (TypeError, ValueError):
+                        pass
+
+        # State tracking.  ``opinion_pressure`` is retained as a property for
+        # scripts and historical CSV readers, while ``public_opinion_pressure``
+        # is the named authoritative state used by event 5.
+        self.gov_pressure = 0.0
+        self._public_opinion_pressure = 0.0
+
+    @property
+    def public_opinion_pressure(self):
+        return self._public_opinion_pressure
+
+    @public_opinion_pressure.setter
+    def public_opinion_pressure(self, value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0.0
+        self._public_opinion_pressure = max(0.0, min(1.0, value))
+
+    @property
+    def opinion_pressure(self):
+        """Backward-compatible alias for :attr:`public_opinion_pressure`."""
+        return self.public_opinion_pressure
+
+    @opinion_pressure.setter
+    def opinion_pressure(self, value):
+        self.public_opinion_pressure = value
 
     # =========================================================================
     # 政府事件影响计算
@@ -516,6 +558,7 @@ class EventInfluenceCalculator:
                 'rumor_suppress_rate': 0,  # 谣言抑制率
                 'seir_infection_reduction': 0,  # SEIR感染率降低
                 'panic_spread_reduction': 0,  # 恐慌传播降低
+                'opinion_pressure_relief': 0,  # authoritative pressure relief
                 'spread_reduction': 0  # 兼容旧接口
             }
 
@@ -549,6 +592,16 @@ class EventInfluenceCalculator:
         k_spread = self.coefficients['opinion_manage_spread']
         panic_spread_reduction = k_spread * avg_panic * avg_official * dt
 
+        # A managed response has a direct, auditable relief term in addition
+        # to the resident-level information/rumour mechanisms.  A small
+        # baseline is present before official information saturates so that a
+        # newly enabled management action is observable in the state equation.
+        relief_factor = 0.25 + 0.75 * avg_official
+        opinion_pressure_relief = (
+            self.coefficients['opinion_manage_pressure_relief']
+            * target_ratio * relief_factor * dt
+        )
+
         return {
             'active': True,
             'active_resident_count': target_count,
@@ -557,6 +610,7 @@ class EventInfluenceCalculator:
             'rumor_suppress_rate': min(0.20, rumor_suppress_rate),
             'seir_infection_reduction': min(0.10, seir_infection_reduction),
             'panic_spread_reduction': min(0.15, panic_spread_reduction),
+            'opinion_pressure_relief': min(0.15, opinion_pressure_relief),
             'spread_reduction': min(0.15, panic_spread_reduction)  # 兼容旧接口
         }
 
@@ -1439,6 +1493,52 @@ class EventInfluenceCalculator:
     # 综合影响计算
     # =========================================================================
 
+    @staticmethod
+    def _government_agents(sim):
+        """Return all district governments, with the legacy ``sim.gov`` fallback."""
+        gov_agents = getattr(sim, 'gov_agents', None)
+        if isinstance(gov_agents, dict) and gov_agents:
+            return list(gov_agents.values())
+        legacy_gov = getattr(sim, 'gov', None)
+        return [legacy_gov] if legacy_gov is not None else []
+
+    def _government_event_context(self, sim, event_name, amount_field=None):
+        """Aggregate only real, currently active district interventions."""
+        attr = {
+            'warning': 'emergency_warning_issued',
+            'resource_grid': 'resource_to_grid',
+            'resource_enterprise': 'resource_to_enterprise',
+            'resource_resident': 'resource_to_resident',
+            'public_opinion': 'public_opinion_active',
+        }[event_name]
+        govs = self._government_agents(sim)
+        active_govs = [gov for gov in govs if bool(getattr(gov, attr, False))]
+        if amount_field is None:
+            return bool(active_govs), 0.0
+        amount = 0.0
+        for gov in active_govs:
+            try:
+                amount += max(0.0, float(getattr(gov, amount_field, 0.0)))
+            except (TypeError, ValueError):
+                continue
+        return bool(active_govs), amount
+
+    def _publish_public_opinion_pressure(self, sim):
+        """Expose one state to every consumer without changing simulation API."""
+        pressure = self.public_opinion_pressure
+        # Dynamic attributes preserve compatibility with lightweight test
+        # simulations and do not require a mandatory SimulationConfig change.
+        try:
+            sim.public_opinion_pressure = pressure
+        except (AttributeError, TypeError):
+            pass
+        for gov in self._government_agents(sim):
+            setter = getattr(gov, 'set_public_opinion_pressure', None)
+            if callable(setter):
+                setter(pressure)
+            else:
+                setattr(gov, 'authoritative_public_opinion_pressure', pressure)
+
     def calculate_all_effects(self, sim, dt):
         """
         计算所有事件的综合影响
@@ -1459,21 +1559,35 @@ class EventInfluenceCalculator:
         }
 
         # ==================== 政府事件 ====================
+        # Each resource effect is calculated from a real active intervention,
+        # not from unconditional fractions of generic government deployment.
+        warning_active, _ = self._government_event_context(sim, 'warning')
+        grid_active, grid_amount = self._government_event_context(
+            sim, 'resource_grid', 'last_resource_to_grid_amount'
+        )
+        enterprise_active, enterprise_amount = self._government_event_context(
+            sim, 'resource_enterprise', 'last_resource_to_enterprise_amount'
+        )
+        resident_active, resident_amount = self._government_event_context(
+            sim, 'resource_resident', 'last_resource_to_resident_amount'
+        )
+        opinion_active, _ = self._government_event_context(sim, 'public_opinion')
+
         # 事件1: 发布应急预警
         effects['government']['warning'] = self.calc_warning_effect(
-            sim.gov.emergency_warning_issued, sim.residents, sim.enterprises, dt)
+            warning_active, sim.residents, sim.enterprises, dt)
 
         # 事件2: 政府分配资源给电网
         effects['government']['resource_grid'] = self.calc_resource_to_grid_effect(
-            sim.gov.last_deployment * 0.5, sim.grid)
+            grid_amount if grid_active else 0.0, sim.grid)
 
         # 事件3: 政府分配资源给企业
         effects['government']['resource_enterprise'] = self.calc_resource_to_enterprise_effect(
-            sim.gov.last_deployment * 0.3, sim.enterprises)
+            enterprise_amount if enterprise_active else 0.0, sim.enterprises)
 
         # 事件4: 政府分配资源给居民
         effects['government']['resource_resident'] = self.calc_resource_to_resident_effect(
-            sim.gov.last_deployment * 0.2, sim.residents, dt)
+            resident_amount if resident_active else 0.0, sim.residents, dt)
 
         # 事件5: 实施舆情管理
         opinion_residents = [
@@ -1481,7 +1595,7 @@ class EventInfluenceCalculator:
             if bool(getattr(r, '_opinion_management_active', False))
         ]
         effects['government']['opinion_manage'] = self.calc_opinion_management_effect(
-            bool(opinion_residents), opinion_residents, dt,
+            opinion_active and bool(opinion_residents), opinion_residents, dt,
             total_residents=len(sim.residents))
 
         # ==================== 电网事件 ====================
@@ -1542,13 +1656,14 @@ class EventInfluenceCalculator:
 
         # 【机制3】物资发放点
         effects['resident']['supply_point'] = self.calc_supply_point_effect(
-            sim.gov.resource_to_resident, sim.residents, dt)
+            resident_active, sim.residents, dt)
 
         # ==================== 汇总关键指标 ====================
         effects['summary'] = self._summarize_effects(effects)
 
         # 更新压力指数
-        self._update_pressure_indices(effects)
+        self._update_pressure_indices(effects, dt)
+        self._publish_public_opinion_pressure(sim)
 
         return effects
 
@@ -1558,6 +1673,10 @@ class EventInfluenceCalculator:
             'total_panic_change': 0.0,
             'total_emotion_change': 0.0,
             'total_opinion_pressure': 0.0,
+            'opinion_management_pressure_relief': 0.0,
+            'opinion_pressure_decay': 0.0,
+            'opinion_pressure_net_change': 0.0,
+            'public_opinion_pressure': self.public_opinion_pressure,
             'total_gov_pressure': 0.0,
             'total_repair_boost': 0.0,
             # 【新增】情绪抑制统计
@@ -1623,6 +1742,10 @@ class EventInfluenceCalculator:
             summary['opinion_management_emotion_change'] -= indirect_emotion_effect
             summary['total_emotion_suppression'] += indirect_emotion_effect
 
+            summary['opinion_management_pressure_relief'] += opinion.get(
+                'opinion_pressure_relief', 0.0
+            )
+
             if opinion.get('official_info_boost', 0) > 0:
                 summary['active_suppression_mechanisms'] += 1
         if 'restore' in grid_effects:
@@ -1682,17 +1805,38 @@ class EventInfluenceCalculator:
 
         return summary
 
-    def _update_pressure_indices(self, effects):
-        """更新压力指数状态"""
+    def _update_pressure_indices(self, effects, dt=1.0):
+        """Update pressure indices with a stable public-opinion state equation."""
         summary = effects.get('summary', {})
 
         # 政府压力指数（0-1）
         pressure_change = summary.get('total_gov_pressure', 0)
         self.gov_pressure = max(0, min(1, self.gov_pressure + pressure_change * 0.1))
 
-        # 舆情压力指数（0-1）
-        opinion_change = summary.get('total_opinion_pressure', 0)
-        self.opinion_pressure = max(0, min(1, self.opinion_pressure + opinion_change * 0.1))
+        try:
+            dt = max(0.0, float(dt))
+        except (TypeError, ValueError):
+            dt = 0.0
+
+        # The drivers are retained in ``total_opinion_pressure`` for backward
+        # compatibility.  The authoritative state additionally has natural
+        # decay and a separately exported event-5 relief term, so it cannot
+        # become a one-way saturated accumulator.
+        opinion_drive = float(summary.get('total_opinion_pressure', 0.0))
+        accumulation = self.coefficients['opinion_pressure_accumulation']
+        decay = (
+            self.coefficients['opinion_pressure_decay_rate']
+            * self.public_opinion_pressure * dt
+        )
+        management_relief = max(
+            0.0, float(summary.get('opinion_management_pressure_relief', 0.0))
+        )
+        net_change = opinion_drive * accumulation - decay - management_relief
+        self.public_opinion_pressure = self.public_opinion_pressure + net_change
+
+        summary['opinion_pressure_decay'] = decay
+        summary['opinion_pressure_net_change'] = net_change
+        summary['public_opinion_pressure'] = self.public_opinion_pressure
 
     def apply_effects(self, sim, effects, dt):
         """
@@ -1706,6 +1850,56 @@ class EventInfluenceCalculator:
         summary = effects.get('summary', {})
         gov_effects = effects.get('government', {})
         res_effects = effects.get('resident', {})
+
+        # Event 3 has two explicit, gated channels: the GovernmentAgent has
+        # already delivered the recorded compensation amount, while this
+        # behavioural channel relieves crisis/desperation.  It is deliberately
+        # absent when the event is off, even if generic deployment is nonzero.
+        enterprise_effect = gov_effects.get('resource_enterprise', {})
+        desperation_reduction = max(
+            0.0, float(enterprise_effect.get('desperation_reduction', 0.0))
+        )
+        crisis_relief = max(
+            0.0, float(enterprise_effect.get('crisis_relief', 0.0))
+        )
+        if (desperation_reduction > 0 or crisis_relief > 0) and getattr(sim, 'enterprises', None):
+            eligible_enterprises = [
+                enterprise for enterprise in sim.enterprises
+                if bool(getattr(enterprise, 'is_in_crisis', False))
+                or float(getattr(enterprise, 'desperation_level', 0.0)) > 0
+                or float(getattr(enterprise, 'current_request_intensity', 0.0)) > 0
+            ]
+            if eligible_enterprises:
+                total_need = sum(
+                    max(
+                        1e-9,
+                        float(getattr(enterprise, 'desperation_level', 0.0))
+                        + float(getattr(enterprise, 'current_request_intensity', 0.0)),
+                    )
+                    for enterprise in eligible_enterprises
+                )
+                for enterprise in eligible_enterprises:
+                    need = max(
+                        1e-9,
+                        float(getattr(enterprise, 'desperation_level', 0.0))
+                        + float(getattr(enterprise, 'current_request_intensity', 0.0)),
+                    )
+                    share = need / total_need
+                    if hasattr(enterprise, 'desperation_level'):
+                        enterprise.desperation_level = max(
+                            0.0,
+                            enterprise.desperation_level - desperation_reduction * share,
+                        )
+                    if hasattr(enterprise, 'current_request_intensity'):
+                        enterprise.current_request_intensity = max(
+                            0.0,
+                            enterprise.current_request_intensity - crisis_relief * share,
+                        )
+                    if (
+                        hasattr(enterprise, 'is_in_crisis')
+                        and float(getattr(enterprise, 'desperation_level', 0.0)) < 0.15
+                    ):
+                        enterprise.is_in_crisis = False
 
         # ============ 应用恐慌变化 ============
         panic_change = summary.get('total_panic_change', 0)
@@ -1833,13 +2027,10 @@ class EventInfluenceCalculator:
                         r.panic_value = max(0, r.panic_value - panic_relief)
                         affected_count += 1
 
-        # ============ 应用修复能力提升 ============
-        repair_boost = summary.get('total_repair_boost', 0)
-        if repair_boost > 0:
-            sim.grid.current_resource_level = min(
-                sim.grid.base_resource_capacity,
-                sim.grid.current_resource_level + repair_boost
-            )
+        # Event 2's actual resource amount is applied exactly once by the
+        # grid state machine.  ``total_repair_boost`` remains a diagnostic
+        # effect for exported analysis and must not mutate the grid resource
+        # pool a second time here.
 
         # ============ 应用SEIR传播加速 ============
         if 'gather_spread' in res_effects:

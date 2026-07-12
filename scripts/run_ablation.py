@@ -76,12 +76,26 @@ DEFAULT_OUTAGE_STEP = 16       # 早点触发, 留更多时间形成 cascade
 DEFAULT_SEED        = 42
 
 GLOBAL_METRIC_FIELDS = [
-    'step', 't_hour',
+    'metric_schema_version', 'step', 't_hour',
     'avg_stress', 'max_stress', 'pct_stress_gt_06',
     'avg_emotion', 'avg_panic',
     'hoard_ratio', 'herd_ratio', 'flee_ratio', 'outage_ratio',
+    'full_outage_zone_ratio', 'unpowered_resident_ratio',
+    'outage_event_id', 'outage_state', 'outage_mode', 'outage_cause',
+    'outage_requested_shed_ratio', 'outage_realized_shed_ratio',
+    'outage_affected_load_count', 'outage_detection_remaining_hours',
+    'outage_total_work', 'outage_work_done', 'outage_remaining_work',
+    'outage_current_capacity', 'outage_progress', 'outage_eta_hours',
     'avg_edge_congestion', 'pct_on_path',
-    'opinion_pressure', 'total_opinion_pressure', 'public_opinion_active',
+    # ``opinion_pressure`` is retained as the v1 compatibility alias.  The
+    # following explicit v2 fields separate Eq.23 help pressure from the
+    # authoritative dynamic public-opinion state used by Event 5.
+    'opinion_pressure', 'public_opinion_pressure',
+    'opinion_pressure_decay', 'opinion_pressure_net_change',
+    'opinion_management_pressure_relief', 'total_opinion_pressure',
+    'system_help_pressure', 'system_help_emotion_component',
+    'system_help_enterprise_component', 'system_help_critical_component',
+    'public_opinion_active',
     'opinion_active_district_count', 'opinion_active_district_ratio',
     'opinion_active_resident_count', 'opinion_active_resident_ratio',
     'opinion_trigger_pressure', 'opinion_threshold_margin',
@@ -98,6 +112,7 @@ def _collect_step_metrics(sim):
     residents = sim.residents
     n = max(1, len(residents))
     event_effects = getattr(sim, 'last_event_effects', {}) or {}
+    event_influence = getattr(sim, 'event_influence', None)
     event_summary = getattr(sim, 'last_event_summary', None)
     if event_summary is None:
         hist = getattr(sim, 'event_effects_hist', [])
@@ -132,8 +147,43 @@ def _collect_step_metrics(sim):
         float(opinion_effect.get('rumor_suppress_rate', 0.0)),
         float(opinion_effect.get('seir_infection_reduction', 0.0)),
         float(opinion_effect.get('panic_spread_reduction', 0.0)),
+        float(opinion_effect.get('opinion_pressure_relief', 0.0)),
     ]
     opinion_effect_nonzero = any(abs(v) > 1e-12 for v in opinion_effect_values)
+
+    components = getattr(sim, 'opinion_components', {}) or {}
+    if not isinstance(components, dict):
+        components = {}
+
+    def _component(name):
+        try:
+            return float(components.get(name, 0.0))
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    system_help_emotion = _component('emotion')
+    system_help_enterprise = _component('enterprise')
+    system_help_critical = _component('critical')
+    help_history = getattr(sim, 'system_help_pressure_hist', None)
+    if not help_history:
+        help_history = getattr(sim, 'P_hist', [])
+    try:
+        system_help_pressure = float(help_history[-1]) if help_history else (
+            system_help_emotion + system_help_enterprise + system_help_critical
+        )
+    except (IndexError, TypeError, ValueError):
+        system_help_pressure = (
+            system_help_emotion + system_help_enterprise + system_help_critical
+        )
+    try:
+        public_opinion_pressure = float(getattr(
+            sim, 'public_opinion_pressure',
+            getattr(event_influence, 'public_opinion_pressure',
+                    getattr(event_influence, 'opinion_pressure', 0.0)),
+        ))
+    except (TypeError, ValueError):
+        public_opinion_pressure = 0.0
+
     seir_counts = Counter(getattr(r, 'state', 'S') for r in residents)
     stress_arr = np.fromiter(
         (float(getattr(r, 'stress_level', 0.0)) for r in residents), dtype=np.float64, count=n)
@@ -151,11 +201,42 @@ def _collect_step_metrics(sim):
         (1 if getattr(r, 'current_edge', None) is not None else 0 for r in residents),
         dtype=np.int8, count=n)
     n_off = sum(1 for p in sim.zone_status.values() if not p)
-    outage_ratio = n_off / max(1, len(sim.zone_status))
+    full_outage_zone_ratio = n_off / max(1, len(sim.zone_status))
+    weighted_outage = getattr(sim, 'get_weighted_outage_ratio', None)
+    if callable(weighted_outage):
+        try:
+            outage_ratio = float(weighted_outage())
+        except (TypeError, ValueError):
+            outage_ratio = full_outage_zone_ratio
+    else:
+        outage_ratio = full_outage_zone_ratio
+    unpowered_resident_ratio = float(sum(
+        1 for resident in residents
+        if not bool(getattr(resident, 'powered', True))
+    ) / n)
+
+    outage_audit = {}
+    get_outage_state = getattr(sim, 'get_outage_state', None)
+    if callable(get_outage_state):
+        try:
+            candidate = get_outage_state()
+            if hasattr(candidate, 'to_audit_dict'):
+                candidate = candidate.to_audit_dict()
+            if isinstance(candidate, dict):
+                outage_audit = candidate
+        except Exception:
+            outage_audit = {}
+
+    def _outage_number(field, default=0.0):
+        try:
+            return float(outage_audit.get(field, default))
+        except (AttributeError, TypeError, ValueError):
+            return float(default)
     flee_arr = np.fromiter(
         (1 if getattr(r, '_dom_action', None) == 'flee' else 0 for r in residents),
         dtype=np.int8, count=n)
     return {
+        'metric_schema_version': 2.0,
         'avg_stress':           float(stress_arr.mean()),
         'max_stress':           float(stress_arr.max()) if n else 0.0,
         'pct_stress_gt_06':     float((stress_arr > 0.6).mean()),
@@ -165,10 +246,36 @@ def _collect_step_metrics(sim):
         'herd_ratio':           float(herd_arr.mean()),
         'flee_ratio':           float(flee_arr.mean()),
         'outage_ratio':         outage_ratio,
+        'full_outage_zone_ratio': full_outage_zone_ratio,
+        'unpowered_resident_ratio': unpowered_resident_ratio,
+        'outage_event_id': str(outage_audit.get('event_id', '')),
+        'outage_state': str(outage_audit.get('status', 'normal')),
+        'outage_mode': str(outage_audit.get('mode', '')),
+        'outage_cause': str(outage_audit.get('cause', '')),
+        'outage_requested_shed_ratio': _outage_number('requested_shed_ratio'),
+        'outage_realized_shed_ratio': _outage_number('realized_shed_ratio'),
+        'outage_affected_load_count': _outage_number('affected_load_count'),
+        'outage_detection_remaining_hours': _outage_number('detection_remaining_hours'),
+        'outage_total_work': _outage_number('total_work'),
+        'outage_work_done': _outage_number('work_done'),
+        'outage_remaining_work': _outage_number('remaining_work'),
+        'outage_current_capacity': _outage_number('current_capacity'),
+        'outage_progress': _outage_number('progress'),
+        'outage_eta_hours': _outage_number('eta_hours'),
         'avg_edge_congestion':  float(cong_arr.mean()),
         'pct_on_path':          float(on_path_arr.mean()),
-        'opinion_pressure':     float(getattr(getattr(sim, 'event_influence', None), 'opinion_pressure', 0.0)),
+        'opinion_pressure':     float(getattr(event_influence, 'opinion_pressure', 0.0)),
+        'public_opinion_pressure': public_opinion_pressure,
+        'opinion_pressure_decay': float(event_summary.get('opinion_pressure_decay', 0.0)),
+        'opinion_pressure_net_change': float(event_summary.get('opinion_pressure_net_change', 0.0)),
+        'opinion_management_pressure_relief': float(
+            event_summary.get('opinion_management_pressure_relief', 0.0)
+        ),
         'total_opinion_pressure': float(event_summary.get('total_opinion_pressure', 0.0)),
+        'system_help_pressure': system_help_pressure,
+        'system_help_emotion_component': system_help_emotion,
+        'system_help_enterprise_component': system_help_enterprise,
+        'system_help_critical_component': system_help_critical,
         'public_opinion_active': float(public_opinion_active),
         'opinion_active_district_count': float(active_district_count),
         'opinion_active_district_ratio': float(active_district_count / len(gov_agents)) if gov_agents else 0.0,
@@ -272,6 +379,8 @@ def _git_info():
 def _write_manifest(args, out_dir, label, use_road_graph, sim):
     manifest = {
         'created_at_utc': datetime.now(timezone.utc).isoformat(),
+        'metric_schema_version': 2,
+        'outage_api': 'trigger_outage_scenario',
         'city': args.city,
         'district': args.district,
         'seed': args.seed,
@@ -664,7 +773,8 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
     peak_metrics = [
         'avg_stress', 'max_stress', 'avg_panic',
         'herd_ratio', 'flee_ratio',
-        'opinion_pressure', 'opinion_trigger_pressure',
+        'opinion_pressure', 'public_opinion_pressure', 'system_help_pressure',
+        'opinion_trigger_pressure',
         'opinion_threshold_margin', 'opinion_active_resident_ratio',
         'seir_I',
     ]
