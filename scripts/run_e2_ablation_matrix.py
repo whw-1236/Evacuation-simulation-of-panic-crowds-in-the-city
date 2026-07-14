@@ -7,7 +7,7 @@ city/seed/ablation matrix, run each cell in a fresh subprocess, and skip cells
 whose ``summary.json`` already exists.
 
 Default full matrix:
-    3 cities x 10 seeds x 10 ablation presets = 300 subprocesses
+    3 cities x 10 seeds x 11 ablation presets = 330 subprocesses
 
 Typical smoke run:
     python -u scripts/run_e2_ablation_matrix.py --seeds 42 --ablations none,no_inertia --n-residents 8 --total-steps 2 --outage-step 1
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -59,6 +60,11 @@ DEFAULT_ABLATIONS = [
 
 TRACE_ROOT = os.path.join(ROOT, "trace_output")
 PYTHON_EXE = sys.executable
+DEFAULT_OUTPUT_BASE = os.path.join(
+    "IJDRR_v7_strict_formal", "E2_ablation_matrix_n10"
+)
+EXPECTED_MODEL_CONTRACT_VERSION = "ijdrr_strict_v1"
+MIN_METRIC_SCHEMA_VERSION = 4
 
 
 def _parse_csv_or_range(value: str, default: list[int] | None = None) -> list[int]:
@@ -117,9 +123,49 @@ def _check_runtime(dry_run: bool) -> None:
         )
 
 
+def _validate_summary_semantics(summary_path: str, expected: str) -> None:
+    try:
+        with open(summary_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:
+        raise RuntimeError(f"unreadable summary: {summary_path}") from exc
+    if data.get("model_contract_version") != EXPECTED_MODEL_CONTRACT_VERSION:
+        raise RuntimeError(f"model_contract_version mismatch: {summary_path}")
+    try:
+        schema_version = int(data.get("metric_schema_version"))
+    except (TypeError, ValueError):
+        schema_version = -1
+    if schema_version < MIN_METRIC_SCHEMA_VERSION:
+        raise RuntimeError(f"metric_schema_version is too old: {summary_path}")
+    if data.get("config", {}).get("psychology_semantics") != expected:
+        raise RuntimeError(f"summary psychology_semantics mismatch: {summary_path}")
+    manifests = data.get("manifest")
+    if not isinstance(manifests, dict):
+        raise RuntimeError(f"summary manifest missing: {summary_path}")
+    for graph_mode in ("off", "on"):
+        manifest = manifests.get(graph_mode)
+        actual = manifest.get("psychology_semantics") if isinstance(manifest, dict) else None
+        if actual != expected:
+            raise RuntimeError(
+                f"{graph_mode} manifest psychology_semantics mismatch: {summary_path}"
+            )
+        if manifest.get("model_contract_version") != EXPECTED_MODEL_CONTRACT_VERSION:
+            raise RuntimeError(
+                f"{graph_mode} manifest model_contract_version mismatch: {summary_path}"
+            )
+        try:
+            manifest_schema = int(manifest.get("metric_schema_version"))
+        except (TypeError, ValueError):
+            manifest_schema = -1
+        if manifest_schema < MIN_METRIC_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{graph_mode} manifest metric_schema_version is too old: {summary_path}"
+            )
+
+
 def _build_command(args, city: str, district: str, seed: int, ablation: str) -> tuple[list[str], str]:
     tag = f"e2_{ablation}_seed{seed:02d}"
-    run_dir = os.path.join(args.output_base_abs, f"t15_{city}_{district}_{tag}")
+    run_dir = os.path.join(args.run_root_abs, f"t15_{city}_{district}_{tag}")
     cmd = [
         PYTHON_EXE,
         "-u",
@@ -144,6 +190,8 @@ def _build_command(args, city: str, district: str, seed: int, ablation: str) -> 
         str(args.outage_step),
         "--switch-ablation",
         ablation,
+        "--psychology-semantics",
+        args.psychology_semantics,
         "--use-mml",
     ]
     return cmd, run_dir
@@ -158,13 +206,19 @@ def _parse_args():
         default=",".join(DEFAULT_ABLATIONS),
         help="comma list of run_ablation.py --switch-ablation presets",
     )
-    parser.add_argument("--output-base", default="E2_ablation_matrix")
+    parser.add_argument("--output-base", default=DEFAULT_OUTPUT_BASE)
     parser.add_argument("--n-residents", type=int, default=800)
     parser.add_argument("--n-enterprises", type=int, default=30)
     parser.add_argument("--total-steps", type=int, default=120)
     parser.add_argument("--outage-step", type=int, default=16)
     parser.add_argument("--force", action="store_true", help="re-run even when summary.json exists")
     parser.add_argument("--dry-run", action="store_true", help="print commands without running")
+    parser.add_argument(
+        "--psychology-semantics",
+        choices=("strict", "legacy"),
+        default="strict",
+        help="Psychology ownership contract; strict is required for formal evidence.",
+    )
     parsed = parser.parse_args()
     parsed.city_pairs = _selected_cities(_parse_csv(parsed.cities, ["all"]))
     parsed.seed_values = _parse_csv_or_range(parsed.seeds, DEFAULT_SEEDS)
@@ -173,6 +227,9 @@ def _parse_args():
         parsed.output_base
         if os.path.isabs(parsed.output_base)
         else os.path.join(TRACE_ROOT, parsed.output_base)
+    )
+    parsed.run_root_abs = os.path.join(
+        parsed.output_base_abs, f"psychology_{parsed.psychology_semantics}"
     )
     return parsed
 
@@ -188,7 +245,7 @@ def main() -> None:
     print("=" * 72)
     print("E2 ablation matrix")
     print(f"cities={len(args.city_pairs)} seeds={args.seed_values} ablations={args.ablation_values}")
-    print(f"output={args.output_base_abs}")
+    print(f"output={args.run_root_abs}")
     print("=" * 72)
 
     for city, district in args.city_pairs:
@@ -198,6 +255,7 @@ def main() -> None:
                 cmd, run_dir = _build_command(args, city, district, seed, ablation)
                 summary_path = os.path.join(run_dir, "summary.json")
                 if os.path.exists(summary_path) and not args.force:
+                    _validate_summary_semantics(summary_path, args.psychology_semantics)
                     skipped += 1
                     print(f"[{done}/{total}] skip {city}/{district} seed={seed} ablation={ablation}")
                     continue
@@ -215,6 +273,7 @@ def main() -> None:
                     failed += 1
                     print(f"[ERROR] exit code {exc.returncode}: {city}/{district} {seed} {ablation}")
                     continue
+                _validate_summary_semantics(summary_path, args.psychology_semantics)
                 elapsed = time.time() - t_global
                 active_done = max(1, done - skipped - failed)
                 eta = (elapsed / active_done) * max(0, total - done)
@@ -225,7 +284,7 @@ def main() -> None:
 
     print("\n" + "=" * 72)
     print(f"E2 complete: total={total}, skipped={skipped}, failed={failed}")
-    print(f"output: {args.output_base_abs}")
+    print(f"output: {args.run_root_abs}")
     print("=" * 72)
 
 
