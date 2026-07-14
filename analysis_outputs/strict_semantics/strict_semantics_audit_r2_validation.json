@@ -1,0 +1,309 @@
+{
+  "model_contract_version": "ijdrr_strict_v1",
+  "psychology_semantics": "strict",
+  "run_count": 5,
+  "passed": 5,
+  "failed": 0,
+  "runs": [
+    {
+      "run_dir": "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s42",
+      "ok": true,
+      "issues": [],
+      "files": {
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s42\\summary.json": "ca7ae6829333e6baaac679682fe917e7c78cbf7083a9578ceffd8ae8c6cdbecc",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s42\\graph_off\\manifest.json": "49cfcdf445efd87d56148407c84e84be1d494303d75c38eed6a6403016eede25",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s42\\graph_off\\global_metrics.csv": "041a1d173a800442cc4e1476748258a53e55f01634799721cf8da6a03bc3f99a",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s42\\graph_on\\manifest.json": "fbbf7b88648972bdadf58bd2eba9806250dc49847ead36c12c846b5a8c69a046",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s42\\graph_on\\global_metrics.csv": "cc331d1a33b23d149efb28513768d88f99d6067aac78c91994c4b64f430404b3"
+      },
+      "config": {
+        "model_contract_version": "ijdrr_strict_v1",
+        "metric_schema_version": 4,
+        "city": "厦门市",
+        "district": "思明区",
+        "n_residents": 24,
+        "n_enterprises": 3,
+        "total_steps": 180,
+        "dt": 0.25,
+        "outage_step": 2,
+        "outage_cause": "equipment_failure",
+        "restores_in_window": true,
+        "seed": 42,
+        "tag": "semantics_contract_r2_s42",
+        "home_distribution": "poi",
+        "flee_threshold": null,
+        "use_mml": true,
+        "switch_ablation": "none",
+        "opinion_mode": "auto",
+        "outage_stress_profile": "sqrt",
+        "psychology_semantics": "strict",
+        "psychology_contract": {
+          "master_state": "stress_level",
+          "panic_projection_exponent": 0.8,
+          "emotion_projection": "stress_times_min_excitation_calming_envelope",
+          "regional_pressure_weights": {
+            "mean_emotion": 0.4,
+            "mean_panic": 0.4,
+            "pts_ratio": 0.2
+          },
+          "pts_enter_base": 0.8,
+          "pts_exit_base": 0.5,
+          "outage_threat_decay_tau_h": 6.0,
+          "restoration_relief_decay_tau_h": 6.0,
+          "strict_feedback_max_abs": 0.15
+        },
+        "phase_contract": {
+          "government_decision": "start_of_step",
+          "global_metrics": "end_of_step",
+          "decision_pressure_field": "decision_avg_region_psychological_pressure"
+        },
+        "mml_overrides": {
+          "mml_scale": null,
+          "mml_asc_flee": null,
+          "mml_b_sigma_flee": null,
+          "mml_b_vis": null
+        }
+      }
+    },
+    {
+      "run_dir": "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s43",
+      "ok": true,
+      "issues": [],
+      "files": {
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s43\\summary.json": "fb3ad216466d24bd12401f25f5d2395932a60ba366b44a09318f96abe468b78b",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s43\\graph_off\\manifest.json": "68dcd01506efc4276294a6b34583615ba659048ddc07e0daaa26574807db2e89",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s43\\graph_off\\global_metrics.csv": "04a3d854ce431759ec1b23068a87c66a6fa129ffe512c06ed5fc363291e8c9cd",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s43\\graph_on\\manifest.json": "63edfd297d2afc8051b64cca90cf8c755e155c15c70ffb11597e9f81816ae4d0",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s43\\graph_on\\global_metrics.csv": "8d4a34396793f8d87db8b58af965dfb14fd4afec0526a26c9521b4510f11f257"
+      },
+      "config": {
+        "model_contract_version": "ijdrr_strict_v1",
+        "metric_schema_version": 4,
+        "city": "厦门市",
+        "district": "思明区",
+        "n_residents": 24,
+        "n_enterprises": 3,
+        "total_steps": 180,
+        "dt": 0.25,
+        "outage_step": 2,
+        "outage_cause": "equipment_failure",
+        "restores_in_window": true,
+        "seed": 43,
+        "tag": "semantics_contract_r2_s43",
+        "home_distribution": "poi",
+        "flee_threshold": null,
+        "use_mml": true,
+        "switch_ablation": "none",
+        "opinion_mode": "auto",
+        "outage_stress_profile": "sqrt",
+        "psychology_semantics": "strict",
+        "psychology_contract": {
+          "master_state": "stress_level",
+          "panic_projection_exponent": 0.8,
+          "emotion_projection": "stress_times_min_excitation_calming_envelope",
+          "regional_pressure_weights": {
+            "mean_emotion": 0.4,
+            "mean_panic": 0.4,
+            "pts_ratio": 0.2
+          },
+          "pts_enter_base": 0.8,
+          "pts_exit_base": 0.5,
+          "outage_threat_decay_tau_h": 6.0,
+          "restoration_relief_decay_tau_h": 6.0,
+          "strict_feedback_max_abs": 0.15
+        },
+        "phase_contract": {
+          "government_decision": "start_of_step",
+          "global_metrics": "end_of_step",
+          "decision_pressure_field": "decision_avg_region_psychological_pressure"
+        },
+        "mml_overrides": {
+          "mml_scale": null,
+          "mml_asc_flee": null,
+          "mml_b_sigma_flee": null,
+          "mml_b_vis": null
+        }
+      }
+    },
+    {
+      "run_dir": "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s44",
+      "ok": true,
+      "issues": [],
+      "files": {
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s44\\summary.json": "99ab3440b5352a96be5d2f2508d5b8594e446196b12fb6deb515fb4195e84e67",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s44\\graph_off\\manifest.json": "d6f8656f4ceb9ca53ded3f800dfeeb2d485f93b43ef2acb4ec15bc620db9b0f7",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s44\\graph_off\\global_metrics.csv": "5cd139da5013aae8fb638414d1091fce3917e19f009b30bdccfbda41ebb677ba",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s44\\graph_on\\manifest.json": "b7ed1e2268eebc359e34a29291c3cdec62747f2ac37259ab1a62b1a9025bc39f",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s44\\graph_on\\global_metrics.csv": "41ead1185d6aa0f0561895840f46a486ef11ea45fda9b19cc4c2236727c6f413"
+      },
+      "config": {
+        "model_contract_version": "ijdrr_strict_v1",
+        "metric_schema_version": 4,
+        "city": "厦门市",
+        "district": "思明区",
+        "n_residents": 24,
+        "n_enterprises": 3,
+        "total_steps": 180,
+        "dt": 0.25,
+        "outage_step": 2,
+        "outage_cause": "equipment_failure",
+        "restores_in_window": true,
+        "seed": 44,
+        "tag": "semantics_contract_r2_s44",
+        "home_distribution": "poi",
+        "flee_threshold": null,
+        "use_mml": true,
+        "switch_ablation": "none",
+        "opinion_mode": "auto",
+        "outage_stress_profile": "sqrt",
+        "psychology_semantics": "strict",
+        "psychology_contract": {
+          "master_state": "stress_level",
+          "panic_projection_exponent": 0.8,
+          "emotion_projection": "stress_times_min_excitation_calming_envelope",
+          "regional_pressure_weights": {
+            "mean_emotion": 0.4,
+            "mean_panic": 0.4,
+            "pts_ratio": 0.2
+          },
+          "pts_enter_base": 0.8,
+          "pts_exit_base": 0.5,
+          "outage_threat_decay_tau_h": 6.0,
+          "restoration_relief_decay_tau_h": 6.0,
+          "strict_feedback_max_abs": 0.15
+        },
+        "phase_contract": {
+          "government_decision": "start_of_step",
+          "global_metrics": "end_of_step",
+          "decision_pressure_field": "decision_avg_region_psychological_pressure"
+        },
+        "mml_overrides": {
+          "mml_scale": null,
+          "mml_asc_flee": null,
+          "mml_b_sigma_flee": null,
+          "mml_b_vis": null
+        }
+      }
+    },
+    {
+      "run_dir": "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s45",
+      "ok": true,
+      "issues": [],
+      "files": {
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s45\\summary.json": "65ac3eb24de5e339c9a63f755c47a817f023538072e51319f5a01cc3ce399b0f",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s45\\graph_off\\manifest.json": "cc5e9bd6e46e55183481faff3452adc778bce1ff75ee111a8ce82ed5074d2400",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s45\\graph_off\\global_metrics.csv": "9836294ba4d8550392044df29971cf60fe3d15d48fddcfcd0c20f17030ece2b7",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s45\\graph_on\\manifest.json": "73f05a3db8a7384a5d02f4f7f96320c963516b8abbc4e2d235bdfc3f1453beeb",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s45\\graph_on\\global_metrics.csv": "ada8fd7b440c2ec8e028c20f0566d379ff7bedbf89219caab0909602f21e8ddd"
+      },
+      "config": {
+        "model_contract_version": "ijdrr_strict_v1",
+        "metric_schema_version": 4,
+        "city": "厦门市",
+        "district": "思明区",
+        "n_residents": 24,
+        "n_enterprises": 3,
+        "total_steps": 180,
+        "dt": 0.25,
+        "outage_step": 2,
+        "outage_cause": "equipment_failure",
+        "restores_in_window": true,
+        "seed": 45,
+        "tag": "semantics_contract_r2_s45",
+        "home_distribution": "poi",
+        "flee_threshold": null,
+        "use_mml": true,
+        "switch_ablation": "none",
+        "opinion_mode": "auto",
+        "outage_stress_profile": "sqrt",
+        "psychology_semantics": "strict",
+        "psychology_contract": {
+          "master_state": "stress_level",
+          "panic_projection_exponent": 0.8,
+          "emotion_projection": "stress_times_min_excitation_calming_envelope",
+          "regional_pressure_weights": {
+            "mean_emotion": 0.4,
+            "mean_panic": 0.4,
+            "pts_ratio": 0.2
+          },
+          "pts_enter_base": 0.8,
+          "pts_exit_base": 0.5,
+          "outage_threat_decay_tau_h": 6.0,
+          "restoration_relief_decay_tau_h": 6.0,
+          "strict_feedback_max_abs": 0.15
+        },
+        "phase_contract": {
+          "government_decision": "start_of_step",
+          "global_metrics": "end_of_step",
+          "decision_pressure_field": "decision_avg_region_psychological_pressure"
+        },
+        "mml_overrides": {
+          "mml_scale": null,
+          "mml_asc_flee": null,
+          "mml_b_sigma_flee": null,
+          "mml_b_vis": null
+        }
+      }
+    },
+    {
+      "run_dir": "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s46",
+      "ok": true,
+      "issues": [],
+      "files": {
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s46\\summary.json": "9d4d77f94462abead88e36330e798ba496ec6797ecbdf4cb99e10de4faa2f5ad",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s46\\graph_off\\manifest.json": "5f51c76aca266222208f35dd2020869fa020b0c7da097d25892452caee7f047f",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s46\\graph_off\\global_metrics.csv": "ffe48967d704a2bf7e904b138029441168f81593e5fe93206a073b52b3db3ffd",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s46\\graph_on\\manifest.json": "20b037194d921713d4a2c5e7302cb2b39a753365f2aadce306c8618084c052b8",
+        "F:\\IJDRR write\\Crowds_sim\\Evacuation-simulation-of-panic-crowds-in-the-city\\trace_output\\IJDRR_v7_strict_semantics_audit_20260714_r2\\psychology_strict\\t15_厦门市_思明区_semantics_contract_r2_s46\\graph_on\\global_metrics.csv": "876156cf68a28acb1d4569dd062b419482d6fd96be8d79f6689f2cbdb641ceb9"
+      },
+      "config": {
+        "model_contract_version": "ijdrr_strict_v1",
+        "metric_schema_version": 4,
+        "city": "厦门市",
+        "district": "思明区",
+        "n_residents": 24,
+        "n_enterprises": 3,
+        "total_steps": 180,
+        "dt": 0.25,
+        "outage_step": 2,
+        "outage_cause": "equipment_failure",
+        "restores_in_window": true,
+        "seed": 46,
+        "tag": "semantics_contract_r2_s46",
+        "home_distribution": "poi",
+        "flee_threshold": null,
+        "use_mml": true,
+        "switch_ablation": "none",
+        "opinion_mode": "auto",
+        "outage_stress_profile": "sqrt",
+        "psychology_semantics": "strict",
+        "psychology_contract": {
+          "master_state": "stress_level",
+          "panic_projection_exponent": 0.8,
+          "emotion_projection": "stress_times_min_excitation_calming_envelope",
+          "regional_pressure_weights": {
+            "mean_emotion": 0.4,
+            "mean_panic": 0.4,
+            "pts_ratio": 0.2
+          },
+          "pts_enter_base": 0.8,
+          "pts_exit_base": 0.5,
+          "outage_threat_decay_tau_h": 6.0,
+          "restoration_relief_decay_tau_h": 6.0,
+          "strict_feedback_max_abs": 0.15
+        },
+        "phase_contract": {
+          "government_decision": "start_of_step",
+          "global_metrics": "end_of_step",
+          "decision_pressure_field": "decision_avg_region_psychological_pressure"
+        },
+        "mml_overrides": {
+          "mml_scale": null,
+          "mml_asc_flee": null,
+          "mml_b_sigma_flee": null,
+          "mml_b_vis": null
+        }
+      }
+    }
+  ]
+}

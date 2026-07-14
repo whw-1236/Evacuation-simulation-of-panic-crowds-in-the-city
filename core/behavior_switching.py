@@ -93,6 +93,7 @@ class SwitchParams:
     feedback_herd_smooth:   float = -0.04   # 跟随Leader成功疏散 -> 轻度下降
     feedback_herd_jam:      float = +0.06   # 跟随Leader陷入拥堵 -> 上升
     feedback_failure_amplify_repeat: float = 0.2  # 连续失败累乘加成 (每次 +20%)
+    feedback_max_abs: float = 0.15  # 单步行为再评估脉冲的绝对上限
     enable_outcome_feedback: bool = True
 
     # M2 新增 — 拥堵直接驱动 σ 上升 (panic cascade loop)
@@ -392,7 +393,8 @@ def compute_inquire_direction(agent, info_nodes, p):
 # =============================================================================
 # P1.B — outcome feedback on σ
 # =============================================================================
-def apply_outcome_feedback(agent, p):
+def calculate_outcome_feedback_delta(
+        agent, p, audit_context='calculate_outcome_feedback_delta', bounded=True):
     """根据 agent 上一帧的行为执行结果，对 stress_level 注入脉冲。
 
     设计要点（对应 Lazarus 再评估 secondary appraisal）：
@@ -404,7 +406,7 @@ def apply_outcome_feedback(agent, p):
     调用约定：放在 ResidentAgent.step 末尾、stress_level 已被 unified 模型更新之后；
     本函数对最终 σ 做加法修正并返回总脉冲 δ。
     """
-    _audit_read(p, 'enable_outcome_feedback', 'apply_outcome_feedback')
+    _audit_read(p, 'enable_outcome_feedback', audit_context)
     if not p.enable_outcome_feedback:
         return 0.0
     delta = 0.0
@@ -434,12 +436,28 @@ def apply_outcome_feedback(agent, p):
 
     # --- 【M2】拥堵 → σ 反馈 (panic cascade loop) ---
     # agent._edge_congestion 由 simulation._path_planning_hook 维护
-    _audit_read(p, 'enable_congestion_feedback', 'apply_outcome_feedback')
+    _audit_read(p, 'enable_congestion_feedback', audit_context)
     if p.enable_congestion_feedback:
         cong = float(getattr(agent, '_edge_congestion', 0.0))
         if cong > 0:
             delta += p.feedback_congestion * cong
 
+    if bounded:
+        _audit_read(p, 'feedback_max_abs', audit_context)
+        max_abs = max(0.0, float(p.feedback_max_abs))
+        delta = max(-max_abs, min(max_abs, delta))
+    return delta
+
+
+def apply_outcome_feedback(agent, p):
+    """Legacy immediate-write wrapper for historical trajectory replay.
+
+    Strict simulations call :func:`calculate_outcome_feedback_delta` and let
+    ``UnifiedStressModel`` perform the sole state update on the next step.
+    """
+    delta = calculate_outcome_feedback_delta(
+        agent, p, audit_context='apply_outcome_feedback', bounded=False
+    )
     if abs(delta) > 0:
         old = getattr(agent, 'stress_level', 0.0)
         agent.stress_level = max(0.0, min(1.0, old + delta))

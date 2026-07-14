@@ -175,6 +175,9 @@ class BlackoutSimulation:
                 from ..config.config import Config
             config = Config()
         self.config = config
+        self.psychology_semantics = self._normalize_psychology_semantics(
+            getattr(config.simulation, 'PSYCHOLOGY_SEMANTICS', 'strict')
+        )
 
         # 保存城市配置
         self.city_config = city_config
@@ -250,6 +253,15 @@ class BlackoutSimulation:
 
         print(f"[OK] 仿真初始化完成: {len(self.residents)}居民, "
               f"{len(self.enterprises)}企业, {len(self.region_manager.regions)}区域")
+
+    @staticmethod
+    def _normalize_psychology_semantics(semantics):
+        semantics = str(semantics or 'strict').lower()
+        if semantics not in {'strict', 'legacy'}:
+            raise ValueError(
+                f"Unsupported psychology_semantics={semantics!r}; expected strict/legacy"
+            )
+        return semantics
 
     @staticmethod
     def _normalize_opinion_mode(mode):
@@ -359,6 +371,9 @@ class BlackoutSimulation:
         # 补齐总数
         while len(self.residents) < self.N_residents:
             self.residents.append(ResidentAgent(seir_type='S'))
+
+        for resident in self.residents:
+            resident.psychology_semantics = self.psychology_semantics
 
         # 关键基础设施Agent
         n_hospitals = config.simulation.N_HOSPITALS
@@ -2269,7 +2284,8 @@ class BlackoutSimulation:
         self.public_opinion_hist = []
         self.opinion_components_hist = []
         self.opinion_components = {
-            'emotion': 0.0, 'enterprise': 0.0, 'critical': 0.0,
+            'psychology': 0.0, 'emotion': 0.0,
+            'enterprise': 0.0, 'critical': 0.0,
         }
         self.public_opinion_pressure = 0.0
 
@@ -2289,6 +2305,10 @@ class BlackoutSimulation:
 
         # 恐慌相关历史
         self.region_panic_hist = {}
+        # Keep named A_z history independent so a legacy panic aggregate can
+        # never contaminate canonical pressure history.
+        self.region_psychological_pressure_hist = {}
+        self.region_psychological_pressure_levels = {}
         self.panic_stats_hist = []
 
         # 当前时间步
@@ -2678,18 +2698,82 @@ class BlackoutSimulation:
         # 行政区级别停电，不需要社区间传播
         pass
 
-    def calculate_region_panic_levels(self):
-        """计算所有区域恐慌水平"""
+    def calculate_region_psychological_pressure_levels(self):
+        """Compute the strict-mode canonical regional psychological pressure A_z."""
         levels = {}
         for region_id in self.region_manager.regions.keys():
-            level = self.region_manager.get_region_panic_level(self.residents, region_id)
+            region_residents = [
+                resident for resident in self.residents
+                if getattr(resident, 'zone', None) == region_id
+            ]
+            if not region_residents:
+                levels[region_id] = 0.0
+                continue
+            avg_emotion = float(np.mean([
+                getattr(resident, 'emotion', 0.0)
+                for resident in region_residents
+            ]))
+            avg_panic = float(np.mean([
+                getattr(resident, 'panic_value', 0.0)
+                for resident in region_residents
+            ]))
+            pts_ratio = sum(
+                1 for resident in region_residents
+                if bool(getattr(resident, 'pts_status', False))
+            ) / len(region_residents)
+            level = max(0.0, min(1.0, 0.4 * avg_emotion + 0.4 * avg_panic + 0.2 * pts_ratio))
             levels[region_id] = level
-
-            if region_id not in self.region_panic_hist:
-                self.region_panic_hist[region_id] = []
-            self.region_panic_hist[region_id].append(level)
-
+        self.region_psychological_pressure_levels = levels
         return levels
+
+    def calculate_region_panic_levels(self):
+        """Return the collective field consumed by the running simulation.
+
+        Strict mode uses one field only: ``region_panic`` is exactly the
+        canonical A_z.  Legacy is the explicitly quarantined compatibility
+        path, so it retains the former emotion-threshold aggregate formula
+        while exporting A_z separately.
+        """
+        canonical_levels = self.calculate_region_psychological_pressure_levels()
+        if getattr(self, 'psychology_semantics', 'strict') != 'legacy':
+            self.region_panic_levels = canonical_levels
+            return canonical_levels
+
+        legacy_levels = {}
+        for region_id in self.region_manager.regions.keys():
+            region_residents = [
+                resident for resident in self.residents
+                if getattr(resident, 'zone', None) == region_id
+            ]
+            if not region_residents:
+                legacy_levels[region_id] = 0.0
+                continue
+            avg_emotion = float(np.mean([
+                getattr(resident, 'emotion', 0.0)
+                for resident in region_residents
+            ]))
+            high_emotion_ratio = sum(
+                1 for resident in region_residents
+                if getattr(resident, 'emotion', 0.0) > 0.7
+            ) / len(region_residents)
+            legacy_levels[region_id] = max(
+                0.0, min(1.0, 0.7 * avg_emotion + 0.3 * high_emotion_ratio)
+            )
+        self.region_panic_levels = legacy_levels
+        return legacy_levels
+
+    def _resident_weighted_region_pressure(self, levels, residents=None):
+        """Return resident-weighted A_z over the supplied population."""
+        residents = self.residents if residents is None else list(residents)
+        if not residents:
+            return 0.0
+        values = [
+            max(0.0, min(1.0, float(levels.get(
+                getattr(resident, 'zone', None), 0.0
+            ))))
+            for resident in residents
+        ]
+        return float(np.mean(values))
 
     def step(self):
         """
@@ -2731,8 +2815,12 @@ class BlackoutSimulation:
         if self.step_count >= self.emergency_response_delay:
             self.recovery_allowed = True
 
-        # 3. 计算区域恐慌水平
+        # 3. Compute the decision-time collective field.  In strict mode this
+        # is canonical A_z and is the sole aggregate psychology input.
         region_panic_levels = self.calculate_region_panic_levels()
+        self.decision_region_psychological_pressure_levels = dict(
+            self.region_psychological_pressure_levels
+        )
 
         # 4. 计算社会力
         social_forces = {}
@@ -2787,6 +2875,12 @@ class BlackoutSimulation:
         avg_emo = np.mean([r.emotion for r in self.residents])
         emotion_std = np.std([r.emotion for r in self.residents])
         emotion_factor = max(0, avg_emo - 0.3) * 2
+        strict_psychology = str(
+            getattr(self, 'psychology_semantics', 'strict')
+        ).lower() == 'strict'
+        decision_avg_psychology = self._resident_weighted_region_pressure(
+            self.decision_region_psychological_pressure_levels
+        )
 
         Q_total = sum(enterprise_requests)
         Q_avg = Q_total / len(self.enterprises) if self.enterprises else 0.0
@@ -2800,16 +2894,25 @@ class BlackoutSimulation:
         # diagnostic fields rather than interchangeable outage definitions.
         outage_ratio = self.get_weighted_outage_ratio()
 
-        C_total = sum(c.request(outage_ratio, emotion_factor) for c in self.criticals)
+        critical_psychology_input = 0.0 if strict_psychology else emotion_factor
+        C_total = sum(
+            c.request(outage_ratio, critical_psychology_input)
+            for c in self.criticals
+        )
 
         # 综合舆情指数
-        emotion_component = min(1.0, emotion_factor)
+        psychology_component = (
+            decision_avg_psychology
+            if strict_psychology else min(1.0, emotion_factor)
+        )
         enterprise_component = min(1.0, Q_avg)
         critical_component = min(1.0, C_total / (len(self.criticals) + 1e-6))
-        P = 0.4 * emotion_component + 0.3 * enterprise_component + 0.3 * critical_component
+        P = 0.4 * psychology_component + 0.3 * enterprise_component + 0.3 * critical_component
         P = min(1.0, P)
         self.opinion_components = {
-            'emotion': 0.4 * emotion_component,
+            'psychology': 0.4 * psychology_component,
+            # Compatibility alias; strict semantics uses A_z, not raw E_i.
+            'emotion': 0.4 * psychology_component,
             'enterprise': 0.3 * enterprise_component,
             'critical': 0.3 * critical_component,
         }
@@ -2843,16 +2946,30 @@ class BlackoutSimulation:
             d_loss = sum(e.loss for e in d_ent)
             d_panic = {z: region_panic_levels.get(z, 0) for z in d_zones}
             d_C = C_total / n_districts if n_districts > 0 else 0
+            d_avg_psychology = self._resident_weighted_region_pressure(
+                d_panic, d_res
+            )
 
-            opinion_emotion_impact = max(0, (d_avg_emo - 0.3) * 2)
-            opinion_max_panic = max(d_panic.values()) if d_panic else 0
-            opinion_pressure = opinion_emotion_impact * 0.5 + opinion_max_panic * 0.5
+            if strict_psychology:
+                government_psychology_input = d_avg_psychology
+                opinion_pressure = d_avg_psychology
+            else:
+                government_psychology_input = d_avg_emo
+                opinion_emotion_impact = max(0, (d_avg_emo - 0.3) * 2)
+                opinion_max_panic = max(d_panic.values()) if d_panic else 0
+                opinion_pressure = (
+                    opinion_emotion_impact * 0.5 + opinion_max_panic * 0.5
+                )
             gov.last_opinion_pressure = float(opinion_pressure)
             gov.last_opinion_threshold_margin = float(
                 opinion_pressure - getattr(gov, 'opinion_threshold', 0.0)
             )
 
-            inf = gov.decide(d_loss, d_avg_emo, d_Q, d_C, d_panic, d_outage_ratio)
+            inf = gov.decide(
+                d_loss, government_psychology_input, d_Q, d_C, d_panic,
+                d_outage_ratio,
+                psychology_semantics=self.psychology_semantics,
+            )
             district_gov_influence[district] = inf
             total_gov_influence += inf
         self._apply_opinion_mode_override()
@@ -2881,7 +2998,8 @@ class BlackoutSimulation:
             d_panic = {z: region_panic_levels.get(z, 0) for z in d_zones}
 
             gov.allocate_resources(
-                d_ent, float(getattr(gov, 'last_deployment', 0.0)), d_panic, d_res
+                d_ent, float(getattr(gov, 'last_deployment', 0.0)), d_panic,
+                d_res, psychology_semantics=self.psychology_semantics,
             )
 
         # ============ 区域物资系统更新 ============
@@ -2998,8 +3116,16 @@ class BlackoutSimulation:
         self.P_hist.append(P)
         self.opinion_components_hist.append(self.opinion_components.copy())
 
-        self.emotion_hist.append(avg_emo)
-        self.emotion_std_hist.append(emotion_std)
+        export_avg_emo = (
+            float(np.mean([r.emotion for r in self.residents]))
+            if strict_psychology else avg_emo
+        )
+        export_emotion_std = (
+            float(np.std([r.emotion for r in self.residents]))
+            if strict_psychology else emotion_std
+        )
+        self.emotion_hist.append(export_avg_emo)
+        self.emotion_std_hist.append(export_emotion_std)
         self.recovery_hist.append(powered_ratio)
         self.blackout_hist.append(outage_ratio)
         self.informed_hist.append(np.mean([r.informed for r in self.residents]))
@@ -3023,11 +3149,12 @@ class BlackoutSimulation:
         panic_stats = self.force_calculator.get_statistics(self.residents)
         self.panic_stats_hist.append(panic_stats)
 
-        # 区域恐慌水平（用于地图颜色）
-        for region_id, panic_level in region_panic_levels.items():
-            if region_id not in self.region_panic_hist:
-                self.region_panic_hist[region_id] = []
-            self.region_panic_hist[region_id].append(panic_level)
+        # Preserve decision-time sampling only for explicit legacy replay.
+        if not strict_psychology:
+            for region_id, panic_level in region_panic_levels.items():
+                if region_id not in self.region_panic_hist:
+                    self.region_panic_hist[region_id] = []
+                self.region_panic_hist[region_id].append(panic_level)
 
         # 当前时间步（用于外部获取）
         self.t = self.step_count
@@ -3040,6 +3167,33 @@ class BlackoutSimulation:
         self.event_influence.apply_effects(self, event_effects, self.dt)
         self.last_event_effects = event_effects
         self.last_event_summary = event_effects.get('summary', {})
+
+        # Freeze the export-time collective field only after the resident and
+        # event layers have completed.  This avoids mixing decision-time A_z(t)
+        # with end-of-step E_i/P_i/Z_i values in one CSV row.
+        if strict_psychology:
+            export_region_panic_levels = self.calculate_region_panic_levels()
+            for region_id, panic_level in export_region_panic_levels.items():
+                if region_id not in self.region_panic_hist:
+                    self.region_panic_hist[region_id] = []
+                self.region_panic_hist[region_id].append(panic_level)
+                if region_id not in self.region_psychological_pressure_hist:
+                    self.region_psychological_pressure_hist[region_id] = []
+                self.region_psychological_pressure_hist[region_id].append(
+                    panic_level
+                )
+        else:
+            # Refresh export-time A_z without altering legacy panic history.
+            export_region_pressure_levels = (
+                self.calculate_region_psychological_pressure_levels()
+            )
+            for region_id, pressure in export_region_pressure_levels.items():
+                if region_id not in self.region_psychological_pressure_hist:
+                    self.region_psychological_pressure_hist[region_id] = []
+                self.region_psychological_pressure_hist[region_id].append(
+                    pressure
+                )
+
         self.public_opinion_pressure = float(getattr(
             self.event_influence, 'public_opinion_pressure',
             getattr(self.event_influence, 'opinion_pressure', 0.0)

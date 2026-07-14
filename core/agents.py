@@ -30,17 +30,17 @@ migrate_to_unified_model = None
 try:
     from .behavior_switching import (
         attempt_acquire, init_store_state, SwitchParams,
-        apply_outcome_feedback,
+        apply_outcome_feedback, calculate_outcome_feedback_delta,
     )
 except ImportError:
     try:
         from behavior_switching import (
             attempt_acquire, init_store_state, SwitchParams,
-            apply_outcome_feedback,
+            apply_outcome_feedback, calculate_outcome_feedback_delta,
         )
     except ImportError:
         attempt_acquire = init_store_state = SwitchParams = None
-        apply_outcome_feedback = None
+        apply_outcome_feedback = calculate_outcome_feedback_delta = None
 
 try:
     from .unified_stress_model import unified_stress_model as _usm, migrate_to_unified_model as _mtum
@@ -688,7 +688,8 @@ class GovernmentAgent:
             return True
         return str(zone_id) in [str(z) for z in self.target_zones]
 
-    def decide(self, loss, avg_emotion, Q, C, region_panic_levels=None, outage_ratio=0.0):
+    def decide(self, loss, avg_emotion, Q, C, region_panic_levels=None,
+               outage_ratio=0.0, psychology_semantics='legacy'):
         """
         决策函数 - 基于行为参数和状态演化，计算资源下发量
 
@@ -723,13 +724,22 @@ class GovernmentAgent:
             max_panic = max(region_panic_levels.values()) if region_panic_levels else 0
 
         # ============ 状态演化：计算压力指数 ============
-        emotion_impact = max(0, (avg_emotion - 0.3) * 2)
+        # The parameter name is retained for compatibility.  Strict callers
+        # pass resident-weighted A_z, the sole aggregate psychological input.
+        strict_psychology = str(psychology_semantics).lower() == 'strict'
+        if strict_psychology:
+            emotion_impact = max(0.0, min(1.0, float(avg_emotion)))
+            aggregate_psychology_term = self.w_E * emotion_impact
+        else:
+            emotion_impact = max(0, (avg_emotion - 0.3) * 2)
+            aggregate_psychology_term = (
+                self.w_E * emotion_impact + 0.2 * max_panic
+            )
         self.pressure_index = (
                 self.w_L * (loss / self.max_loss if self.max_loss > 0 else 0)
-                + self.w_E * emotion_impact
+                + aggregate_psychology_term
                 + self.w_Q * (Q / self.max_Q if self.max_Q > 0 else 0)
                 + self.w_C * (C / self.max_C if self.max_C > 0 else 0)
-                + 0.2 * max_panic
         )
         self.pressure_index = min(1.0, self.pressure_index)
 
@@ -756,9 +766,17 @@ class GovernmentAgent:
         # ============ 事件5: 实施舆情管理 ============
         # 【人为控制模式】由外部控制开始/结束
         # 【自动模式】舆情压力 > opinion_threshold 时触发
-        proxy_opinion_pressure = emotion_impact * 0.5 + max_panic * 0.5
+        proxy_opinion_pressure = (
+            emotion_impact
+            if strict_psychology
+            else emotion_impact * 0.5 + max_panic * 0.5
+        )
         authoritative_pressure = self.authoritative_public_opinion_pressure
-        if authoritative_pressure is None:
+        if strict_psychology:
+            # A_z is the sole government-facing aggregate psychology input.
+            # The dynamic legacy opinion accumulator remains diagnostic only.
+            authoritative_pressure = proxy_opinion_pressure
+        elif authoritative_pressure is None:
             authoritative_pressure = proxy_opinion_pressure
         self.last_opinion_pressure = max(0.0, min(1.0, float(authoritative_pressure)))
         self.last_opinion_threshold_margin = (
@@ -949,7 +967,9 @@ class GovernmentAgent:
             if not resident_allocated:
                 self.resource_to_resident = False
 
-    def allocate_resources(self, enterprises, deployed_resources, region_panic_levels=None, residents=None):
+    def allocate_resources(self, enterprises, deployed_resources,
+                           region_panic_levels=None, residents=None,
+                           psychology_semantics='legacy'):
         """Allocate event-gated government support without cross-event locks.
 
         The previous implementation used one shared ``use_manual_events``
@@ -1093,10 +1113,19 @@ class GovernmentAgent:
         # Event 4: resources to residents.  The resource pool is recorded only
         # when this event is active; EventInfluenceCalculator uses the same
         # gate for behavioural effects.
-        avg_emotion = (
-            sum(max(0.0, float(getattr(resident, 'emotion', 0.0))) for resident in residents) / len(residents)
-            if residents else 0.0
-        )
+        strict_psychology = str(psychology_semantics).lower() == 'strict'
+        if strict_psychology:
+            avg_emotion = (
+                sum(max(0.0, min(1.0, float(region_panic_levels.get(
+                    getattr(resident, 'zone', None), 0.0
+                )))) for resident in residents) / len(residents)
+                if residents else 0.0
+            )
+        else:
+            avg_emotion = (
+                sum(max(0.0, float(getattr(resident, 'emotion', 0.0))) for resident in residents) / len(residents)
+                if residents else 0.0
+            )
         high_severity = any(severity > 0.3 for severity in zone_severity.values())
         high_panic = any(float(value) > 0.5 for value in region_panic_levels.values())
         auto_resident = bool(residents) and (
@@ -1912,6 +1941,14 @@ class ResidentAgent:
 
         # 情绪状态 [0,1]
         self.emotion = 0.0
+        # ``strict`` is the formal-experiment default.  ``legacy`` is set
+        # explicitly by the batch runner when reproducing historical traces.
+        self.psychology_semantics = 'strict'
+        self.episode_outage_hours = 0.0
+        self.cumulative_outage_hours = 0.0
+        self.time_since_service_restoration = 0.0
+        # Compatibility aliases.  In strict mode these are projections of the
+        # explicit clocks above; legacy retains the historical update path.
         self.t_outage = 0.0
         self.powered = True
         self.informed = False
@@ -2019,14 +2056,19 @@ class ResidentAgent:
         # 注：原有的 peak_panic / trauma_level / recovery_resistance 字段已废弃
         # （初始化后从未被读写），长尾效应现由 unified_stress_model 的 peak_stress
         # 和 powered_recovery 分支统一处理。
-        self.total_outage_hours = 0.0  # 累计停电时长
+        self.total_outage_hours = 0.0  # compatibility alias for cumulative exposure
 
         # 【停电恢复后长尾效应】- 新增
-        self.time_since_recovery = 0.0  # 恢复供电后经过的时间（小时）
+        self.time_since_recovery = 0.0  # compatibility alias for restoration clock
         self.was_affected = False  # 是否曾受停电影响（用于判断是否需要长尾效应）
         self.recovery_phase = False  # 是否处于恢复期
         self.max_emotion_during_outage = 0.0  # 停电期间的最高情绪值
         self.prev_powered_state = True  # 上一步的供电状态
+        # Strict-mode inputs are written by the event layer and consumed by the
+        # unified stress model; they are never direct E/P writes.
+        self._event_social_support = 0.0
+        self._event_social_exposure = 0.0
+        self._pending_stress_reappraisal = 0.0
 
         # 【区域差异化属性】- 在distribute_residents时设置
         self.zone_spread_index = 0.5  # 所在区域的传播指数 [0,1]
@@ -2381,6 +2423,101 @@ class ResidentAgent:
         self.zone = zone
         self.home_position = (x, y)
 
+    def _uses_strict_psychology(self):
+        return str(getattr(self, 'psychology_semantics', 'strict')).lower() == 'strict'
+
+    def _advance_strict_service_time_state(self, dt):
+        """Advance the three explicit service clocks for strict semantics.
+
+        The method is called before the stress update, so the same per-load
+        service state used by ``DistrictOutageState`` drives psychological
+        inputs.  ``episode_outage_hours`` is intentionally retained after
+        restoration and reset only when a new loss of service begins.
+        """
+        dt = max(0.0, float(dt))
+        was_powered = bool(getattr(self, 'prev_powered_state', True))
+        is_powered = bool(getattr(self, 'powered', True))
+
+        if not is_powered:
+            if was_powered:
+                self.episode_outage_hours = 0.0
+                self.time_since_service_restoration = 0.0
+                self.recovery_phase = False
+                self.was_affected = True
+                self.max_emotion_during_outage = 0.0
+                self.emotion_reaction_time = 0.0
+            self.episode_outage_hours += dt
+            self.cumulative_outage_hours += dt
+            self.time_since_service_restoration = 0.0
+            self.safe_time = 0.0
+            self.informed = True
+        else:
+            self.safe_time += dt
+            if not was_powered:
+                self.recovery_phase = True
+                self.time_since_service_restoration = 0.0
+                self.max_emotion_during_outage = max(
+                    self.max_emotion_during_outage, self.emotion
+                )
+            elif self.cumulative_outage_hours > 0.0:
+                # This service-history clock outlives the shorter
+                # psychological recovery phase.  A new outage is its only
+                # reset after restoration.
+                self.time_since_service_restoration += dt
+
+        # Public compatibility views must never become a second time source.
+        self.t_outage = self.episode_outage_hours
+        self.total_outage_hours = self.cumulative_outage_hours
+        self.time_since_recovery = self.time_since_service_restoration
+        self.prev_powered_state = is_powered
+        self._event_social_support = max(
+            0.0, float(getattr(self, '_event_social_support', 0.0)) - 0.05 * dt
+        )
+        self._event_social_exposure = max(
+            0.0, float(getattr(self, '_event_social_exposure', 0.0)) - 0.08 * dt
+        )
+
+    def _finalize_strict_recovery_phase(self):
+        """End only the event-state flag, never the cumulative exposure clock."""
+        if (
+            bool(getattr(self, 'powered', True))
+            and bool(getattr(self, 'recovery_phase', False))
+            and float(getattr(self, 'time_since_service_restoration', 0.0)) >= 2.0
+            and float(getattr(self, 'stress_level', 0.0)) < 0.05
+        ):
+            self.recovery_phase = False
+
+    def _derive_psychological_observables(self, dt):
+        """Single ownership point for E and P derived from the stress state."""
+        stress = float(np.clip(getattr(self, 'stress_level', 0.0), 0.0, 1.0))
+        internal_stress = getattr(self, '_internal_stress', 0.0)
+        tolerance = getattr(self, '_tolerance', 0.3)
+        is_reacting = internal_stress > tolerance
+        is_recovering = bool(getattr(self, 'recovery_phase', False))
+
+        if is_reacting or is_recovering:
+            self.emotion_reaction_time += dt
+        elif self.emotion_reaction_time > 0 and stress < 0.05:
+            self.emotion_reaction_time = max(
+                0.0, self.emotion_reaction_time - dt * 0.5
+            )
+
+        t = self.emotion_reaction_time
+        pe_exp = -self.alpha1_emotion * (t - self.te_emotion)
+        pc_exp = self.alpha2_emotion * (t - self.tc_emotion - self.te_emotion)
+        pe = 1.0 / (1.0 + np.exp(np.clip(pe_exp, -50, 50)))
+        pc = 1.0 / (1.0 + np.exp(np.clip(pc_exp, -50, 50)))
+        envelope = min(pe, pc)
+
+        self.panic_value = stress ** 0.8
+        self.emotion = float(np.clip(stress * envelope, 0.0, 1.0))
+        self._psychology_observables = {
+            'stress': stress,
+            'panic': self.panic_value,
+            'emotion': self.emotion,
+            'emotion_envelope': envelope,
+        }
+
     def step(self, dt=1.0, social_force=None, gov_resource=0.0,
              region_panic_level=0.0, hazard_positions=None,
              time_factors=None, sim_time=0.0):  # 新增 sim_time 参数
@@ -2411,8 +2548,10 @@ class ResidentAgent:
         # 1. SEIR状态转换
         self._update_seir_state(dt)
 
-        # 2. 停电状态更新
-        if not self.powered:
+        # Service clocks must follow the authoritative per-load power state.
+        if self._uses_strict_psychology():
+            self._advance_strict_service_time_state(dt)
+        elif not self.powered:
             self.t_outage += dt
             # 【长尾效应】累计停电时长（用于计算心理创伤）
             self.total_outage_hours += dt
@@ -2534,70 +2673,9 @@ class ResidentAgent:
         )
         self._stress_components = components
 
-        # 从 stress_level 派生 panic_value 和 emotion
-        # - panic_value: 恐慌是压力的急性显性表达，低压力时相对放大
-        # - emotion: 【改进2】经Pe/Pc双因子包络调制的情绪状态
-        stress = self.stress_level
-
-        # panic_value: 凹函数 x^0.8
-        #   stress=0.1 → panic=0.16（低压力时恐慌感明显）
-        #   stress=0.5 → panic=0.57
-        #   stress=1.0 → panic=1.00（高压力时两者趋同）
-        self.panic_value = stress ** 0.8
-
-        # ============================================================
-        # 【改进2】情绪激发-平复双因子模型 (Paper 1, Eq.7-10)
-        # ============================================================
-        #
-        # 核心思想：stress_level 是内在心理压力（由ODE驱动），
-        # emotion 是外显情绪表达，二者通过 P(t) 包络函数关联：
-        #
-        #   Pe(t) = 1/(1+exp(-α1·(t-te)))   激发S形曲线（0→1上升）
-        #   Pc(t) = 1/(1+exp( α2·(t-tc-te)))  平复S形曲线（1→0下降）
-        #   P(t)  = min(Pe, Pc)              山丘形包络
-        #   emotion ≈ stress × 0.9 × P(t)
-        #
-        # 效果：即使 stress 持续高位，emotion 也会经历
-        # "缓慢上升 → 维持高峰 → 逐渐适应下降"的心理学动态曲线。
-        # α1/α2/tc/te 均由OCEAN五因素决定，实现个体差异化。
-        #
-
-        # 1) 更新情绪反应累计时间
-        #    - 正在反应中（停电且超过耐受）或恢复期：时间推进
-        #    - 完全恢复后：缓慢归零，为下次事件做准备
-        internal_stress = getattr(self, '_internal_stress', 0.0)
-        tolerance = getattr(self, '_tolerance', 0.3)
-        is_reacting = internal_stress > tolerance
-        is_recovering = getattr(self, 'recovery_phase', False)
-
-        if is_reacting or is_recovering:
-            self.emotion_reaction_time += dt
-        elif self.emotion_reaction_time > 0 and stress < 0.05:
-            # 完全平静后，反应时间缓慢归零（下次事件可重新计时）
-            self.emotion_reaction_time = max(0.0, self.emotion_reaction_time - dt * 0.5)
-
-        # 2) 计算 Pe/Pc 包络
-        t = self.emotion_reaction_time
-        te = self.te_emotion
-        tc = self.tc_emotion
-
-        # Pe: 激发曲线 0→1。t < te 时 Pe≈0.5以下；t >> te 时 Pe→1
-        pe_exp = -self.alpha1_emotion * (t - te)
-        Pe = 1.0 / (1.0 + np.exp(np.clip(pe_exp, -50, 50)))
-
-        # Pc: 平复曲线 1→0。t < tc+te 时 Pc≈1；t >> tc+te 时 Pc→0
-        pc_exp = self.alpha2_emotion * (t - tc - te)
-        Pc = 1.0 / (1.0 + np.exp(np.clip(pc_exp, -50, 50)))
-
-        P_envelope = min(Pe, Pc)
-
-        # 3) emotion = stress × P(t)，严格按论文 Eq.10 E(t)=En·P(t)
-        # 【改进】去除原有的 0.9 衰减系数和一阶平滑滤波，严格对齐论文公式。
-        # Pe/Pc 本身是 sigmoid 函数，已自带平滑性；
-        # stress 由 unified_stress_model 的 ODE 更新，本身也是连续变化，
-        # 因此无需额外滤波即可保证 emotion 无抖动。
-        self.emotion = stress * P_envelope
-        self.emotion = np.clip(self.emotion, 0, 1)
+        # Evaluate the single observation map once after the sigma update.
+        # This helper owns both the reaction timer and the E/P projection.
+        self._derive_psychological_observables(dt)
 
         # 注：pts_status 已由 unified_stress_model._update_behavior_states（经由
         # update_resident_stress 调用）根据性格调整后的阈值设置，此处不再覆盖，
@@ -2611,14 +2689,22 @@ class ResidentAgent:
         self._update_information_spread(dt, gov_resource)
 
         # ============ 更新事件触发状态 ============
+        if self._uses_strict_psychology():
+            self._finalize_strict_recovery_phase()
         self._update_event_states(dt, gov_resource, region_panic_level)
 
         # ============ P1.B 行为结果反馈 σ (Lazarus 再评估) ============
         # 在 is_hoarding / just_hoarded / hoarding_success / _herd_active 都已
         # 完成本步更新后，按行为结果向 stress_level 注入脉冲。开关由
         # self.sw.enable_outcome_feedback 控制（消融实验直接关掉即可）。
-        if apply_outcome_feedback is not None and getattr(self, 'sw', None) is not None:
-            apply_outcome_feedback(self, self.sw)
+        if getattr(self, 'sw', None) is not None:
+            if self._uses_strict_psychology():
+                if calculate_outcome_feedback_delta is not None:
+                    self._pending_stress_reappraisal = calculate_outcome_feedback_delta(
+                        self, self.sw, audit_context='queue_outcome_feedback'
+                    )
+            elif apply_outcome_feedback is not None:
+                apply_outcome_feedback(self, self.sw)
 
     def _update_event_states(self, dt, gov_resource, region_panic_level):
         """
@@ -2646,7 +2732,7 @@ class ResidentAgent:
         # - 恢复期时长：取决于停电时长、峰值情绪、抗压能力等
 
         # 检测供电状态变化
-        if self.prev_powered_state and not self.powered:
+        if (not self._uses_strict_psychology()) and self.prev_powered_state and not self.powered:
             # 从有电变停电：开始记录影响
             self.was_affected = True
             self.recovery_phase = False
@@ -2667,7 +2753,7 @@ class ResidentAgent:
         self.prev_powered_state = self.powered
 
         # 恢复期时间累加
-        if self.recovery_phase:
+        if (not self._uses_strict_psychology()) and self.recovery_phase:
             self.time_since_recovery += dt
 
             # 【退出条件】以时间为主：

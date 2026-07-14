@@ -28,6 +28,7 @@ import os
 import sys
 import csv
 import json
+import hashlib
 import time
 import argparse
 import random
@@ -59,6 +60,10 @@ from simulation.simulation import BlackoutSimulation
 from core.unified_stress_model import unified_stress_model
 
 
+MODEL_CONTRACT_VERSION = 'ijdrr_strict_v1'
+METRIC_SCHEMA_VERSION = 4
+
+
 TRACE_ROOT = os.path.join(ROOT, 'trace_output')
 MAP_DIR = os.path.join(ROOT, 'simulation map data')
 os.makedirs(TRACE_ROOT, exist_ok=True)
@@ -76,9 +81,16 @@ DEFAULT_OUTAGE_STEP = 16       # 早点触发, 留更多时间形成 cascade
 DEFAULT_SEED        = 42
 
 GLOBAL_METRIC_FIELDS = [
-    'metric_schema_version', 'step', 't_hour',
+    'metric_schema_version', 'metric_phase', 'step', 't_hour',
+    'psychology_semantics',
     'avg_stress', 'max_stress', 'pct_stress_gt_06',
-    'avg_emotion', 'avg_panic',
+    'avg_emotion', 'avg_panic', 'pts_ratio',
+    'avg_episode_outage_hours', 'avg_cumulative_outage_hours',
+    'avg_time_since_service_restoration',
+    'decision_avg_region_psychological_pressure',
+    'avg_region_psychological_pressure',
+    'occupied_zone_mean_psychological_pressure',
+    'service_restoration_ratio',
     'hoard_ratio', 'herd_ratio', 'flee_ratio', 'outage_ratio',
     'full_outage_zone_ratio', 'unpowered_resident_ratio',
     'outage_event_id', 'outage_state', 'outage_mode', 'outage_cause',
@@ -93,7 +105,8 @@ GLOBAL_METRIC_FIELDS = [
     'opinion_pressure', 'public_opinion_pressure',
     'opinion_pressure_decay', 'opinion_pressure_net_change',
     'opinion_management_pressure_relief', 'total_opinion_pressure',
-    'system_help_pressure', 'system_help_emotion_component',
+    'system_help_pressure', 'system_help_psychology_component',
+    'system_help_emotion_component',
     'system_help_enterprise_component', 'system_help_critical_component',
     'public_opinion_active',
     'opinion_active_district_count', 'opinion_active_district_ratio',
@@ -162,6 +175,9 @@ def _collect_step_metrics(sim):
             return 0.0
 
     system_help_emotion = _component('emotion')
+    system_help_psychology = _component('psychology')
+    if 'psychology' not in components:
+        system_help_psychology = system_help_emotion
     system_help_enterprise = _component('enterprise')
     system_help_critical = _component('critical')
     help_history = getattr(sim, 'system_help_pressure_hist', None)
@@ -169,11 +185,11 @@ def _collect_step_metrics(sim):
         help_history = getattr(sim, 'P_hist', [])
     try:
         system_help_pressure = float(help_history[-1]) if help_history else (
-            system_help_emotion + system_help_enterprise + system_help_critical
+            system_help_psychology + system_help_enterprise + system_help_critical
         )
     except (IndexError, TypeError, ValueError):
         system_help_pressure = (
-            system_help_emotion + system_help_enterprise + system_help_critical
+            system_help_psychology + system_help_enterprise + system_help_critical
         )
     try:
         public_opinion_pressure = float(getattr(
@@ -191,6 +207,18 @@ def _collect_step_metrics(sim):
         (float(getattr(r, 'emotion', 0.0)) for r in residents), dtype=np.float64, count=n)
     panic_arr = np.fromiter(
         (float(getattr(r, 'panic_value', 0.0)) for r in residents), dtype=np.float64, count=n)
+    pts_arr = np.fromiter(
+        (1 if bool(getattr(r, 'pts_status', False)) else 0 for r in residents),
+        dtype=np.int8, count=n)
+    episode_outage_arr = np.fromiter(
+        (float(getattr(r, 'episode_outage_hours', getattr(r, 't_outage', 0.0))) for r in residents),
+        dtype=np.float64, count=n)
+    cumulative_outage_arr = np.fromiter(
+        (float(getattr(r, 'cumulative_outage_hours', getattr(r, 'total_outage_hours', 0.0))) for r in residents),
+        dtype=np.float64, count=n)
+    restoration_clock_arr = np.fromiter(
+        (float(getattr(r, 'time_since_service_restoration', getattr(r, 'time_since_recovery', 0.0))) for r in residents),
+        dtype=np.float64, count=n)
     hoard_arr = np.fromiter(
         (1 if getattr(r, 'is_hoarding', False) else 0 for r in residents), dtype=np.int8, count=n)
     herd_arr = np.fromiter(
@@ -214,6 +242,41 @@ def _collect_step_metrics(sim):
         1 for resident in residents
         if not bool(getattr(resident, 'powered', True))
     ) / n)
+    regional_pressure = getattr(sim, 'region_psychological_pressure_levels', {}) or {}
+    decision_regional_pressure = getattr(
+        sim, 'decision_region_psychological_pressure_levels', regional_pressure
+    ) or {}
+    try:
+        resident_pressure_values = [
+            float(regional_pressure.get(getattr(resident, 'zone', None), 0.0))
+            for resident in residents
+        ]
+        avg_regional_pressure = (
+            float(np.mean(resident_pressure_values))
+            if resident_pressure_values else 0.0
+        )
+        occupied_zones = {
+            getattr(resident, 'zone', None) for resident in residents
+            if getattr(resident, 'zone', None) in regional_pressure
+        }
+        occupied_zone_mean_pressure = (
+            float(np.mean([regional_pressure[zone] for zone in occupied_zones]))
+            if occupied_zones else 0.0
+        )
+        decision_pressure_values = [
+            float(decision_regional_pressure.get(
+                getattr(resident, 'zone', None), 0.0
+            ))
+            for resident in residents
+        ]
+        decision_avg_regional_pressure = (
+            float(np.mean(decision_pressure_values))
+            if decision_pressure_values else 0.0
+        )
+    except (TypeError, ValueError):
+        avg_regional_pressure = 0.0
+        occupied_zone_mean_pressure = 0.0
+        decision_avg_regional_pressure = 0.0
 
     outage_audit = {}
     get_outage_state = getattr(sim, 'get_outage_state', None)
@@ -236,12 +299,22 @@ def _collect_step_metrics(sim):
         (1 if getattr(r, '_dom_action', None) == 'flee' else 0 for r in residents),
         dtype=np.int8, count=n)
     return {
-        'metric_schema_version': 2.0,
+        'metric_schema_version': float(METRIC_SCHEMA_VERSION),
+        'metric_phase': 'end_of_step',
+        'psychology_semantics': str(getattr(sim, 'psychology_semantics', 'strict')),
         'avg_stress':           float(stress_arr.mean()),
         'max_stress':           float(stress_arr.max()) if n else 0.0,
         'pct_stress_gt_06':     float((stress_arr > 0.6).mean()),
         'avg_emotion':          float(emotion_arr.mean()),
         'avg_panic':            float(panic_arr.mean()),
+        'pts_ratio':            float(pts_arr.mean()),
+        'avg_episode_outage_hours': float(episode_outage_arr.mean()),
+        'avg_cumulative_outage_hours': float(cumulative_outage_arr.mean()),
+        'avg_time_since_service_restoration': float(restoration_clock_arr.mean()),
+        'decision_avg_region_psychological_pressure': decision_avg_regional_pressure,
+        'avg_region_psychological_pressure': avg_regional_pressure,
+        'occupied_zone_mean_psychological_pressure': occupied_zone_mean_pressure,
+        'service_restoration_ratio': 1.0 - unpowered_resident_ratio,
         'hoard_ratio':          float(hoard_arr.mean()),
         'herd_ratio':           float(herd_arr.mean()),
         'flee_ratio':           float(flee_arr.mean()),
@@ -273,6 +346,7 @@ def _collect_step_metrics(sim):
         ),
         'total_opinion_pressure': float(event_summary.get('total_opinion_pressure', 0.0)),
         'system_help_pressure': system_help_pressure,
+        'system_help_psychology_component': system_help_psychology,
         'system_help_emotion_component': system_help_emotion,
         'system_help_enterprise_component': system_help_enterprise,
         'system_help_critical_component': system_help_critical,
@@ -369,17 +443,90 @@ def _run_git(args):
 
 def _git_info():
     status = _run_git(['status', '--short'])
+    tracked_diff = _run_git(['diff', '--binary', '--no-ext-diff', 'HEAD']) or ''
+    untracked = _run_git(['ls-files', '--others', '--exclude-standard']) or ''
+    untracked_code = {}
+    for relative_path in sorted(untracked.splitlines()):
+        if os.path.splitext(relative_path)[1].lower() not in {
+            '.py', '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg'
+        }:
+            continue
+        path = os.path.join(ROOT, relative_path)
+        try:
+            with open(path, 'rb') as handle:
+                untracked_code[relative_path] = hashlib.sha256(
+                    handle.read()
+                ).hexdigest()
+        except OSError:
+            untracked_code[relative_path] = None
+    fingerprint_payload = json.dumps(
+        {
+            'status_short': status or '',
+            'tracked_diff_sha256': hashlib.sha256(
+                tracked_diff.encode('utf-8')
+            ).hexdigest(),
+            'untracked_code': untracked_code,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    ).encode('utf-8')
     return {
         'commit': _run_git(['rev-parse', 'HEAD']),
         'dirty': bool(status),
         'status_short': status or '',
+        'git_diff_sha256': hashlib.sha256(
+            tracked_diff.encode('utf-8')
+        ).hexdigest(),
+        'untracked_code_sha256': untracked_code,
+        'worktree_fingerprint_sha256': hashlib.sha256(
+            fingerprint_payload
+        ).hexdigest(),
+    }
+
+
+def _config_sha256(config):
+    payload = json.dumps(
+        config, ensure_ascii=False, sort_keys=True, separators=(',', ':')
+    ).encode('utf-8')
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _psychology_contract_snapshot(sim=None):
+    feedback_max_abs = None
+    residents = list(getattr(sim, 'residents', []) or []) if sim is not None else []
+    if residents:
+        switch_params = getattr(residents[0], 'sw', None)
+        if switch_params is not None:
+            feedback_max_abs = getattr(switch_params, 'feedback_max_abs', None)
+    return {
+        'master_state': 'stress_level',
+        'panic_projection_exponent': 0.8,
+        'emotion_projection': 'stress_times_min_excitation_calming_envelope',
+        'regional_pressure_weights': {
+            'mean_emotion': 0.4,
+            'mean_panic': 0.4,
+            'pts_ratio': 0.2,
+        },
+        'pts_enter_base': float(unified_stress_model.THRESHOLD_EXTREME_PANIC),
+        'pts_exit_base': float(unified_stress_model.THRESHOLD_PTS_EXIT),
+        'outage_threat_decay_tau_h': float(
+            unified_stress_model.OUTAGE_THREAT_DECAY_TAU
+        ),
+        'restoration_relief_decay_tau_h': float(
+            unified_stress_model.RESTORATION_RELIEF_DECAY_TAU
+        ),
+        'strict_feedback_max_abs': (
+            None if feedback_max_abs is None else float(feedback_max_abs)
+        ),
     }
 
 
 def _write_manifest(args, out_dir, label, use_road_graph, sim):
     manifest = {
         'created_at_utc': datetime.now(timezone.utc).isoformat(),
-        'metric_schema_version': 2,
+        'model_contract_version': MODEL_CONTRACT_VERSION,
+        'metric_schema_version': METRIC_SCHEMA_VERSION,
         'outage_api': 'trigger_outage_scenario',
         'city': args.city,
         'district': args.district,
@@ -387,6 +534,7 @@ def _write_manifest(args, out_dir, label, use_road_graph, sim):
         'n_residents': args.n_residents,
         'n_enterprises': args.n_enterprises,
         'total_steps': args.total_steps,
+        'dt': float(getattr(sim, 'dt', 0.25)),
         'outage_step': args.outage_step,
         'outage_cause': getattr(args, 'outage_cause', 'equipment_failure'),
         'tag': getattr(args, 'tag', ''),
@@ -396,11 +544,29 @@ def _write_manifest(args, out_dir, label, use_road_graph, sim):
         'switch_ablation': getattr(args, 'switch_ablation', 'none') or 'none',
         'opinion_mode': getattr(args, 'opinion_mode', 'auto'),
         'outage_stress_profile': getattr(args, 'outage_stress_profile', 'sqrt'),
+        'psychology_semantics': getattr(args, 'psychology_semantics', 'strict'),
+        'psychology_contract': _psychology_contract_snapshot(sim),
+        'phase_contract': {
+            'government_decision': 'start_of_step',
+            'global_metrics': 'end_of_step',
+            'decision_pressure_field': 'decision_avg_region_psychological_pressure',
+        },
         'home_distribution': getattr(args, 'home_distribution', None) or 'poi',
+        'flee_threshold': getattr(args, 'flee_threshold', None),
+        'mml_overrides': {
+            'mml_scale': getattr(args, 'mml_scale', None),
+            'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
+            'mml_b_sigma_flee': getattr(args, 'mml_b_sigma_flee', None),
+            'mml_b_vis': getattr(args, 'mml_b_vis', None),
+        },
         'output_dir': os.path.abspath(out_dir),
         'restores_in_window': getattr(sim, '_restores_in_window', None),
         'git': _git_info(),
     }
+    manifest['config_sha256'] = _config_sha256({
+        key: value for key, value in manifest.items()
+        if key not in {'created_at_utc', 'output_dir', 'git', 'config_sha256'}
+    })
     path = os.path.join(out_dir, 'manifest.json')
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -410,6 +576,8 @@ def _write_manifest(args, out_dir, label, use_road_graph, sim):
 
 def _desired_run_config(args):
     return {
+        'model_contract_version': MODEL_CONTRACT_VERSION,
+        'metric_schema_version': METRIC_SCHEMA_VERSION,
         'city': args.city,
         'district': args.district,
         'n_residents': args.n_residents,
@@ -425,6 +593,7 @@ def _desired_run_config(args):
         'switch_ablation': getattr(args, 'switch_ablation', 'none') or 'none',
         'opinion_mode': getattr(args, 'opinion_mode', 'auto'),
         'outage_stress_profile': getattr(args, 'outage_stress_profile', 'sqrt'),
+        'psychology_semantics': getattr(args, 'psychology_semantics', 'strict'),
         'mml_overrides': {
             'mml_scale': getattr(args, 'mml_scale', None),
             'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
@@ -460,6 +629,8 @@ def _existing_run_config(run_dir):
 
 def _desired_run_config_for_manifest_keys():
     return (
+        'model_contract_version',
+        'metric_schema_version',
         'city',
         'district',
         'n_residents',
@@ -475,6 +646,7 @@ def _desired_run_config_for_manifest_keys():
         'switch_ablation',
         'opinion_mode',
         'outage_stress_profile',
+        'psychology_semantics',
         'mml_overrides',
     )
 
@@ -498,7 +670,9 @@ def _guard_run_dir(run_dir, args):
     desired = _desired_run_config(args)
     mismatches = []
     for key, desired_value in desired.items():
-        if key in existing and existing.get(key) != desired_value:
+        if key not in existing:
+            mismatches.append((key, '<missing>', desired_value))
+        elif existing.get(key) != desired_value:
             mismatches.append((key, existing.get(key), desired_value))
 
     if mismatches:
@@ -630,6 +804,7 @@ def run_one(label, use_road_graph, args, run_dir):
     cfg.simulation.N_RESIDENTS = args.n_residents
     cfg.simulation.N_ENTERPRISES = args.n_enterprises
     cfg.simulation.TOTAL_STEPS = args.total_steps
+    cfg.simulation.PSYCHOLOGY_SEMANTICS = getattr(args, 'psychology_semantics', 'strict')
     # F2 控制实验: home 分布策略 ('poi' 默认 / 'uniform' 去 POI bias)
     home_dist = getattr(args, 'home_distribution', None)
     if home_dist:
@@ -643,7 +818,8 @@ def run_one(label, use_road_graph, args, run_dir):
     )
     print(f'[init] {time.time()-t0:.1f}s, use_road_graph={sim.use_road_graph}')
     print(f'[validation] opinion_mode={sim.opinion_mode}, '
-          f'outage_stress_profile={unified_stress_model.OUTAGE_STRESS_PROFILE}')
+          f'outage_stress_profile={unified_stress_model.OUTAGE_STRESS_PROFILE}, '
+          f'psychology_semantics={sim.psychology_semantics}')
     override_audits = []
 
     # F5 控制实验: flee_threshold 覆盖 (默认 0.6, 扫描 {0.4..0.8} 验证 phase transition)
@@ -781,12 +957,17 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
 
     # ---- 1) 关键路径: 先写 summary.json (matplotlib 不参与, 不会 crash) ----
     summary = {
+        'model_contract_version': MODEL_CONTRACT_VERSION,
+        'metric_schema_version': METRIC_SCHEMA_VERSION,
         'config': {
+            'model_contract_version': MODEL_CONTRACT_VERSION,
+            'metric_schema_version': METRIC_SCHEMA_VERSION,
             'city':          args.city,
             'district':      args.district,
             'n_residents':   args.n_residents,
             'n_enterprises': args.n_enterprises,
             'total_steps':   args.total_steps,
+            'dt':            float(getattr(sim_on, 'dt', 0.25)),
             'outage_step':   args.outage_step,
             'outage_cause':  getattr(args, 'outage_cause', 'equipment_failure'),
             'restores_in_window': getattr(sim_on, '_restores_in_window', None),
@@ -798,6 +979,13 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
             'switch_ablation':    getattr(args, 'switch_ablation', 'none') or 'none',
             'opinion_mode':       getattr(args, 'opinion_mode', 'auto'),
             'outage_stress_profile': getattr(args, 'outage_stress_profile', 'sqrt'),
+            'psychology_semantics': getattr(args, 'psychology_semantics', 'strict'),
+            'psychology_contract': _psychology_contract_snapshot(sim_on),
+            'phase_contract': {
+                'government_decision': 'start_of_step',
+                'global_metrics': 'end_of_step',
+                'decision_pressure_field': 'decision_avg_region_psychological_pressure',
+            },
             'mml_overrides': {
                 'mml_scale': getattr(args, 'mml_scale', None),
                 'mml_asc_flee': getattr(args, 'mml_asc_flee', None),
@@ -805,6 +993,7 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
                 'mml_b_vis': getattr(args, 'mml_b_vis', None),
             },
         },
+        'git': _git_info(),
         'final': {
             k: {'off': h_off[-1][k], 'on': h_on[-1][k]}
             for k in summary_metrics
@@ -879,6 +1068,7 @@ def plot_compare(h_off, h_on, args, run_dir, sim_off=None, sim_on=None):
             'on': getattr(sim_on, '_manifest', None),
         },
     }
+    summary['config_sha256'] = _config_sha256(summary['config'])
     out_json = os.path.join(run_dir, 'summary.json')
     with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -976,8 +1166,11 @@ def _parse_args():
                    choices=['auto', 'on', 'off'],
                    help='文献验证: 仅控制事件5舆情管理(auto/on/off), 不启用 GovernmentAgent manual events')
     p.add_argument('--outage-stress-profile', default='sqrt', dest='outage_stress_profile',
-                   choices=['sqrt', 'log', 'linear'],
-                   help='文献验证: t_outage→internal stress 敏感性曲线, 默认 sqrt 保持基线')
+                    choices=['sqrt', 'log', 'linear'],
+                    help='文献验证: t_outage→internal stress 敏感性曲线, 默认 sqrt 保持基线')
+    p.add_argument('--psychology-semantics', default='strict', dest='psychology_semantics',
+                   choices=['strict', 'legacy'],
+                   help='心理状态所有权: strict 用于正式实验；legacy 仅用于历史轨迹复现')
     p.add_argument('--mml-scale', type=float, default=None, dest='mml_scale',
                    help='F13 sensitivity: override SwitchParams.mml_scale for this run')
     p.add_argument('--mml-asc-flee', type=float, default=None, dest='mml_asc_flee',
@@ -999,7 +1192,11 @@ def main():
                 else os.path.join(TRACE_ROOT, args.output_base))
     else:
         base = TRACE_ROOT
-    run_dir = os.path.join(base, f't15_{args.city}_{args.district}{suffix}')
+    run_dir = os.path.join(
+        base,
+        f'psychology_{args.psychology_semantics}',
+        f't15_{args.city}_{args.district}{suffix}',
+    )
     _guard_run_dir(run_dir, args)
     os.makedirs(run_dir, exist_ok=True)
     print(f'[output] → {run_dir}')
@@ -1015,7 +1212,8 @@ def main():
     print(f'  T15 对照实验摘要: {args.city}/{args.district}'
           + (f' [tag={args.tag}]' if args.tag else ''))
     print(f'  opinion_mode={args.opinion_mode}, '
-          f'outage_stress_profile={args.outage_stress_profile}')
+          f'outage_stress_profile={args.outage_stress_profile}, '
+          f'psychology_semantics={args.psychology_semantics}')
     print('=' * 70)
     print(f'  {"指标":<24} {"graph-off":>14} {"graph-on":>14}  Δ%')
     keys = [

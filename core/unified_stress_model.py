@@ -73,6 +73,8 @@ class UnifiedStressModel:
     GOV_EVENT_SOFTNESS = 0.3
     # 恢复供电后 outage_threat 的指数衰减时间常数 (h)；越小衰减越快。
     OUTAGE_THREAT_DECAY_TAU = 6.0
+    # 复电即时缓解项的独立衰减常数；默认值相同但不与威胁衰减耦合。
+    RESTORATION_RELIEF_DECAY_TAU = 6.0
     VALID_OUTAGE_STRESS_PROFILES = {'sqrt', 'log', 'linear'}
     OUTAGE_STRESS_PROFILE = 'sqrt'
 
@@ -104,6 +106,24 @@ class UnifiedStressModel:
                 "expected sqrt/log/linear"
             )
         self.OUTAGE_STRESS_PROFILE = profile
+
+    @staticmethod
+    def _uses_strict_psychology(resident):
+        return str(getattr(resident, 'psychology_semantics', 'strict')).lower() == 'strict'
+
+    def _outage_clocks(self, resident):
+        """Return (episode, cumulative, time_since_service_restoration)."""
+        if self._uses_strict_psychology(resident):
+            return (
+                float(getattr(resident, 'episode_outage_hours', 0.0)),
+                float(getattr(resident, 'cumulative_outage_hours', 0.0)),
+                float(getattr(resident, 'time_since_service_restoration', 0.0)),
+            )
+        return (
+            float(getattr(resident, 't_outage', 0.0)),
+            float(getattr(resident, 'total_outage_hours', 0.0)),
+            float(getattr(resident, 'time_since_recovery', 0.0)),
+        )
 
     def _base_outage_internal_stress(self, t_outage, profile=None):
         """Map outage duration to baseline internal stress for sensitivity runs."""
@@ -137,14 +157,13 @@ class UnifiedStressModel:
         # 0h→0, 2h→0.28, 6h→0.55, 12h→0.78, 24h→1.00(封顶), 48h→1.00(封顶)
         # 【2026-06-13】恢复供电后按 exp(-t/τ) 衰减，让 σ 钟形曲线能回落
         # （对应 Fig.5 的"平复"段；τ 默认 6h）。
-        t_outage = getattr(resident, 't_outage', 0)
-        if t_outage > 0:
-            outage_threat = min(1.0, 0.4 * np.log1p(t_outage / 2.0))
+        episode_outage, _cumulative_outage, t_since_restore = self._outage_clocks(resident)
+        if episode_outage > 0:
+            outage_threat = min(1.0, 0.4 * np.log1p(episode_outage / 2.0))
             if getattr(resident, 'powered', True):
                 # 恢复后衰减：用 time_since_recovery 作为衰减计时
-                t_since = float(getattr(resident, 'time_since_recovery', 0.0))
                 tau = max(0.5, self.OUTAGE_THREAT_DECAY_TAU)
-                outage_threat *= float(np.exp(-t_since / tau))
+                outage_threat *= float(np.exp(-t_since_restore / tau))
             threat += self.threat_weights['outage_duration'] * outage_threat
 
         # 2. 物资短缺威胁
@@ -155,12 +174,28 @@ class UnifiedStressModel:
 
         # 3. 邻居恐慌传染
         neighbors = getattr(resident, 'neighbors', [])
-        if neighbors:
-            avg_neighbor_stress = np.mean([
-                getattr(n, 'stress_level', 0) for n in neighbors
-            ])
-            # 非线性传染：邻居恐慌越高，传染效果越强
-            neighbor_threat = avg_neighbor_stress ** 1.5
+        social_exposure = max(0.0, min(
+            1.0, float(getattr(resident, '_event_social_exposure', 0.0))
+        ))
+        adjacent_exposure = 0.0
+        if self._uses_strict_psychology(resident):
+            adjacent_exposure = max(0.0, min(
+                1.0, float(getattr(resident, 'adjacent_zone_panic', 0.0))
+            ))
+        if neighbors or social_exposure > 0.0 or adjacent_exposure > 0.0:
+            avg_neighbor_stress = (
+                float(np.mean([
+                    getattr(n, 'stress_level', 0) for n in neighbors
+                ])) if neighbors else 0.0
+            )
+            # Local stress, event exposure, and adjacent A_z share one
+            # bounded social-threat channel; no direct E/P write occurs.
+            neighbor_threat = min(
+                1.0,
+                avg_neighbor_stress ** 1.5
+                + social_exposure
+                + adjacent_exposure,
+            )
             threat += self.threat_weights['neighbor_panic'] * neighbor_threat
 
         # 4. 信息缺失威胁
@@ -169,8 +204,9 @@ class UnifiedStressModel:
         #   - 当前停电中 (not powered)
         #   - 处于恢复期 (recovery_phase)
         # 退出恢复期后（was_affected 也重置），此项归零，stress 可自由下降。
-        is_under_stress = (not getattr(resident, 'powered', True)) \
-                          or getattr(resident, 'recovery_phase', False)
+        is_under_stress = not getattr(resident, 'powered', True)
+        if not self._uses_strict_psychology(resident):
+            is_under_stress = is_under_stress or getattr(resident, 'recovery_phase', False)
         if is_under_stress:
             official_info = getattr(resident, 'info_received', {}).get('official', 0)
             rumor_belief = getattr(resident, 'rumor_belief', 0)
@@ -232,6 +268,10 @@ class UnifiedStressModel:
             social_support = min(1.0, (r_neighbors + helping_neighbors) / max(1, len(neighbors)))
         else:
             social_support = 0.3  # 没有邻居时的基础社会支持
+        event_social_support = max(0.0, min(
+            1.0, float(getattr(resident, '_event_social_support', 0.0))
+        ))
+        social_support = min(1.0, social_support + event_social_support)
         coping += self.coping_weights['social_support'] * social_support
 
         # 4. 信息获取
@@ -276,7 +316,8 @@ class UnifiedStressModel:
         # 3. 不同人的tolerance不同，所以开始反应的时间不同
         # 4. 这就是"延迟"效果的体现
         #
-        t_outage = getattr(resident, 't_outage', 0)
+        episode_outage, cumulative_outage, t_since_restore = self._outage_clocks(resident)
+        t_outage = episode_outage
         personality = getattr(resident, 'personality', '普通型')
         stress_resistance = getattr(resident, 'stress_resistance', 0.5)
         age = getattr(resident, 'age', 40)
@@ -420,25 +461,29 @@ class UnifiedStressModel:
         # 上升到峰值，对应论文 Fig.5 的"激发-平台-平复"钟形曲线。
         gov_events = getattr(resident, '_gov_events', {})
         gov_softness = self.GOV_EVENT_SOFTNESS
+        # In strict mode these interventions are already represented through
+        # threat/coping/information/material/social/service-state inputs.  The
+        # additive blocks below are legacy-only to prevent double counting.
+        legacy_direct_effect = not self._uses_strict_psychology(resident)
 
         # 事件1: 发布停电通知 → 降低信息焦虑
-        if gov_events.get('outage_notice', False):
+        if legacy_direct_effect and gov_events.get('outage_notice', False):
             event_effect -= 0.02 * gov_softness * dt
 
         # 事件2: 启动应急响应 → 增加安全感
-        if gov_events.get('emergency_response', False):
+        if legacy_direct_effect and gov_events.get('emergency_response', False):
             event_effect -= 0.025 * gov_softness * dt
 
         # 事件3: 发放应急物资 → 降低物资焦虑
-        if gov_events.get('supply_distribution', False):
+        if legacy_direct_effect and gov_events.get('supply_distribution', False):
             event_effect -= 0.03 * gov_softness * dt
 
         # 事件4: 疏散安置 → 降低危险感（如果在安全区）
-        if gov_events.get('evacuation', False):
+        if legacy_direct_effect and gov_events.get('evacuation', False):
             event_effect -= 0.04 * gov_softness * dt
 
         # 事件5: 心理疏导/安抚 → 直接降低压力
-        if gov_events.get('psychological_comfort', False):
+        if legacy_direct_effect and gov_events.get('psychological_comfort', False):
             # 安抚效果因人而异
             comfort_effectiveness = {
                 '焦虑型': 0.8,  # 很需要安抚
@@ -453,18 +498,18 @@ class UnifiedStressModel:
         grid_events = getattr(resident, '_grid_events', {})
 
         # 事件7: 临时供电站 → 部分缓解
-        if grid_events.get('temp_station', False):
+        if legacy_direct_effect and grid_events.get('temp_station', False):
             event_effect -= 0.02 * dt
 
         # 事件8: 加速修复 → 增加希望（如果知道的话）
-        if grid_events.get('accelerated_repair', False):
+        if legacy_direct_effect and grid_events.get('accelerated_repair', False):
             official_info = getattr(resident, 'info_received', {}).get('official', 0)
             event_effect -= 0.015 * official_info * dt  # 知道才有效
 
         # ---------- 居民行为影响 ----------
 
         # 囤积行为影响
-        if getattr(resident, 'is_hoarding', False):
+        if legacy_direct_effect and getattr(resident, 'is_hoarding', False):
             if getattr(resident, 'hoarding_success', True):
                 event_effect -= 0.025 * dt  # 成功缓解压力
             else:
@@ -472,13 +517,13 @@ class UnifiedStressModel:
                 event_effect += 0.03 * min(2.0, 1 + failure_count * 0.2) * dt  # 失败增加压力
 
         # 自救行为影响
-        if getattr(resident, 'is_self_helping', False):
+        if legacy_direct_effect and getattr(resident, 'is_self_helping', False):
             initiative = getattr(resident, 'initiative', 0.5)
             event_effect -= 0.03 * initiative * dt  # 自救降低压力（主动应对）
 
         # 聚集行为影响（双刃剑）
         neighbors = getattr(resident, 'neighbors', [])
-        if getattr(resident, 'is_gathering', False) and neighbors:
+        if legacy_direct_effect and getattr(resident, 'is_gathering', False) and neighbors:
             gathering_neighbors = [n for n in neighbors if getattr(n, 'is_gathering', False)]
             if gathering_neighbors:
                 avg_stress = np.mean([getattr(n, 'stress_level', 0.5) for n in gathering_neighbors])
@@ -488,21 +533,40 @@ class UnifiedStressModel:
                     event_effect += 0.025 * (avg_stress - 0.5) * dt  # 与恐慌者聚集：传染
 
         # 请求供电影响（发泄情绪）
-        if getattr(resident, 'is_requesting_power', False):
+        if legacy_direct_effect and getattr(resident, 'is_requesting_power', False):
             # 请求本身是一种发泄，稍微缓解压力
             event_effect -= 0.01 * dt
 
         # ---------- 供电恢复影响（长尾效应）----------
-        if getattr(resident, 'powered', True) and getattr(resident, 'total_outage_hours', 0) > 0:
+        restoration = 0.0
+        recovery_active = bool(getattr(resident, 'recovery_phase', False))
+        if (
+            getattr(resident, 'powered', True)
+            and cumulative_outage > 0
+            and (not self._uses_strict_psychology(resident) or recovery_active)
+        ):
             # 恢复供电后的长尾恢复效应
             peak_stress = getattr(resident, 'peak_stress', 0.5)
-            total_outage = getattr(resident, 'total_outage_hours', 0)
+            total_outage = cumulative_outage
 
             # 恢复阻力 = f(峰值压力, 停电时长)
             # 经历越痛苦，恢复越慢
             resistance = 1.0 + peak_stress * 0.5 + min(1.0, total_outage / 24) * 0.3
-            powered_recovery = -0.015 / resistance * σ * dt
-            event_effect += powered_recovery
+            restoration_kernel = 1.0
+            if self._uses_strict_psychology(resident):
+                tau = max(0.5, float(self.RESTORATION_RELIEF_DECAY_TAU))
+                restoration_kernel = float(np.exp(-max(0.0, t_since_restore) / tau))
+            restoration = -0.015 * restoration_kernel / resistance * σ * dt
+            event_effect += restoration
+
+        # In strict mode behavioural reappraisal is an input to this ODE, not
+        # a second writer of sigma.  It was queued after the previous action
+        # update and is consumed exactly once here.
+        reappraisal = 0.0
+        if self._uses_strict_psychology(resident):
+            reappraisal = float(getattr(resident, '_pending_stress_reappraisal', 0.0))
+            resident._pending_stress_reappraisal = 0.0
+            event_effect += reappraisal
 
         # ========== 综合变化 ==========
         stress_change = stimulation + recovery + contagion + event_effect
@@ -515,8 +579,10 @@ class UnifiedStressModel:
             'beta': β,
             'stimulation': stimulation,
             'recovery': recovery,
+            'restoration': restoration,
             'contagion': contagion,
             'event_effect': event_effect,
+            'reappraisal': reappraisal,
             'total_change': stress_change
         }
 
@@ -574,6 +640,13 @@ class UnifiedStressModel:
         moderate_threshold = self.THRESHOLD_MODERATE_ANXIETY * mult
         high_threshold = self.THRESHOLD_HIGH_PANIC * mult
         extreme_threshold = self.THRESHOLD_EXTREME_PANIC * mult
+        # PTS is the personality-adjusted acute-stress state.  Behavioural
+        # demonstration may change action thresholds below, but never this
+        # onset/recovery hysteresis pair.
+        pts_enter = min(0.95, extreme_threshold)
+        pts_exit = self.THRESHOLD_PTS_EXIT * mult
+        resident._pts_enter_threshold = pts_enter
+        resident._pts_exit_threshold = pts_exit
 
         # ============================================================
         # P2: 行为示范对 θ₁/θ₂ 的压低（独立于情绪传染 γ·(σ̄-σ)）
@@ -595,8 +668,6 @@ class UnifiedStressModel:
             resident._theta2_eff = high_threshold
 
         # 更新PTS状态（极度恐慌 + 迟滞带：进入0.8×mult，退出0.5×mult）
-        pts_enter = min(0.95, extreme_threshold)      # extreme_threshold 即 0.8×mult；封顶0.95
-        pts_exit  = self.THRESHOLD_PTS_EXIT * mult    # 0.5×mult
         if resident.pts_status:
             resident.pts_status = stress >= pts_exit  # 已在PTS：σ跌破退出阈值才解除
         else:
