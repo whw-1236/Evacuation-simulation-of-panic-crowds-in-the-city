@@ -2,11 +2,11 @@
 """Aggregate E2 switch-ablation matrix outputs.
 
 Input:
-    trace_output/E2_ablation_matrix/t15_*/summary.json
+    trace_output/IJDRR_v7_strict_formal/E2_ablation_matrix_n10/psychology_<semantics>/t15_*/summary.json
 
 Outputs:
-    trace_output/E2_ablation_matrix/e2_ablation_summary.csv
-    trace_output/E2_ablation_matrix/e2_ablation_summary.json
+    <input>/e2_ablation_summary.csv
+    <input>/e2_ablation_summary.json
 
 The summary table reports graph-off/graph-on means and 95% CI by
 city/district/ablation. It also reports the graph-on difference from the
@@ -23,9 +23,16 @@ import os
 import sys
 from collections import defaultdict
 
+from scipy.stats import t as student_t
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRACE_ROOT = os.path.join(ROOT, "trace_output")
+DEFAULT_INPUT_BASE = os.path.join(
+    "IJDRR_v7_strict_formal", "E2_ablation_matrix_n10"
+)
+EXPECTED_MODEL_CONTRACT_VERSION = "ijdrr_strict_v1"
+MIN_METRIC_SCHEMA_VERSION = 4
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -52,22 +59,63 @@ def ci95(values: list[float]) -> tuple[float, float, float, float]:
         return mean, 0.0, mean, mean
     var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
     std = math.sqrt(var)
-    try:
-        from scipy.stats import t as student_t
-
-        tval = float(student_t.ppf(0.975, len(vals) - 1))
-    except Exception:
-        tval = 1.96
+    tval = float(student_t.ppf(0.975, len(vals) - 1))
     half = tval * std / math.sqrt(len(vals))
     return mean, std, mean - half, mean + half
 
 
-def load_records(input_dir: str) -> list[dict]:
+def semantics_dir(base: str, semantics: str) -> str:
+    leaf = f"psychology_{semantics}"
+    return base if os.path.basename(os.path.normpath(base)) == leaf else os.path.join(base, leaf)
+
+
+def validate_summary_semantics(summary: dict, expected: str, path: str) -> None:
+    if summary.get("model_contract_version") != EXPECTED_MODEL_CONTRACT_VERSION:
+        raise ValueError(f"summary model_contract_version mismatch: {path}")
+    try:
+        schema_version = int(summary.get("metric_schema_version"))
+    except (TypeError, ValueError):
+        schema_version = -1
+    if schema_version < MIN_METRIC_SCHEMA_VERSION:
+        raise ValueError(f"summary metric_schema_version is too old: {path}")
+    actual = summary.get("config", {}).get("psychology_semantics")
+    if actual != expected:
+        raise ValueError(
+            f"summary psychology_semantics mismatch: expected={expected!r}, "
+            f"actual={actual!r}, path={path}"
+        )
+    manifests = summary.get("manifest")
+    if not isinstance(manifests, dict):
+        raise ValueError(f"summary manifest missing: {path}")
+    for graph_mode in ("off", "on"):
+        manifest = manifests.get(graph_mode)
+        actual = manifest.get("psychology_semantics") if isinstance(manifest, dict) else None
+        if actual != expected:
+            raise ValueError(
+                f"{graph_mode} manifest psychology_semantics mismatch: "
+                f"expected={expected!r}, actual={actual!r}, path={path}"
+            )
+        if manifest.get("model_contract_version") != EXPECTED_MODEL_CONTRACT_VERSION:
+            raise ValueError(
+                f"{graph_mode} manifest model_contract_version mismatch: {path}"
+            )
+        try:
+            manifest_schema = int(manifest.get("metric_schema_version"))
+        except (TypeError, ValueError):
+            manifest_schema = -1
+        if manifest_schema < MIN_METRIC_SCHEMA_VERSION:
+            raise ValueError(
+                f"{graph_mode} manifest metric_schema_version is too old: {path}"
+            )
+
+
+def load_records(input_dir: str, psychology_semantics: str = "strict") -> list[dict]:
     records: list[dict] = []
     pattern = os.path.join(input_dir, "t15_*", "summary.json")
     for path in sorted(glob.glob(pattern)):
         with open(path, "r", encoding="utf-8") as fh:
             summary = json.load(fh)
+        validate_summary_semantics(summary, psychology_semantics, path)
         cfg = summary.get("config", {})
         final = summary.get("final", {})
         rec = {
@@ -79,6 +127,7 @@ def load_records(input_dir: str) -> list[dict]:
             "tag": cfg.get("tag", ""),
             "n_residents": cfg.get("n_residents"),
             "total_steps": cfg.get("total_steps"),
+            "psychology_semantics": psychology_semantics,
         }
         for metric in METRICS:
             pair = final.get(metric, {})
@@ -103,6 +152,7 @@ def aggregate(records: list[dict]) -> list[dict]:
             "district": district,
             "ablation": ablation,
             "n_runs": len(recs),
+            "psychology_semantics": recs[0]["psychology_semantics"],
             "seeds": ",".join(str(r.get("seed")) for r in sorted(recs, key=lambda x: x.get("seed") or 0)),
         }
         for metric in METRICS:
@@ -167,7 +217,13 @@ def print_brief(rows: list[dict]) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Aggregate E2 ablation matrix outputs.")
-    parser.add_argument("--input-base", default="E2_ablation_matrix")
+    parser.add_argument("--input-base", default=DEFAULT_INPUT_BASE)
+    parser.add_argument(
+        "--psychology-semantics",
+        choices=("strict", "legacy"),
+        default="strict",
+        help="Only aggregate runs produced under this psychology contract.",
+    )
     return parser.parse_args()
 
 
@@ -176,10 +232,11 @@ def main() -> None:
     input_dir = (
         args.input_base if os.path.isabs(args.input_base) else os.path.join(TRACE_ROOT, args.input_base)
     )
+    input_dir = semantics_dir(input_dir, args.psychology_semantics)
     if not os.path.exists(input_dir):
         raise SystemExit(f"input directory does not exist: {input_dir}")
 
-    records = load_records(input_dir)
+    records = load_records(input_dir, args.psychology_semantics)
     print(f"[load] {len(records)} summary.json from {input_dir}")
     if not records:
         raise SystemExit("no summary.json files found")

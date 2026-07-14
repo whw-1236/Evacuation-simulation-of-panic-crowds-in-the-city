@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -15,6 +17,9 @@ from simulation.simulation import BlackoutSimulation
 
 REQUIRED_FIELDS = {
     'metric_schema_version',
+    'metric_phase',
+    'psychology_semantics',
+    'pts_ratio',
     'outage_ratio',
     'full_outage_zone_ratio',
     'unpowered_resident_ratio',
@@ -42,6 +47,14 @@ REQUIRED_FIELDS = {
     'seir_R',
     'seir_infection_reduction',
     'rumor_suppress_rate',
+    'avg_episode_outage_hours',
+    'avg_cumulative_outage_hours',
+    'avg_time_since_service_restoration',
+    'decision_avg_region_psychological_pressure',
+    'avg_region_psychological_pressure',
+    'occupied_zone_mean_psychological_pressure',
+    'service_restoration_ratio',
+    'system_help_psychology_component',
 }
 
 
@@ -99,6 +112,7 @@ def test_collect_step_metrics_exports_validation_channels():
             current_edge=None,
             _dom_action='home',
             state='S',
+            zone='z0',
         ),
         SimpleNamespace(
             stress_level=0.8,
@@ -110,6 +124,7 @@ def test_collect_step_metrics_exports_validation_channels():
             current_edge=('a', 'b', 0),
             _dom_action='flee',
             state='I',
+            zone='z0',
         ),
     ]
     sim = SimpleNamespace(
@@ -119,6 +134,7 @@ def test_collect_step_metrics_exports_validation_channels():
         public_opinion_pressure=0.17,
         P_hist=[0.60],
         opinion_components={'emotion': 0.10, 'enterprise': 0.20, 'critical': 0.30},
+        region_psychological_pressure_levels={'z0': 0.30, 'z1': 0.0},
         gov_agents={'d0': SimpleNamespace(public_opinion_active=True)},
         last_event_summary={
             'total_opinion_pressure': 0.12,
@@ -140,7 +156,9 @@ def test_collect_step_metrics_exports_validation_channels():
 
     assert REQUIRED_FIELDS.issubset(metrics)
     assert metrics['public_opinion_active'] == 1.0
-    assert metrics['metric_schema_version'] == 2.0
+    assert metrics['metric_schema_version'] == 4.0
+    assert metrics['metric_phase'] == 'end_of_step'
+    assert metrics['psychology_semantics'] == 'strict'
     assert metrics['outage_ratio'] == 0.5
     assert metrics['full_outage_zone_ratio'] == 0.5
     assert metrics['unpowered_resident_ratio'] == 0.0
@@ -152,7 +170,17 @@ def test_collect_step_metrics_exports_validation_channels():
     assert metrics['opinion_management_pressure_relief'] == 0.03
     assert metrics['total_opinion_pressure'] == 0.12
     assert metrics['system_help_pressure'] == 0.60
+    assert metrics['system_help_psychology_component'] == 0.10
     assert metrics['system_help_emotion_component'] == 0.10
+    assert metrics['pts_ratio'] == 0.0
+    assert metrics['avg_region_psychological_pressure'] == 0.30
+    assert metrics['decision_avg_region_psychological_pressure'] == 0.30
+    assert metrics['occupied_zone_mean_psychological_pressure'] == 0.30
+    assert metrics['avg_region_psychological_pressure'] == pytest.approx(
+        0.4 * metrics['avg_emotion']
+        + 0.4 * metrics['avg_panic']
+        + 0.2 * metrics['pts_ratio']
+    )
     assert metrics['system_help_enterprise_component'] == 0.20
     assert metrics['system_help_critical_component'] == 0.30
     assert metrics['seir_S'] == 0.5

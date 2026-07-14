@@ -295,21 +295,30 @@ class GeoJSONRegionManager:
         """获取所有区域ID列表"""
         return self.all_zone_ids.copy()
 
-    def get_region_panic_level(self, residents, region_id, panic_threshold=0.7):
-        """
-        计算区域恐慌水平
-
-        返回:
-            panic_level: 0-1之间的恐慌水平
-        """
+    def get_region_psychological_pressure(self, residents, region_id):
+        """Compute A_z = 0.4 mean(E) + 0.4 mean(P) + 0.2 PTS ratio."""
         region_residents = [r for r in residents if r.zone == region_id]
         if not region_residents:
             return 0.0
 
         avg_emotion = np.mean([r.emotion for r in region_residents])
-        panic_ratio = sum(1 for r in region_residents if r.emotion > panic_threshold) / len(region_residents)
+        avg_panic = np.mean([getattr(r, 'panic_value', 0.0) for r in region_residents])
+        pts_ratio = sum(
+            1 for r in region_residents if getattr(r, 'pts_status', False)
+        ) / len(region_residents)
 
-        return avg_emotion * 0.7 + panic_ratio * 0.3
+        return float(max(0.0, min(1.0, 0.4 * avg_emotion + 0.4 * avg_panic + 0.2 * pts_ratio)))
+
+    def get_region_panic_level(self, residents, region_id, panic_threshold=0.7):
+        """Retain the historical API; strict code requests A_z by name."""
+        region_residents = [r for r in residents if r.zone == region_id]
+        if not region_residents:
+            return 0.0
+        avg_emotion = np.mean([r.emotion for r in region_residents])
+        panic_ratio = sum(
+            1 for r in region_residents if r.emotion > panic_threshold
+        ) / len(region_residents)
+        return float(avg_emotion * 0.7 + panic_ratio * 0.3)
 
 
 # =============================================================================

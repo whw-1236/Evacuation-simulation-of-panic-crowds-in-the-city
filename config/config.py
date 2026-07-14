@@ -227,6 +227,11 @@ class SimulationConfig:
     # set this explicitly for reproducible partial-load selections.
     RANDOM_SEED = 42
 
+    # ==================== 心理语义模式 ====================
+    # strict: 统一压力 sigma 是唯一心理状态；emotion/panic 仅为派生观测量。
+    # legacy: 保留历史事件模块对 emotion/panic 的直接写入，只用于复现旧结果。
+    PSYCHOLOGY_SEMANTICS = 'strict'
+
     # 时间换算参考：
     # - 1小时 = 4步
     # - 1天 = 96步

@@ -1838,6 +1838,162 @@ class EventInfluenceCalculator:
         summary['opinion_pressure_net_change'] = net_change
         summary['public_opinion_pressure'] = self.public_opinion_pressure
 
+    @staticmethod
+    def _uses_strict_psychology(sim):
+        return str(getattr(sim, 'psychology_semantics', 'strict')).lower() == 'strict'
+
+    def _apply_strict_psychological_inputs(self, sim, effects, dt):
+        """Translate event effects into stress-model inputs, never E/P writes."""
+        residents = list(getattr(sim, 'residents', []))
+        if not residents:
+            return
+
+        gov_effects = effects.get('government', {})
+        res_effects = effects.get('resident', {})
+        summary = effects.setdefault('summary', {})
+        audit = {
+            'official_information': 0.0,
+            'material_support': 0.0,
+            'social_support': 0.0,
+            'social_exposure': 0.0,
+        }
+
+        warning = gov_effects.get('warning', {})
+        warning_boost = max(0.0, float(warning.get('informed_boost', 0.0)))
+        if warning_boost > 0:
+            for resident in residents:
+                info = getattr(resident, 'info_received', None)
+                if isinstance(info, dict):
+                    current = float(info.get('official', 0.0))
+                    increase = warning_boost * (1.0 - current)
+                    info['official'] = min(1.0, current + increase)
+                    audit['official_information'] += increase
+                resident.informed = True
+
+        resident_resource = gov_effects.get('resource_resident', {})
+        resource_strength = max(
+            0.0,
+            float(resident_resource.get('emotion_reduction', 0.0))
+            + float(resident_resource.get('panic_reduction', 0.0)),
+        )
+        if resource_strength > 0:
+            targets = [
+                resident for resident in residents
+                if bool(getattr(resident, '_gov_resource_received', False))
+            ] or residents
+            material_increment = min(0.25, 0.02 + 2.0 * resource_strength)
+            support_increment = min(0.15, resource_strength)
+            hoarding_reduction = max(
+                0.0, float(resident_resource.get('hoarding_reduction', 0.0))
+            )
+            for resident in targets:
+                resident.personal_supply = min(
+                    1.0, float(getattr(resident, 'personal_supply', 0.0)) + material_increment
+                )
+                resident._event_social_support = min(
+                    1.0,
+                    float(getattr(resident, '_event_social_support', 0.0)) + support_increment,
+                )
+                if bool(getattr(resident, 'is_hoarding', False)) and random.random() < hoarding_reduction:
+                    resident.is_hoarding = False
+                audit['material_support'] += material_increment
+                audit['social_support'] += support_increment
+
+        community = res_effects.get('community_self_help', {})
+        for zone, effect in community.get('zone_effects', {}).items():
+            if not effect.get('active', False):
+                continue
+            support_increment = min(
+                0.25,
+                max(0.0, float(effect.get('emotion_suppression', 0.0)))
+                + max(0.0, float(effect.get('panic_suppression', 0.0)))
+                + max(0.0, float(effect.get('neighbor_calm', 0.0))),
+            )
+            for resident in residents:
+                if getattr(resident, 'zone', None) == zone:
+                    resident._event_social_support = min(
+                        1.0,
+                        float(getattr(resident, '_event_social_support', 0.0)) + support_increment,
+                    )
+                    audit['social_support'] += support_increment
+
+        supply = res_effects.get('supply_point', {})
+        coverage = max(0.0, min(1.0, float(self.coefficients['supply_point_coverage'])))
+        max_targets = int(len(residents) * coverage)
+        supply_strength = max(
+            0.0,
+            float(supply.get('emotion_relief', 0.0))
+            + float(supply.get('panic_relief', 0.0)),
+        )
+        if max_targets > 0 and supply_strength > 0:
+            targets = [r for r in residents if bool(getattr(r, 'is_hoarding', False))]
+            targets += [
+                r for r in residents
+                if r not in targets and float(getattr(r, 'stress_level', 0.0)) > 0.4
+            ]
+            material_increment = min(0.30, 0.03 + 2.0 * supply_strength)
+            hoarding_reduction = max(0.0, float(supply.get('hoarding_reduction', 0.0)))
+            for resident in targets[:max_targets]:
+                resident.personal_supply = min(
+                    1.0, float(getattr(resident, 'personal_supply', 0.0)) + material_increment
+                )
+                if bool(getattr(resident, 'is_hoarding', False)) and random.random() < hoarding_reduction:
+                    resident.is_hoarding = False
+                audit['material_support'] += material_increment
+
+        gather = res_effects.get('gather_spread', {})
+        gather_exposure = min(
+            0.25,
+            max(0.0, float(gather.get('emotion_spread', 0.0)))
+            + 0.5 * max(0.0, float(gather.get('seir_boost', 0.0))),
+        )
+        if gather_exposure > 0:
+            sources = [r for r in residents if bool(getattr(r, 'is_gathering', False))]
+            for source in sources:
+                for neighbor in getattr(source, 'neighbors', []):
+                    neighbor._event_social_exposure = min(
+                        1.0,
+                        float(getattr(neighbor, '_event_social_exposure', 0.0)) + gather_exposure,
+                    )
+                    neighbor.rumor_belief = min(
+                        1.0, float(getattr(neighbor, 'rumor_belief', 0.0)) + 0.25 * gather_exposure
+                    )
+                    audit['social_exposure'] += gather_exposure
+
+        burst = res_effects.get('emotion_burst', {})
+        burst_exposure = min(0.25, max(0.0, float(burst.get('panic_spread', 0.0))))
+        if burst_exposure > 0:
+            for source in residents:
+                if not bool(getattr(source, 'is_emotion_burst', False)):
+                    continue
+                for neighbor in getattr(source, 'neighbors', []):
+                    neighbor._event_social_exposure = min(
+                        1.0,
+                        float(getattr(neighbor, '_event_social_exposure', 0.0)) + burst_exposure,
+                    )
+                    neighbor.rumor_belief = min(
+                        1.0, float(getattr(neighbor, 'rumor_belief', 0.0)) + burst_exposure
+                    )
+                    audit['social_exposure'] += burst_exposure
+
+        self_help = res_effects.get('self_help', {})
+        self_help_support = min(
+            0.15,
+            max(0.0, float(self_help.get('emotion_relief', 0.0)))
+            + max(0.0, float(self_help.get('panic_relief', 0.0))),
+        )
+        if self_help_support > 0:
+            for resident in residents:
+                resident._event_social_support = min(
+                    1.0,
+                    float(getattr(resident, '_event_social_support', 0.0)) + self_help_support,
+                )
+                audit['social_support'] += self_help_support
+
+        summary['psychology_semantics'] = 'strict'
+        summary['strict_psychological_inputs'] = audit
+        summary['direct_emotion_panic_write'] = False
+
     def apply_effects(self, sim, effects, dt):
         """
         应用事件影响到仿真状态
@@ -1850,6 +2006,9 @@ class EventInfluenceCalculator:
         summary = effects.get('summary', {})
         gov_effects = effects.get('government', {})
         res_effects = effects.get('resident', {})
+        strict_psychology = self._uses_strict_psychology(sim)
+        if strict_psychology:
+            self._apply_strict_psychological_inputs(sim, effects, dt)
 
         # Event 3 has two explicit, gated channels: the GovernmentAgent has
         # already delivered the recorded compensation amount, while this
@@ -1903,7 +2062,7 @@ class EventInfluenceCalculator:
 
         # ============ 应用恐慌变化 ============
         panic_change = summary.get('total_panic_change', 0)
-        if abs(panic_change) > 0.001:
+        if (not strict_psychology) and abs(panic_change) > 0.001:
             scale = 0.1  # 缩放因子，避免变化过大
             for r in sim.residents:
                 new_panic = r.panic_value + panic_change * scale
@@ -1913,7 +2072,7 @@ class EventInfluenceCalculator:
         emotion_change = summary.get('total_emotion_change', 0)
         opinion_emotion_change = summary.get('opinion_management_emotion_change', 0)
         global_emotion_change = emotion_change - opinion_emotion_change
-        if abs(global_emotion_change) > 0.001:
+        if (not strict_psychology) and abs(global_emotion_change) > 0.001:
             scale = 0.1
             for r in sim.residents:
                 new_emotion = r.emotion + global_emotion_change * scale
@@ -1923,7 +2082,7 @@ class EventInfluenceCalculator:
             r for r in sim.residents
             if bool(getattr(r, '_opinion_management_active', False))
         ]
-        if abs(opinion_emotion_change) > 0.001 and opinion_target_residents:
+        if (not strict_psychology) and abs(opinion_emotion_change) > 0.001 and opinion_target_residents:
             scale = 0.1
             for r in opinion_target_residents:
                 new_emotion = r.emotion + opinion_emotion_change * scale
@@ -1966,7 +2125,7 @@ class EventInfluenceCalculator:
                                 r.state = 'R'
 
         # ============ 【新增】应用社区集体自救效果 ============
-        if 'community_self_help' in res_effects:
+        if (not strict_psychology) and 'community_self_help' in res_effects:
             community_effect = res_effects['community_self_help']
             zone_effects = community_effect.get('zone_effects', {})
 
@@ -1986,7 +2145,7 @@ class EventInfluenceCalculator:
                             r.panic_value = max(0, r.panic_value - panic_supp)
 
         # ============ 【新增】应用物资发放点效果 ============
-        if 'supply_point' in res_effects:
+        if (not strict_psychology) and 'supply_point' in res_effects:
             supply_effect = res_effects['supply_point']
 
             emotion_relief = supply_effect.get('emotion_relief', 0)
